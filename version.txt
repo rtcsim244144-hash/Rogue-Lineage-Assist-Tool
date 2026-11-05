@@ -1,0 +1,2 @@
+version=1.2.0
+script_sha256=2e4d5fd229eb14222616d8d1f15529d119eae42ac9f669ff2fde8fe70b1e5dac
