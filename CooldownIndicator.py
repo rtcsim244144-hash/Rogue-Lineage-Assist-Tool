@@ -1,0 +1,12715 @@
+"""
+Cooldown Indicator  (Scroom skin)
+---------------------------------
+Shows a red, see-through box + a number on top of your hotbar slots while a move is on cooldown.
+It is ALWAYS ON: it starts tracking the moment this window opens and stops only when you close it (x).
+
+How it knows a move was used (the game never tells us, so we copy what you do):
+    1. you press the move's hotbar key  (1 2 3 ... 0 - =)   -> the move is "armed"
+    2. you LEFT click                                       -> the cooldown starts on that click
+
+SNAP SPELLS work the same way but on RIGHT click, with their own list per profile, one shared cooldown
+for the whole list (use one and ALL snap spells go on the cooldown of the one you used) and blue boxes.
+A move with a BLANK main cooldown is a WEAPON: its left click has no cooldown and it stays armed (equipped)
+while you attack - clicks and the armed timeout never un-arm it - and its M2 (the weapon's special attack)
+works normally.
+Snap Gelidus is special: right click starts it RUNNING, the cooldown only starts when you LEFT click
+(which stops it).
+A normal move can also have an "M2" cooldown (its right-click variant): key + RIGHT click starts it, in
+blue. It does NOT count as a snap spell and shares nothing with the snap cooldown. By default M1 (left)
+and M2 (right) SHARE a cooldown: using either puts both on the cooldown of the one you used. Right-click
+the M2 box of a move to switch it to "doesn't share" (the box turns green): then each has its own timer.
+
+Every key press and click is caught with Windows low-level hooks, in order, so very fast input
+(AutoHotkey taps, rapid key + click combos) is not missed.
+
+Every class can have its own PROFILE (move list + keys + cooldowns). Make one per class on the Main tab.
+
+Hotkeys:  F2 = find the hotbar (rebindable)   F7 = test overlay (rebindable)   F8 = hide / show window (rebindable)
+Needs:    pip install mss numpy pillow keyboard      (Windows - run as administrator for the hotkeys)
+Files:    scroom_assets.py must sit next to this file. Put Manufaktur.ttf next to it too (optional).
+"""
+import collections, ast, subprocess, base64, ctypes, hashlib, urllib.request, zlib, glob, io, json, math, os, queue, re, sys, threading, time, traceback
+import urllib.error
+import tkinter as tk
+import tkinter.font as tkfont
+from ctypes import wintypes
+
+IS_WIN = os.name == "nt"
+if IS_WIN:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)      # real pixels, so the overlay lines up
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+import numpy as np
+import mss
+import keyboard
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
+import scroom_assets as ART
+pyaudio_error = ""
+try:
+    import pyaudiowpatch as pyaudio            # Windows "loopback": listens to what the game plays (Snap Training)
+except Exception as _ex:
+    pyaudio, pyaudio_error = None, f"{type(_ex).__name__}: {_ex}"
+
+# ---- where files live: the script's folder, or the .exe's folder when built with PyInstaller ----
+if getattr(sys, "frozen", False):
+    APP_DIR = os.path.dirname(sys.executable)
+    RES_DIR = getattr(sys, "_MEIPASS", APP_DIR)
+else:
+    APP_DIR = RES_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    os.chdir(APP_DIR)
+except Exception:
+    pass
+
+CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
+
+# ======================= UPDATES =======================
+# The macro can update itself from a web folder YOU control (GitHub is the easiest - see README_BUILD.txt).
+# Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
+# In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
+# Leave it empty to switch the update button off. (Users can also type a link in Settings.)
+APP_VERSION = "1.0.0"
+UPDATE_BASE_URL = ""
+
+# ======================= SETTINGS =======================
+HOTBAR_KEYS = ("1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=")
+KEY_ALIASES = {"minus": "-", "equal": "=", "equals": "="}
+# virtual-key code -> name, for the 12 hotbar keys (+ Esc for cancelling pickers)
+VK_NAME = {0x31: "1", 0x32: "2", 0x33: "3", 0x34: "4", 0x35: "5", 0x36: "6", 0x37: "7", 0x38: "8",
+           0x39: "9", 0x30: "0", 0xBD: "-", 0xBB: "=", 0x1B: "esc"}
+VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
+
+# Where the hotbar is on a 1920x1080 screen: the parchment inside slot 1 (x, y, w, h) and the
+# distance from one slot to the next (pitch). Press F2 and the program finds the real values itself.
+DEFAULT_BAR = {"x": 537, "y": 1014, "w": 54, "h": 53, "pitch": 72.0}
+
+DEFAULT_SETTINGS = {
+    "topmost": True,         # keep this window above the game
+    "only_in_game": True,    # only react to keys / clicks while the game window is the active window
+    "game_title": "Roblox",  # ...a window whose title contains this text
+    "arm_timeout": 30.0,     # seconds a pressed key stays armed waiting for the click (0 = forever)
+    "cancel_on_repeat": True,    # pressing the armed key again UN-ARMS it (press 1 = armed, press 1 again = not armed)
+    "grace": 0.25,           # a click this close to the end of a cooldown already counts as ready
+    "opacity": 0.3,          # strength of the red box, 0.1 - 1
+    "tenths_under": 3.0,     # show 2.4 instead of 3 below this many seconds (0 = whole seconds only)
+    "box_grow": 1,           # make every red box this many px bigger on each side (negative = smaller)
+    "mana_only_focused": True,  # show the Mana Overlay and the Decorations only while the game window is in front
+    "mana_on": True,         # draw the Mana Overlay (the tick marks + cast marks) over the mana bar
+    "decor_on": True,        # show the Decorations (your own pictures on the screen)
+    "dash_on": True,         # Dash / PB CD: show the Dash coin
+    "pb_on": True,           # Dash / PB CD: show the PB coin
+    "fist_on": True,         # Dash / PB CD: show the Fist M2 coin (a right click while nothing is armed)
+    "fist_cd": 2.8,
+    "fist_need_cross": True,   # the Fist M2 coin only counts while Shiftlock is on (the cursor sits in the middle of the game window)
+    "mascot_on": True,       # show the little Scroom while this window is hidden and the game isn't in front
+    "mana_dash_timeout": 0.2,  # seconds: after a mana dash, dash key presses are ignored for this long
+    "mana_pct_on": True,     # show the mana % as a number on top of the mana bar
+    "dash_cd": 1.5,          # seconds
+    "pb_cd": 3.0,
+    "mana_dash_cd": 5.2,     # every blue coin
+    "dj_cd": 4.1,            # Whisperer's Double Jump cooldown
+    "dj_window": 0.5,        # two Space presses this close together = a double jump
+    "soul_dur": 25.0,        # Soul Berserk (Wraith Knight): how long the buff lasts
+    "soul_cd": 35.0,         # ...and its cooldown, which starts when the buff ends
+    "awk_dur": 25.5,         # Dzin's Awakened: how long it lasts
+    "awk_cd": 60.0,          # ...and its cooldown, which starts when it ends (or when the dodges run out / it is switched off)
+    "awk_dodges": 10,        # the dodges Awakened gives
+    "fisch_cd": 60.0,        # Fischeran: the dodges' regeneration time (starts when you are hit)
+    "agi_dur": 10.0, "agi_cd": 30.0,             # Agility: how long it lasts / its cooldown (starts when it ends)
+    "bane_dur": 10.0, "bane_dur_mana": 20.0, "bane_cd": 25.0,   # Bane (the longer time is used with Dragon Sage / Faceless dashes on)
+    "levi_dur": 35.0, "levi_cd": 40.0,          # Leviathan Plunge
+    "hyper_dur": 90.0, "hyper_cd": 30.0,        # Hyper Body
+    "vind_dur": 5.0, "vind_cd": 10.0,            # Tempest Soul (Vind Soul)
+    "flock_dur": 2.0, "flock_cd": 25.0,          # Flock (Flocked)
+    "stand_dur": 30.0, "stand_cd": 6000.0,       # Bloodline (Last Stand, then a 5 s Red Veil debuff; the cooldown starts after it)
+    "pto_dur": 60.0, "pto_cd": 6000.0,           # Galvanize (Potions Timeout: starts 1.8 s after the click)
+    "song_switch_cd": 3.0,   # Songs: leaving a song before its Error Meter is empty puts the other songs on this cooldown (placeholder)
+    "kda_kill": False, "kda_death": False, "kda_assist": False, "kda_knock": False,     # Other Stuff > KDA: which counters are shown
+    "kda_n_kill": 0, "kda_n_death": 0, "kda_n_assist": 0, "kda_n_knock": 0,           # ...and their numbers
+    "auto_bard": True,       # play the Song minigame by itself while the Error Meter is up (needs opencv-python)
+    "bard_offset_ms": -12.0, # Auto Bard click timing: negative = a bit before the ring closes
+    "song_fail_cd": 10.0,    # ...the Error Meter running empty (Song Fail) puts them on this one (placeholder)
+    "shard_cd": 15.0,        # Sapphire / Opal / Ruby Shard: using one puts all of them on this cooldown
+    "flood_dur": 30.0, "flood_cd": 6000.0,      # Flood (Flood Infinite): the buff, then a 15 s Flood Finite debuff; it resets when the hotbar disappears
+    "awk_read": True,        # read the 'Dodges: x' text on the screen to count the dodges (off = only the timers)
+    "mana_dash_min": 3.0,    # the mana dash happens when the mana bar is filled at least this much (%)
+    "key_dash": "q",
+    "key_pb": "f",
+    "mana_opacity": 0.6,     # strength of the cast-mark boxes, 0.1 - 1
+    "update_check": True,    # look for a new version when the program starts (only if an update link is set)
+    "update_base": UPDATE_BASE_URL,   # the web folder the updates come from
+    "inv_hide": True,        # hide the coins while the inventory is open
+    "inv_equip": True,       # clicking a known item (Fire Protection, ...) in the inventory = equipping it
+    "potion_cd": 6.0,             # every potion: this long a cooldown for ALL potions, from the moment a drink is finished
+    "fire_dur": 120.0,            # Fire Protection (potion) lasts this many seconds
+    "feather_dur": 30.0,         # Feather Feet (potion)
+    "inv_box_color": "#46e060",   # the outline around the recognised inventory cards
+    "inv_box_width": 3,
+    "inv_box_opacity": 0.6,
+    "buff_numbers": True,         # the seconds left as a number on the potion effect icons
+    "dblood_sound": True,         # Dragon Blood: listen for its low-health turning-off sound while it is on
+    "inv_items": {},         # the item pictures learned by the user: name -> base64 (see inv_card_sig)
+    "click_equip": True,     # clicking a hotbar slot with the mouse equips that move (same as pressing its key)
+    "detect_disarm": True,   # watch the hotbar: Weapon gone from it = disarmed (moves removed, cooldowns reset)
+    "key_hide": "f8",
+    "key_area": "f2",
+    "key_test": "f7",
+    "key_mana": "f3",
+    "key_snaptrain": "'",    # starts / stops Snap Training (Extras tab)
+    "key_brew": "f4",        # starts / stops the Potion Brewer / Weapon Crafter (Extras > Automation)
+    "brew_click_ms": 100.0,  # Potion Brewer: wait between two clicks (milliseconds)
+    "brew_pick_ms": 20.0,   # ... after choosing an item (key / inventory card), before the first click
+    "brew_after_s": 0.3,     # ... after clicking the Wooden Spoon / Hammer, before the next round (seconds)
+    "brew_arrive_ms": 20.0,  # ... after the cursor arrives on a spot, before the click (the game needs a moment to see it)
+    "brew_hold_ms": 5.0,    # ... how long each click is held down
+    "brew_webhook": "",       # ... Discord webhook link: Alchemy/Smith posts "Ran out of Ingredient!" / "Made x Potion/Weapons!" there
+    "key_imenu": "[",          # Instant Menu: moves the mouse onto the game's Menu button and clicks it (Extras > Other Stuff > Instant Menu)
+    "key_gank": "]",           # sends a screenshot of the game to the Gank Ping webhook (Extras > Other Stuff)
+    "gank_webhook": "",       # ... the Discord webhook link for it
+    "gank_name": "",          # ... the name shown in the message
+    "brew_nudge": False,      # ... a tiny 1 px mouse wiggle after moving (helps the game notice the cursor)
+    "brew_wait_s": 0.25,      # ... after putting the last item away, before clicking the Wooden Spoon / Hammer (seconds)
+    "train_g_ms": 20.0,      # wait between two G spam presses in ms while training (blank = no spamming)
+    "train_g_hold_ms": 200.0,  # how long each G spam press is held down in ms (blank = a quick tap)
+    "train_mid_pct": 60.0,    # Perfect %: cast only in the middle this much (%) of the cast mark's height
+    "train_mana_empty": True,  # stop training and hold G again as soon as the mana drops under the cast band
+    "train_mana_wait": 0.5,    # seconds between "mana is empty" (training stops at once) and holding G
+    "cast_match": 0.99,      # how closely a sound must match the cast sound to count (0.5 = loose, 0.99 = strict)
+    "train_key": "",         # the hotbar key of the spell that Snap Training casts ("" = not chosen yet)
+}
+# where the mana bar is (the whole overlay picture goes there: x, y, w, h in screen pixels) and what is drawn.
+# zone = where 100% and 0% are, as a fraction of the picture's height (the built-in picture's tick marks).
+DEFAULT_MANA = {"x": 15, "y": 551, "w": 56, "h": 359, "image": "", "zone": [0.0191, 0.9844]}
+MARK_COLORS = {"move": "#abe9ed", "snap": "#7aa8ff"}       # default colour of a cast mark (normal / snap)
+HOTKEY_ACTIONS = (("area", "Find the hotbar"), ("mana", "Find the mana bar"), ("test", "Test overlay"),
+                  ("hide", "Hide / show window"), ("snaptrain", "Snap Training on / off"),
+                  ("brew", "Potion Brewer / Weapon Crafter on / off"), ("gank", "Gank Ping screenshot"), ("imenu", "Instant Menu"))
+
+# RUNNING snap spells (hardcoded). A snap spell whose NAME contains one of these words does not start its
+# cooldown when you right click it: it just starts RUNNING (as long as you like). The cooldown starts at
+# your next LEFT click, which stops it. Works in every profile. Add more words here if needed.
+RUNNING_SNAPS = ("gelidus",)
+
+# first start only: the default profile is Solan. Weapon (blank cooldown = a weapon), the four Charges (5 s
+# activation cooldown) and Charged Blow. The Charged Blow cooldowns below are the starting values - edit them!
+DEFAULT_PROFILE = "Solan"
+SEED_SOLAN = (("1", "Sword", 0.0), ("2", "Thunder Charge", 5.0), ("3", "White Fire Charge", 5.0),
+              ("4", "Flame Charge", 5.0), ("5", "Ice Charge", 5.0), ("6", "Charged Blow", 0.0))
+SEED_CHARGED = {"thunder": 13.0, "white fire": 12.0, "flame": 12.0, "ice": 18.0}
+# ========================================================
+
+
+# SOLAN: four Charge moves, and Charged Blow which uses the last Charge (it stays remembered). Only the NAMES are built in; the
+# cooldowns are typed by the user. (name the moves exactly like this in the profile)
+CHARGES = (("thunder", "Thunder Charge"), ("white fire", "White Fire Charge"),
+           ("flame", "Flame Charge"), ("ice", "Ice Charge"))
+# WRAITH KNIGHT: almost the same as Solan - three Charges and "Dark Charged Blow" (the Dark version of Charged Blow).
+# The starting cooldowns of the three Dark Charged Blows are below (the user can change them).
+WK_CHARGES = (("fallen lightning", "Fallen Lightning"), ("darkflame burst", "Darkflame Burst"),
+              ("impure crystal", "Impure Crystal"))
+WK_ALIASES = {"dark flame burst": "darkflame burst", "impure crystals": "impure crystal"}   # other ways to write them
+SEED_DARK = {"fallen lightning": 10.5, "darkflame burst": 16.5, "impure crystal": 11.0}
+SOLAN_KINDS = tuple(k for k, _ in CHARGES)
+WK_KINDS = tuple(k for k, _ in WK_CHARGES)
+CHARGE_LABEL = dict(CHARGES + WK_CHARGES)
+# RIFT DIVE (hardcoded): left click = you go under the ground. Left click again (not in the first second) = you come
+# up. After 5 seconds you come up by yourself. The move's cooldown starts when you come up.
+RIFT_DIVE_NAME = "rift dive"
+DIVE_LOCK = 1.0             # seconds after diving in which another click can NOT bring you up (spam failsafe)
+DIVE_MAX = 5.0              # seconds under the ground before you come up by yourself
+BLADE_MAX = 3.5             # Blade Crash is shorter: you come back down by yourself after this many seconds
+CHARGE_LIFETIME = 30.0      # a Charge is forgotten this many seconds after it was activated
+# BLADE CRASH works like Rift Dive (you go UP in the air instead of under the ground): the same 1 s click lock and
+# the same 5 s limit. For both, the cooldown starts DIVE_CD_DELAY seconds after you come back down / up.
+BLADE_CRASH_NAME = "blade crash"
+DIVE_CD_DELAY = 1.0
+# VANGUARD: "Azure Ignition" (a left click, like a Charge) turns on the Azure variants of Brandish, Puncture and
+# Blade Crash. While it is on, using one of those moves puts the typed Azure cooldown on the move's slot in the blue
+# (M2) box - it shares its cooldown with the normal move. Only the names are built in; the cooldowns are typed.
+AZURE_IGNITION_NAME = "azure ignition"
+AZURES = (("brandish", "Azure Brandish"), ("puncture", "Azure Puncture"), ("blade crash", "Azure Blade Crash"))
+AZURE_LABEL = dict(AZURES)
+AZURE_BASE = {"brandish": "Brandish", "puncture": "Puncture", "blade crash": "Blade Crash"}
+AZURE_LIFETIME = 30.0       # Azure Ignition is forgotten this many seconds after it was activated
+
+
+def _norm_name(name):
+    return " ".join(str(name or "").lower().split())
+
+
+def is_soul_name(name):
+    """Wraith Knight's Soul Rip is found by its NAME (in the profile's Moves or in its Inventory)."""
+    return _norm_name(name) == "soul rip"
+
+
+SHARDS = ("Sapphire Shard", "Opal Shard", "Ruby Shard")        # they share one cooldown (the Hammer's shards)
+
+
+def is_shard_name(name):
+    """Sapphire / Opal / Ruby Shard are found by their NAME (in the profile's Moves or in its Inventory)."""
+    return _norm_name(name) in {_norm_name(n) for n in SHARDS}
+
+
+SONGS = ("Symphony of Horses", "Sweet Soothing", "Vinifera's Song", "Song of Lethargy", "Joyous Dance")
+_SONG_KEYS = {re.sub(r"[^a-z]", "", n.lower()) for n in SONGS}
+
+
+def is_song_name(name):
+    """The five Songs are found by their NAME (in the profile's Moves or in its Inventory); punctuation / spaces don't matter."""
+    return re.sub(r"[^a-z]", "", str(name or "").lower()) in _SONG_KEYS
+
+
+def is_hammer_name(name):
+    return _norm_name(name) == "hammer"
+
+
+def is_awk_name(name):
+    """Dzin's Awakened is found by its NAME (in the profile's Moves or in its Inventory)."""
+    return _norm_name(name) == "awakened"
+
+
+# the buff moves: found by name, a LEFT click starts them (name, duration setting, cooldown setting, the extra box's name)
+BMOVES = {"agility": ("Agility", "agi_dur", "agi_cd", "Agility Duration"),
+          "bane": ("Bane", "bane_dur", "bane_cd", "Bane Duration"),
+          "leviathan": ("Leviathan Plunge", "levi_dur", "levi_cd", "Leviathan Duration"),
+          "hyper": ("Hyper Body", "hyper_dur", "hyper_cd", "Hyper Body Duration"),
+          "flood": ("Flood", "flood_dur", "flood_cd", "Flood Infinite Duration"),
+          "tempest": ("Tempest Soul", "vind_dur", "vind_cd", "Vind Soul Duration"),
+          "flock": ("Flock", "flock_dur", "flock_cd", "Flocked Duration"),
+          "bloodline": ("Bloodline", "stand_dur", "stand_cd", "Last Stand Duration"),
+          "galvanize": ("Galvanize", "pto_dur", "pto_cd", "Potions Timeout Duration"),
+          "silverguard": ("Silverguard", None, None, ""),          # these two last until they are turned off (no duration / cooldown)
+          "dragonblood": ("Dragon Blood", None, None, "")}
+TOGGLE_BM = ("silverguard", "dragonblood")
+FLOOD_DEBUFF = 15.0                # Flood Infinite is followed by the Flood Finite debuff for this many seconds
+BM_TITLE = {"flood": "Flood Infinite", "floodfinite": "Flood Finite", "tempest": "Vind Soul", "flock": "Flocked",
+            "bloodline": "Last Stand", "redveil": "Red Veil", "galvanize": "Potions Timeout"}          # (what the buff / the debuff are called)
+# buffs that are followed by a debuff (kind -> (debuff icon, seconds)): their cooldown starts when the debuff ends
+BM_DEBUFF = {"flood": ("floodfinite", FLOOD_DEBUFF), "bloodline": ("redveil", 5.0)}
+GALVANIZE_DELAY = 1.8              # Galvanize: the Potions Timeout debuff starts this long after the click
+BM_NO_RESET = ("bloodline", "galvanize", "flock")        # (only Flood is reset when the hotbar disappears)
+TOGGLE_LOCK = 1.0                  # seconds after turning one on in which it can't be turned off
+DBLOOD_DEAF = 2.5                  # seconds after turning Dragon Blood on in which its sound is ignored (that is the turning-on sound)
+BMOVE_BY_NAME = {_norm_name(v[0]): k for k, v in BMOVES.items()}
+
+
+def bmove_kind(name):
+    return BMOVE_BY_NAME.get(_norm_name(name))
+
+
+def charge_kind(name):
+    """'Thunder Charge' -> 'thunder' (any capitals / extra spaces); None for every other name."""
+    n = _norm_name(name)
+    n = WK_ALIASES.get(n, n)
+    for kind, label in CHARGES + WK_CHARGES:
+        if n == label.lower():
+            return kind
+    return None
+
+
+def is_charged_blow(name):
+    """The move called 'Charged Blow' (any capitals / extra spaces)."""
+    return _norm_name(name) == "charged blow"
+
+
+def is_dark_charged_blow(name):
+    """The Wraith Knight's move called 'Dark Charged Blow'."""
+    return _norm_name(name) == "dark charged blow"
+
+
+def is_azure_ignition(name):
+    return _norm_name(name) == AZURE_IGNITION_NAME
+
+
+def azure_kind(name):
+    """'Brandish' -> 'brandish' (the NORMAL move that has an Azure variant); None for every other name."""
+    n = _norm_name(name)
+    for kind, base in AZURE_BASE.items():
+        if n == base.lower():
+            return kind
+    return None
+
+
+def is_blade_crash(name):
+    return _norm_name(name) == BLADE_CRASH_NAME
+
+
+def is_dive_move(name):
+    n = _norm_name(name)
+    return n == RIFT_DIVE_NAME or n == BLADE_CRASH_NAME
+
+
+def clean_charged(d):
+    """{kind: cooldown seconds >= 0}: the four Charged Blow cooldowns (Solan), the three Azure cooldowns (Vanguard)
+    and the three Dark Charged Blow cooldowns (Wraith Knight - they start at SEED_DARK when nothing was saved)."""
+    out = {}
+    d = d if isinstance(d, dict) else {}
+    for kind, _ in CHARGES + AZURES + WK_CHARGES:
+        try:
+            out[kind] = max(0.0, float(d[kind] or 0.0)) if kind in d else float(SEED_DARK.get(kind, 0.0))
+        except Exception:
+            out[kind] = float(SEED_DARK.get(kind, 0.0))
+    return out
+
+
+def norm_key(name):
+    name = (name or "").strip().lower()
+    return KEY_ALIASES.get(name, name)
+
+
+def is_rift_dive(name):
+    return _norm_name(name) == RIFT_DIVE_NAME
+
+
+def seed_profiles():
+    return {DEFAULT_PROFILE: [{"key": k, "name": n, "cd": cd, "cd2": 0.0, "split": False} for k, n, cd in SEED_SOLAN]}
+
+
+def clean_moves(moves, m2=False):
+    """A saved move list -> a clean list: valid hotbar keys, one entry per key, cooldown >= 0.
+    m2=True (normal moves): also keeps the optional right-click cooldown "cd2" (0 = none) and "split"
+    (True = M1 and M2 DON'T share a cooldown; the default False = they share)."""
+    lst, used = [], set()
+    for m in (moves if isinstance(moves, list) else []):
+        try:
+            key = norm_key(str(m["key"]))
+            cd = max(0.0, float(m.get("cd", 10)))
+            nm = str(m.get("name", ""))
+            cd2 = max(0.0, float(m.get("cd2") or 0.0))
+            if m.get("spell"):
+                cd2 = 0.0                                  # a Normal Spell has no M2 (its right click is a snap spell)
+        except Exception:
+            continue
+        if key in HOTBAR_KEYS and key not in used:
+            used.add(key)
+            ue = bool(m.get("unequip", False))                # right-click the name box: unequips after use
+            d = ({"key": key, "name": nm, "cd": cd, "cd2": cd2, "split": bool(m.get("split", False)), "unequip": ue}
+                 if m2 else {"key": key, "name": nm, "cd": cd, "unequip": ue})
+            if m2 and m.get("spell"):
+                d["spell"] = True                          # listed under "Normal Spells" (hovering one removes Charge / Azure)
+            if m2 and is_soul_name(nm) and not d.get("spell"):
+                d["soul"] = True                           # Wraith Knight's Soul Rip: found by its name (a weapon-like move, blank cooldowns)
+                d["cd"], d["cd2"] = 0.0, 0.0
+            if m2 and bmove_kind(nm) and not d.get("spell"):
+                d["bmove"] = bmove_kind(nm)                # Agility / Bane / Leviathan Plunge / Hyper Body: found by name
+                d["cd"], d["cd2"] = 0.0, 0.0
+            if m2 and is_awk_name(nm) and not d.get("spell"):
+                d["awk"] = True                            # Dzin's Awakened: found by its name (cooldowns are the Races page's)
+                d["cd"], d["cd2"] = 0.0, 0.0
+            lst.append(d)
+    return lst
+
+
+# ----------------------------------------------------------------------------
+# Share codes: a profile (moves + snap spells) as one line of text you can paste to a friend
+#   CDI1-<base64 of zlib-compressed JSON>.   Hotkeys, hotbar position and other settings are NOT shared.
+# ----------------------------------------------------------------------------
+SHARE_PREFIX = "CDI1-"
+
+
+def make_share_code(cfg, names):
+    """Share code for the given profile names."""
+    profs = []
+    for n in names:
+        if n not in cfg["profiles"]:
+            continue
+        profs.append({"n": n,
+                      "m": [[m["key"], m["name"], m["cd"], m.get("cd2", 0.0), bool(m.get("split", False)), bool(m.get("unequip", False)),
+                             bool(m.get("spell", False))]
+                            for m in cfg["profiles"][n]],
+                      "s": [[m["key"], m["name"], m["cd"], bool(m.get("unequip", False))] for m in cfg["snaps"].get(n, [])],
+                      "k": [[m["key"], m["kind"], m["lo"], m["hi"], m["color"]] for m in cfg.get("marks", {}).get(n, [])],
+                      "c": clean_charged(cfg.get("charged", {}).get(n))})
+        po = cfg.get("popts", {}).get(n, {})
+        if po.get("mana_dash"):
+            profs[-1]["d"] = 1                                # Dragon Sage / Faceless dashes are on in this profile
+        if po.get("whisper_dj"):
+            profs[-1]["j"] = 1                                # Whisperer's Double Jump
+        if po.get("fischeran"):
+            profs[-1]["f"] = 1                                # Fischeran dodges
+        inv = [[e["name"], e["cd"], e.get("cd2", 0.0), bool(e.get("split")), bool(e.get("potion")), e.get("color", "")]
+               for e in cfg.get("inv", {}).get(n, []) if not e.get("builtin") or e.get("color") != INV_POTION_COLOR.get(e["name"])]
+        if inv:
+            profs[-1]["i"] = inv                              # the profile's Inventory moves (names + cooldowns; the card pictures are NOT shared)
+    raw = json.dumps({"v": 1, "p": profs}, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return SHARE_PREFIX + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
+
+
+def read_share_code(code):
+    """Share code -> [(name, moves, snaps, marks, charged)] with clean lists. Raises ValueError with a readable reason."""
+    code = "".join(str(code).split())                         # pasting from chat adds spaces / line breaks
+    if not code.startswith(SHARE_PREFIX):
+        raise ValueError("That isn't a Cooldown Indicator share code (it should start with " + SHARE_PREFIX + ").")
+    if len(code) > 60000:
+        raise ValueError("That code is far too long.")
+    try:
+        body = code[len(SHARE_PREFIX):]
+        zd = zlib.decompressobj()
+        d = zd.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)), 400000)
+        if not zd.eof:                                        # cut off (the checksum at the end is missing)
+            raise ValueError("incomplete")
+        data = json.loads(d.decode("utf-8"))
+        out = []
+        for p in data["p"][:30]:
+            name = str(p["n"]).strip()[:40] or "Imported"
+            moves = clean_moves([{"key": a[0], "name": a[1], "cd": a[2], "cd2": a[3], "split": a[4],
+                                  "unequip": a[5] if len(a) > 5 else False, "spell": a[6] if len(a) > 6 else False}
+                                 for a in p["m"]], m2=True)
+            snaps = clean_moves([{"key": a[0], "name": a[1], "cd": a[2], "unequip": a[3] if len(a) > 3 else False}
+                                 for a in p["s"]])
+            marks = clean_marks([{"key": a[0], "kind": a[1], "lo": a[2], "hi": a[3], "color": a[4]}
+                                 for a in p.get("k", [])])
+            out.append((name, moves, snaps, marks, clean_charged(p.get("c"))))
+    except Exception:
+        raise ValueError("That code is damaged or incomplete - copy the whole line again.")
+    if not out:
+        raise ValueError("That code has no profiles in it.")
+    return out
+
+
+# The default profiles that come with a version. DEFAULT_PACK_CODE is a share code (Profile > Share > "all profiles") of the profiles
+# every user should have. The FIRST time a config that hasn't got this DEFAULT_PACK_VERSION yet is opened (an old config after
+# an update, or a brand-new one), the profiles of the code whose names are missing are added - nothing that exists is ever
+# changed, and the active profile stays. Raise DEFAULT_PACK_VERSION whenever the code changes so everyone gets the new ones once.
+DEFAULT_PACK_VERSION = "1.2.0"
+DEFAULT_PACK_CODE = (
+    "CDI1-eNrtWd9P4zgQ_lcsv9xLhNJCyw_pHmihC7fdAzVoeUA8uImbWHXtyHHodRH_-804Ldt2IU5Z7WkF9wC0Yca_vm--GU8e6QM"
+    "9aQU0pyd3j1TRE3rGJ6yUlkRaMkUDOoP_3NEWfIrm2iQ0CPfCYB9-JkwWfP33fXBH22B3k5Uq4Yb0M2ZSToMOGIevOeyDw20mLCc"
+    "DYXgznwPwGUg2a2jeAfPLuKFxF4yv9WzGJYmsEVOwb3X2Oq87HIPDaWyFViQq3fjtsG6CEOyrlSSkJ_UcD7Rm-D_B_GKRw3GOdbK"
+    "oTv9l4_uAFoAV_JlWf2J68khtBQaA3AYvOndHPYGjXj2Z4EGuvogYPx7hx7FhKhFFRk9wOpqXKrYlurmvY8kSTmLDng1gEZIrIkW"
+    "aWSVUCuPgxmjCzNTNQcalKSw87uJjMcthNBhhUVgm4WlrL3x6CjY5ONIw0gYHPzPLFGtCQiNyyUkkcYVBK_RxsOc2NBh-N2_DigJ"
+    "ryhfpF81hu3pORvyBmwI2gCwJq1-vknAAHnAypK9LZQETz7KQin0mZ-SLUBB3B523Qh9uIx-uAR8-4x7-LrCDHhTAeDyhNehHLBf"
+    "4yAv935wnkv9RkPMFd2fcqYf-XPKUKbvGlU699lwiekanDKMe4r1WH7pOETm5ZUxYHL4OcicmqZDC_kyo_-54w2OHaiQkRE9aslV"
+    "a2d4tpff32-Q4tQDTZl7KOWvCixuRMElAGBKuLABx4NOEaMrnLkzbvmx0wUyuIQP4QhpVIOIm50i3RukF6XMVc6aAz9dGWx5XpOv"
+    "WznO4poCrabp1Dke4CadKMM9AxyUc8X74UQTnjPN8qnDENxFriJ4E1SlGuhz7eAXpXyhyXcoqbXQ9ajPLGeDoI8rbqLUTSZBVUTn"
+    "-xo3eoTga8gfBbMZgx7JUWCB56yPEg0QsNmKCRKmb5L0x0bAUK0nJFlvprwkZ93cG6GA1MumbsshwziMfy1b1_cqvypreqno3ciL"
+    "XbrFYijRuu3XoS5vLkxtV5p33mzsn7sJWZdDlpuEeoXdJoeNFUUABO92i2CfDmS0a3vKiTJcSadCr8O_6VM_NCgk4imGaWRNi3hr"
+    "QjUkpyZCzHBxadVKJzByJCYSQeMBLWPfDJK-lZDCU1jU0h6tJyLkc4z1zq7D9frXZyGPO48zo_Ie6Z9MBIf2iFSusiCGmmUKhPnj"
+    "V450d-lemlnXrW-Pn9BvOcpkqURV03mtKdUNdym19jwGDp7c6JYwbT0l6vTrCoHXslfHGcf9LIHebWcO8wmwD9PYvQ_1KiQ3Az_g"
+    "MIm8gRY5pM3Q_rwVXZRtZnjfAOsqhQPws4qknahHo03_40vTYh_OQp6QHJHXCv0WLzYG7Tk2LSgtQX5x950PEdnQhlB5vIc3StFH"
+    "zIcpYoudYSyElDuthvprLta7DUX1AfzIsh1qdBofeAq0q6qs1k5vMvKD-L0T2kEOVXrUe9kNvy9PfpVgW8z2m-DtuZmyzZ8BiLnl"
+    "RgFjwn6EQDKQada8sVO2cNW1X_8-P_7xgT-DTDy1Og91A8vmFpkPD-mFQre25ZmvwnuXsedk9t2z_W5bLakf9akdFgxctu7wK2fl"
+    "dy-FyE2SHFyjY2YqgZCEjkX8gGZLQLQd_UWyy64LBcRtPVDoR8vVmN-sVSE0Zvr8D7fI6ILGuclSsBsbuWleOF42MDz9E-3wb6j5"
+    "M4m5f6yqymOWZVguiJ-RCm4IXvta0A33OOb751TZziuJ_bfZVKDHhhkHXONJ-F9duAjtclksnJl006Zn_pRe6LCBjuX223i-090_"
+    "_Anfsnzg"
+)
+
+
+def merge_default_pack(cfg, code=None, version=None):
+    """Adds the default pack's missing profiles to cfg (see above). Returns the names added ([] when nothing / already done)."""
+    code = DEFAULT_PACK_CODE if code is None else code
+    version = DEFAULT_PACK_VERSION if version is None else version
+    if not code or cfg.get("pack") == version:
+        return []
+    try:
+        items = read_share_code(code)
+        opts = read_share_opts(code)
+        invs = read_share_inv(code)
+    except ValueError:
+        return []
+    taken = {n.strip().lower() for n in cfg["profiles"]}
+    added = []
+    for i, (name, moves, snaps, marks, charged) in enumerate(items):
+        if name.strip().lower() in taken:
+            continue                                         # you already have a profile with that name: yours stays untouched
+        taken.add(name.strip().lower())
+        cfg["profiles"][name] = moves
+        cfg["snaps"][name] = snaps
+        cfg["marks"][name] = marks
+        cfg["charged"][name] = charged
+        cfg["popts"][name] = dict(default_popts(), **(opts[i] if i < len(opts) else {}))
+        cfg["inv"][name] = invs[i] if i < len(invs) else clean_inv(None)
+        added.append(name)
+    cfg["pack"] = version
+    return added
+
+
+def read_share_opts(code):
+    """The per-profile options of a share code (read_share_code already checked it): [{"mana_dash": bool}, ...] in the same order."""
+    try:
+        body = "".join(str(code).split())[len(SHARE_PREFIX):]
+        d = zlib.decompressobj().decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)), 400000)
+        return [{"mana_dash": bool(p.get("d")), "whisper_dj": bool(p.get("j")), "fischeran": bool(p.get("f"))}
+                for p in json.loads(d.decode("utf-8"))["p"][:30]]
+    except Exception:
+        return []
+
+
+def read_share_inv(code):
+    """The Inventory moves of a share code: [[{name, cd, cd2, split, potion}, ...] per profile] (same order as read_share_code)."""
+    try:
+        body = "".join(str(code).split())[len(SHARE_PREFIX):]
+        d = zlib.decompressobj().decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)), 400000)
+        return [clean_inv([{"name": a[0], "cd": a[1], "cd2": a[2], "split": a[3], "potion": a[4], "color": a[5] if len(a) > 5 else ""} for a in p.get("i", [])])
+                for p in json.loads(d.decode("utf-8"))["p"][:30]]
+    except Exception:
+        return []
+
+
+MANA_PREFIX = "CDM1-"
+
+
+def make_mana_code(cfg, profile, with_image=True):
+    """Share code for the Mana Overlay: the cast marks of one profile, the 100% / 0% lines and (if there is one)
+    the custom picture. Where / how big it sits on the screen is NOT shared (that depends on the screen)."""
+    m = cfg["mana"]
+    data = {"v": 1, "z": [round(m["zone"][0], 4), round(m["zone"][1], 4)],
+            "k": [[x["key"], x["kind"], x["lo"], x["hi"], x["color"]] for x in cfg.get("marks", {}).get(profile, [])],
+            "i": ""}
+    if with_image and m.get("image"):
+        try:
+            img = load_mana_image(m["image"])
+            buf = io.BytesIO()
+            img.save(buf, "PNG", optimize=True)
+            data["i"] = base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            data["i"] = ""
+    raw = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    code = MANA_PREFIX + base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode("ascii").rstrip("=")
+    if len(code) > 50000 and data["i"]:                       # a huge picture: share the marks without it
+        return make_mana_code(cfg, profile, with_image=False)
+    return code
+
+
+def read_mana_code(code):
+    """Mana share code -> {"zone": [top, bottom], "marks": [...], "image": PIL RGBA picture or None}.
+    Raises ValueError with a readable reason."""
+    code = "".join(str(code).split())
+    if not code.startswith(MANA_PREFIX):
+        raise ValueError("That isn't a Mana Overlay code (it should start with " + MANA_PREFIX + ").")
+    if len(code) > 90000:
+        raise ValueError("That code is far too long.")
+    try:
+        body = code[len(MANA_PREFIX):]
+        zd = zlib.decompressobj()
+        d = zd.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)), 800000)
+        if not zd.eof:
+            raise ValueError("incomplete")
+        data = json.loads(d.decode("utf-8"))
+        zone = [float(data["z"][0]), float(data["z"][1])]
+        if not (0 <= zone[0] < zone[1] <= 1):
+            raise ValueError("zone")
+        marks = clean_marks([{"key": a[0], "kind": a[1], "lo": a[2], "hi": a[3], "color": a[4]} for a in data["k"]])
+        img = None
+        if data.get("i"):
+            img = Image.open(io.BytesIO(base64.b64decode(data["i"])))
+            if img.width * img.height > 4_000_000:
+                raise ValueError("picture too big")
+            img = img.convert("RGBA")
+    except Exception:
+        raise ValueError("That code is damaged or incomplete - copy the whole line again.")
+    return {"zone": zone, "marks": marks, "image": img}
+
+
+def unique_name(name, taken):
+    if name not in taken:
+        return name
+    i = 2
+    while f"{name} ({i})" in taken:
+        i += 1
+    return f"{name} ({i})"
+
+
+MANA_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAADgAAAFaCAYAAABLzZ77AAAABGdBTUEAALGPC/xhBQAACklpQ0NQc1JHQiBJRUM2MTk2Ni0yLjEA"
+    "AEiJnVN3WJP3Fj7f92UPVkLY8LGXbIEAIiOsCMgQWaIQkgBhhBASQMWFiApWFBURnEhVxILVCkidiOKgKLhnQYqIWotVXDjuH9yn"
+    "tX167+3t+9f7vOec5/zOec8PgBESJpHmomoAOVKFPDrYH49PSMTJvYACFUjgBCAQ5svCZwXFAADwA3l4fnSwP/wBr28AAgBw1S4k"
+    "Esfh/4O6UCZXACCRAOAiEucLAZBSAMguVMgUAMgYALBTs2QKAJQAAGx5fEIiAKoNAOz0ST4FANipk9wXANiiHKkIAI0BAJkoRyQC"
+    "QLsAYFWBUiwCwMIAoKxAIi4EwK4BgFm2MkcCgL0FAHaOWJAPQGAAgJlCLMwAIDgCAEMeE80DIEwDoDDSv+CpX3CFuEgBAMDLlc2X"
+    "S9IzFLiV0Bp38vDg4iHiwmyxQmEXKRBmCeQinJebIxNI5wNMzgwAABr50cH+OD+Q5+bk4eZm52zv9MWi/mvwbyI+IfHf/ryMAgQA"
+    "EE7P79pf5eXWA3DHAbB1v2upWwDaVgBo3/ldM9sJoFoK0Hr5i3k4/EAenqFQyDwdHAoLC+0lYqG9MOOLPv8z4W/gi372/EAe/tt6"
+    "8ABxmkCZrcCjg/1xYW52rlKO58sEQjFu9+cj/seFf/2OKdHiNLFcLBWK8ViJuFAiTcd5uVKRRCHJleIS6X8y8R+W/QmTdw0ArIZP"
+    "wE62B7XLbMB+7gECiw5Y0nYAQH7zLYwaC5EAEGc0Mnn3AACTv/mPQCsBAM2XpOMAALzoGFyolBdMxggAAESggSqwQQcMwRSswA6c"
+    "wR28wBcCYQZEQAwkwDwQQgbkgBwKoRiWQRlUwDrYBLWwAxqgEZrhELTBMTgN5+ASXIHrcBcGYBiewhi8hgkEQcgIE2EhOogRYo7Y"
+    "Is4IF5mOBCJhSDSSgKQg6YgUUSLFyHKkAqlCapFdSCPyLXIUOY1cQPqQ28ggMor8irxHMZSBslED1AJ1QLmoHxqKxqBz0XQ0D12A"
+    "lqJr0Rq0Hj2AtqKn0UvodXQAfYqOY4DRMQ5mjNlhXIyHRWCJWBomxxZj5Vg1Vo81Yx1YN3YVG8CeYe8IJAKLgBPsCF6EEMJsgpCQ"
+    "R1hMWEOoJewjtBK6CFcJg4Qxwicik6hPtCV6EvnEeGI6sZBYRqwm7iEeIZ4lXicOE1+TSCQOyZLkTgohJZAySQtJa0jbSC2kU6Q+"
+    "0hBpnEwm65Btyd7kCLKArCCXkbeQD5BPkvvJw+S3FDrFiOJMCaIkUqSUEko1ZT/lBKWfMkKZoKpRzame1AiqiDqfWkltoHZQL1OH"
+    "qRM0dZolzZsWQ8ukLaPV0JppZ2n3aC/pdLoJ3YMeRZfQl9Jr6Afp5+mD9HcMDYYNg8dIYigZaxl7GacYtxkvmUymBdOXmchUMNcy"
+    "G5lnmA+Yb1VYKvYqfBWRyhKVOpVWlX6V56pUVXNVP9V5qgtUq1UPq15WfaZGVbNQ46kJ1Bar1akdVbupNq7OUndSj1DPUV+jvl/9"
+    "gvpjDbKGhUaghkijVGO3xhmNIRbGMmXxWELWclYD6yxrmE1iW7L57Ex2Bfsbdi97TFNDc6pmrGaRZp3mcc0BDsax4PA52ZxKziHO"
+    "Dc57LQMtPy2x1mqtZq1+rTfaetq+2mLtcu0W7eva73VwnUCdLJ31Om0693UJuja6UbqFutt1z+o+02PreekJ9cr1Dund0Uf1bfSj"
+    "9Rfq79bv0R83MDQINpAZbDE4Y/DMkGPoa5hpuNHwhOGoEctoupHEaKPRSaMnuCbuh2fjNXgXPmasbxxirDTeZdxrPGFiaTLbpMSk"
+    "xeS+Kc2Ua5pmutG003TMzMgs3KzYrMnsjjnVnGueYb7ZvNv8jYWlRZzFSos2i8eW2pZ8ywWWTZb3rJhWPlZ5VvVW16xJ1lzrLOtt"
+    "1ldsUBtXmwybOpvLtqitm63Edptt3xTiFI8p0in1U27aMez87ArsmuwG7Tn2YfYl9m32zx3MHBId1jt0O3xydHXMdmxwvOuk4TTD"
+    "qcSpw+lXZxtnoXOd8zUXpkuQyxKXdpcXU22niqdun3rLleUa7rrStdP1o5u7m9yt2W3U3cw9xX2r+00umxvJXcM970H08PdY4nHM"
+    "452nm6fC85DnL152Xlle+70eT7OcJp7WMG3I28Rb4L3Le2A6Pj1l+s7pAz7GPgKfep+Hvqa+It89viN+1n6Zfgf8nvs7+sv9j/i/"
+    "4XnyFvFOBWABwQHlAb2BGoGzA2sDHwSZBKUHNQWNBbsGLww+FUIMCQ1ZH3KTb8AX8hv5YzPcZyya0RXKCJ0VWhv6MMwmTB7WEY6G"
+    "zwjfEH5vpvlM6cy2CIjgR2yIuB9pGZkX+X0UKSoyqi7qUbRTdHF09yzWrORZ+2e9jvGPqYy5O9tqtnJ2Z6xqbFJsY+ybuIC4qriB"
+    "eIf4RfGXEnQTJAntieTE2MQ9ieNzAudsmjOc5JpUlnRjruXcorkX5unOy553PFk1WZB8OIWYEpeyP+WDIEJQLxhP5aduTR0T8oSb"
+    "hU9FvqKNolGxt7hKPJLmnVaV9jjdO31D+miGT0Z1xjMJT1IreZEZkrkj801WRNberM/ZcdktOZSclJyjUg1plrQr1zC3KLdPZisr"
+    "kw3keeZtyhuTh8r35CP5c/PbFWyFTNGjtFKuUA4WTC+oK3hbGFt4uEi9SFrUM99m/ur5IwuCFny9kLBQuLCz2Lh4WfHgIr9FuxYj"
+    "i1MXdy4xXVK6ZHhp8NJ9y2jLspb9UOJYUlXyannc8o5Sg9KlpUMrglc0lamUycturvRauWMVYZVkVe9ql9VbVn8qF5VfrHCsqK74"
+    "sEa45uJXTl/VfPV5bdra3kq3yu3rSOuk626s91m/r0q9akHV0IbwDa0b8Y3lG19tSt50oXpq9Y7NtM3KzQM1YTXtW8y2rNvyoTaj"
+    "9nqdf13LVv2tq7e+2Sba1r/dd3vzDoMdFTve75TsvLUreFdrvUV99W7S7oLdjxpiG7q/5n7duEd3T8Wej3ulewf2Re/ranRvbNyv"
+    "v7+yCW1SNo0eSDpw5ZuAb9qb7Zp3tXBaKg7CQeXBJ9+mfHvjUOihzsPcw83fmX+39QjrSHkr0jq/dawto22gPaG97+iMo50dXh1H"
+    "vrf/fu8x42N1xzWPV56gnSg98fnkgpPjp2Snnp1OPz3Umdx590z8mWtdUV29Z0PPnj8XdO5Mt1/3yfPe549d8Lxw9CL3Ytslt0ut"
+    "Pa49R35w/eFIr1tv62X3y+1XPK509E3rO9Hv03/6asDVc9f41y5dn3m978bsG7duJt0cuCW69fh29u0XdwruTNxdeo94r/y+2v3q"
+    "B/oP6n+0/rFlwG3g+GDAYM/DWQ/vDgmHnv6U/9OH4dJHzEfVI0YjjY+dHx8bDRq98mTOk+GnsqcTz8p+Vv9563Or59/94vtLz1j8"
+    "2PAL+YvPv655qfNy76uprzrHI8cfvM55PfGm/K3O233vuO+638e9H5ko/ED+UPPR+mPHp9BP9z7nfP78L/eE8/stRzjPAAAAIGNI"
+    "Uk0AAHomAACAhAAA+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAJcEhZcwAACxMAAAsTAQCanBgAAAo7SURBVHic7Z2/bhw3"
+    "EMZnT7KcwFBlNy4cwGkMu7cbASmsRnVqVfcQAvQAwQH3EKr0EGqEAAHU5AECpHKhIo0EBBACREqkdXHLNY/Hf0Nydmf2+AMEnfbu"
+    "lvxuSO4ePw7VfP74Hiy0toOL+QG8ebVvewrN9c0dnJ5duZ5ubAcvf/8DXU5jEdiWFIJFE74hMkXgrvH3mrjrm7v+CduxHFxlvHm1"
+    "D4v5AZyeXbXgiCQGXeBG5DxNiITzkyMAgKIilcD2/OQIjpcXfSHHywtYzA8A4JtQ9XcpzPPq5Z+eXUFXJ5tI/ZgaLxrjeQCAZgZd"
+    "5HyVWMwPiosDgP68vpbSlasPeubjpvtpbcd2AVZNQo+YpQCy5ur68Bbzg7WIauhigpiDzAaasOwO7zh/C1C++Stm6sH5ydFGlLTh"
+    "mkRcRwMAja1sS/TQBCPIHL25NrZjMwBojpcXxa5vJbm+uYPj5QVAV/nDTx/UU3qLsrWw/tgMukuEuvboWEYwKjZGcnVN7pppch1m"
+    "+h+ePkiNtQ/a0KIYRd9EXQWjzpaHtSy9iaYwC79ENkqgL4qjkRs9gPUIDtkcY8muk8gmevjpQ/RgI1KgIkakaIExiBcYiqL0e1EA"
+    "WBdpztuIj2CIyQk0m+zkBJpMUqAexUkMMr4JYfERDM12ixcYQrTAGK9CtMAYxA0yWIdJVART7DNRAlMQIzAlegCCBKYiQmBq9ACE"
+    "CNRoYXOW23ash71ALXpBs9P2/tB1cAhfghSvQCpT0oXNjzj89EFFEeXsKrwCh15lEYG58CBIqIkOPdsdqrjX7LS9IXgvenl773zu"
+    "8OXz0NujzoU4j02ENwixo2ij/cwAYAfAL95Ee+3MOF/wPFhPUMcbwa5gvTKPkD+yPnXl6tcvstE6JoK6uFL8D6tWEL2CIzWKIYGq"
+    "8JLiFA9a+WSDWUwEn6gKB4D/ACEuJYoc7mRQrcPnQ9jwCrQN35iRkwPom23stY/ynDFNNmnSKaVCFB9MDOy/LoXYOgPURHwEQ1SB"
+    "0qkCpTN5gZO4TPjuSZ0C//zrIbqAd6/3cDUqSOiGOzuCseIwH1hJsvogJnIUUSa1sFMqPEZTTmqiORV993ovq7mSW9glopB6DnIL"
+    "u2QTG6q5RgukqBDmnKkmqLMPDvUJ5/bJECxu1UIf5iQs7MgWg7awOcyLerFY2Ppj27E1WDm8P//y68Yxh8MbPRvO3uENRDAIK4f3"
+    "3eu94l2CzSDjwkhrVQOKaWE7IyrtCy+ZhT0qORa2CIE5iBFIZWGLR5RACgubHVgLW1QEUxAtsJiFHbvwYCyb2oc3gpe39+j1aEOv"
+    "wsi1sJMWoV7e3g8aTZ/ImCa6070OFRouzTpmkGlhtZzre9KaEBESqJrnE6yWXBUXSd1nY5qoEvkItAvzkklOce36h/pCqaJYkuwZ"
+    "g1Ipri0Epud0EAMH+axdUCBmlDt8+bx/vf6YiuzllLH4hKjnCqy478HMdEc1UVclMFEqFVHsNH50BA9fPu+jkFPRnPeW2CHWy5g3"
+    "0zUD1IEIgZOwz6hgPydjmC86vj1+e9hH0PAmzFSgSaa4oramZmWAUviR7A1QA/TG4qwMUMB3ifwUV2ZUf9BEhMAcxAis/qADUYMM"
+    "1joDEBzBrdgCNwbRAusevzABgTXFdcB6jEIVKJ3JC5zEIFP3+J0yogXWxXggcJCpe/waiBKYghiB1eF1IELgNjm8xRMkR8eRXmc7"
+    "hk+QBH4GaNkESYYGaNkESYYGKJqY7TeH/NmgJkgGmmpRgeaSSXNtW+qSSi0TGw1ql2ZXRVwV57BVJ+pCb8tssYh41v34ykTt0gxA"
+    "ZIBquzTbjrsq9gJWW9u62IVVsokulIzYxBAMfweef4DVLs2PgBRIkSDpXANWqH89wrdIxq3oF5ggSZpsEpvaQ01SOdkJkjFrtDlc"
+    "CnyMdidTaoF76CYgW6CeboB5T0lyEyTzCh85r7fIKDq2CB+klwkOwosJ5CDGBlkfHFIw6SiqM0YUqwE6dgVykHKzTYq0SadqgJqI"
+    "EVj9QQciBG6TP4iG/SjqyAA1kyTNYz3sBRqgDVBpTTR6wxBFzKzakD8bOHJ4y/wPUIYOLxr2Dm9gkAlmgEpzeG2v8/ob0gYZNCIE"
+    "1hRXD2IEbkWKa90h1oKoCKYgWmDNAIUJCKwZoAPWYxQmL9DbRFNXUHDyCsl2acZC9aHENNEdkpIHInaP32fgX0GYS1JLUeQ4vGoq"
+    "Llqc3tQQTZVEHEDh5ZRmPxpiG9wQwbVql7f3QYHBNddEIsn3+B07OjEEBXITMWmHNwVRAidtYaciRmD16B2IEGhED5XiKkKghuni"
+    "yt/j15LDO+k9flvt9zRSXI3/4gpQMoKYExWi+B6/IgYZY1qwOrw6YgRuhT+YgiiBKVEUJTAFceZLdXgNRAusDi9MQGB1eAesxyhU"
+    "gdKZvMBJDDJ1j98pI1pgvdkGgYPMpA3QSfuD1T5zIEJgTXH1wH4UzU1xZR/BQIKkfAPUoO7xa8LeAM2FvQFKneI6OjXFNYAIgTkp"
+    "rlEX+piNjLmCjqBtI+MhILOwfVtMDy2UMsXVu9fvkM22qAGqbUPtvR5y3iU2pg9GbRXNtV/G7GUR8zoA4BnJmIo/AW3eUha5Bii3"
+    "r0tWkg1QDrlHuURdJiSLZD0n893bn7LPwf1mO7t+3AVmb/TPuon+++W3qNdVh3fKiBZYHV5gPsjYqA6vgRiB1eF1IEJgdXg9sB9F"
+    "qR1e7lvg5jm8DA1QNNIM0LIWNuZEhQgZoOj6sB9kDMyBZrIOry6mOrzsqZsYexAjcCuSlLcihxcrUpxAgJXIWKEiBSpqiisQChxq"
+    "mcngKa62/3ZO7S+OnuI65uKEogJ9QsYSOejXpcvbe3j7z8OQRZaLYGyEvrzYK1VkFKN84bWJpIpsEYEl+tePP+wXqMkmXKYs0vbz"
+    "FuIPJtUhdjp/bIFqk3KyJWNjCtyBhP9GB4AzY6j74DNYn2ZXv1v4tgYmWmCKy1REoLrXtIymUcswKe9VizZRytWJrBxejFDqbxqk"
+    "fbBU5bfJ4W2Nx8EBir1Ah8MbND4V0hxeNNXhlQ57h9dB0PhUcPm6FItpfAZhP4oCVH/QixiBW+EPpiBKIMY2U4gSqMCIFCkQg1iB"
+    "sVGUdqFfozq8UAXKpwqUThUona0SyHHXg+w6KYHt+clR7rmK09UpS+RWNFFf9IZsttaycqPojWA38TuEyJZqknkXAJrj5YVVRDfx"
+    "O8TcaHN6drVRh+PlRf+8fhzjNvVNlOsgQ9pEOZKcha01hx6tD1L2wxYcfdBWJyzBb/SqYFsfKQFmcEleZXG8vIDzkyPrJ3Z6dgWL"
+    "+QGplabKMHHUCZVDuAsBl3QxP+httNIiEedtuujpOYRR+YTN54/v1eMWANZG0xJ9AIOj7Aagb55ZAtWb+oKub+76J9682t84loPt"
+    "fOqYQ5yqX5ZA9cbRrou2i3uOQNso2gBA62qepYQHmr+r4tHOrsJ1mXC92Sk8kZTbQNR7xN3JYPkK7QcmHTcjElkAAAAASUVORK5C"
+    "YII="
+)
+
+
+def clean_marks(marks):
+    """Saved cast marks -> a clean list. A mark = the box on the mana bar that shows when its key is armed:
+    key (hotbar key), kind ('move' = normal cast / 'snap' = snap cast), lo..hi = mana % the box covers, colour."""
+    out = []
+    for m in (marks if isinstance(marks, list) else []):
+        try:
+            key = norm_key(str(m["key"]))
+            lo = min(100.0, max(0.0, float(m["lo"])))
+            hi = min(100.0, max(0.0, float(m["hi"])))
+            col = str(m.get("color", ""))
+            kind = "snap" if m.get("kind") == "snap" else "move"
+        except Exception:
+            continue
+        if key not in HOTBAR_KEYS:
+            continue
+        if hi < lo:
+            lo, hi = hi, lo
+        if hi - lo < 0.5:
+            hi = min(100.0, lo + 0.5)
+            lo = max(0.0, hi - 0.5)
+        if not (len(col) == 7 and col[0] == "#" and all(c in "0123456789abcdefABCDEF" for c in col[1:])):
+            col = MARK_COLORS[kind]
+        out.append({"key": key, "kind": kind, "lo": round(lo, 2), "hi": round(hi, 2), "color": col.lower()})
+    return out
+
+
+MAX_DECOR = 30
+
+
+def clean_decor(items):
+    """Saved decorations -> clean list: id, picture file, screen rect, opacity 0.1-1, on / off."""
+    out, used = [], set()
+    for d in (items if isinstance(items, list) else []):
+        try:
+            iid = str(d["id"])
+            item = {"id": iid, "file": str(d["file"]), "name": str(d.get("name", ""))[:30],
+                    "x": float(d["x"]), "y": float(d["y"]),
+                    "w": float(d["w"]), "h": float(d["h"]),
+                    "opacity": min(1.0, max(0.1, float(d.get("opacity", 1.0)))), "on": bool(d.get("on", True))}
+        except Exception:
+            continue
+        if item["w"] < 8 or item["h"] < 8 or iid in used:
+            continue
+        used.add(iid)
+        out.append(item)
+    return out[:MAX_DECOR]
+
+
+# ----------------------------------------------------------------------------
+# Dash / PB cooldown coins (Extras tab > Dash/PB CD)
+# ----------------------------------------------------------------------------
+LETTER_VK = {0x41 + i: chr(97 + i) for i in range(26)}          # the Dash / PB keys can be any letter
+LETTER_VK[0x20] = "space"                                      # (Space is watched too: Whisperer's Double Jump)
+DASH_IDS = ("dash", "pb", "fist", "mana", "jump", "rune", "awk_pb", "awk_dash", "fisch_dash")
+DASH_LABEL = {"dash": "Dash coin", "pb": "PB coin", "fist": "Fist M2 coin", "mana": "Mana dash coins",
+              "jump": "Double Jump coin (purple)", "rune": "Rune coin", "awk_pb": "Awakened PB coin (big)",
+              "awk_dash": "Awakened dodge coins (10)", "fisch_dash": "Fischeran dodge coins (5)"}
+BASIC_COINS = ("dash", "pb", "fist")          # the coins of the Dash/PB CD page (the others sit on the Race/Class > Classes page)
+SOUL_COL = "#131926"                          # Soul Berserk: the hotbar box is black while the buff runs
+POPT_KEYS = ("mana_dash", "whisper_dj", "fischeran")   # per-profile switches (Race/Class > Classes)
+CROSS_NEAR = 60                 # Shiftlock = the cursor is the crosshair, held in the middle of the game window: within this many pixels of it
+GDASH_WINDOW = 0.5
+GQ_WINDOW = 0.16            # seconds: G and the dash key this close together (with 0 mana) = a normal dash AND a mana dash
+AWK_COINS = 10             # Dzin: the dodge coins
+AWK_GONE = 1.2             # seconds the 'Dodges:' text must be missing before Awakened counts as over
+MANA_COINS = 5              # the blue coins (Dragon Sage / Faceless mana dashes)
+DASH_CD_DEFAULT = {"dash_cd": 1.5, "pb_cd": 3.0, "fist_cd": 2.8, "mana_dash_cd": 5.2, "mana_dash_timeout": 0.2,
+                   "dj_cd": 4.1, "dj_window": 0.5, "soul_dur": 25.0, "soul_cd": 35.0, "awk_dur": 25.5, "awk_cd": 60.0, "fisch_cd": 60.0,
+                   "agi_dur": 10.0, "agi_cd": 30.0, "bane_dur": 10.0, "bane_dur_mana": 20.0, "bane_cd": 25.0,
+                   "levi_dur": 35.0, "levi_cd": 40.0, "hyper_dur": 90.0, "hyper_cd": 30.0,
+                   "song_switch_cd": 3.0, "song_fail_cd": 10.0, "shard_cd": 15.0, "flood_dur": 30.0, "flood_cd": 6000.0, "vind_dur": 5.0, "vind_cd": 10.0, "flock_dur": 2.0, "flock_cd": 25.0,
+                   "stand_dur": 30.0, "stand_cd": 6000.0, "pto_dur": 60.0, "pto_cd": 6000.0}
+# where the in-game coins are on a 1920x1080 screen (x, y, w, h): they are scaled to your screen on the first start
+DASH_POS_1080 = {"dash": (1101, 928, 18, 18), "pb": (1129, 928, 18, 18), "fist": (1072, 928, 18, 18), "mana": (1171, 954, 105, 21),
+               "jump": (1171, 954, 21, 21), "rune": (10, 1019, 20, 21),
+               "awk_pb": (565, 935, 57, 57), "awk_dash": (627, 939, 125, 52), "fisch_dash": (627, 952, 125, 24)}   # (the Double Jump coin sits on the first blue coin; the rune coin on the game's rune icon)
+RUNE_PNG = "iVBORw0KGgoAAAANSUhEUgAAABQAAAAVCAYAAABG1c6oAAADzklEQVR42oWV3UtcRxiHn/nY9fi5SJJdtd0sdqERL4og1baitCIpugQsoU2gTUMRSr0IKb0pvcs/0qvmovmgJRfB4MZChYIfGFkas5WQxMVgPGvWxbras+w5M72w2WI0Zu5mYJ6Zed7fy4jvLv5AEBiEAGsBawk3hrg9/avliJEa+ETsbpUR4r8FC4EJ0L4fIKUEoFDMc+/JjHUch3g8fhSPqbkJ63keXe29IlIfITAGKSVaSoExhuL2Jn8+XbDxeBzHcYjFYkcCHcfB8zyWnt6z7yTeFY11EaQQ6CAw7JZ3yazM2WQyyYkTJ/A8j9XVVaSU+L5/KDAWixGLxQiFQmRW5uz7b38oQjW1SN8GzC7/buPxOM3NzTx79oxCoYAxBmMMSqkq5OzZs/T09ADgui65XI7jx48Tj8f546/frMUiJaK6wRhDpVLZc6E1xhgAlFKkUimSySTFYvGVGgQCtWv/tidPnqSlpYW1tbW9glmLUgohBEGwV7RTp07x8OFDFhcX90FKpRKtra1IKVlcnr8iDzvJGIPv+0gpUUoxODhIZ2cnhUKB1419wNbWVi5fvrwPqpRCKcXCwgLLy8vViI2Pj3Pp0iWam5tfDfQ8D2MM4+PjVWhvby/d3d2MjIyQSqWQUjI2NkY4HObatWsHnKpoNHolEonQ2NhIPp9nZWWFrq4uOjs7CYfDDA0NkU6nuX//Pn19fYyOjlIul7lx4wbr6+sANDU1USqV2NraQr/sIJ/Pc/PmTc6dO8fw8DCTk5PMzs6ilEJrTUdHB1NTU7iuixACa/d3qD5MbENDA5FIhO3tbdra2gAIgoCZmRnm5+fxfR9jDKFQ6EDwD1S5vb2dCxcuMD09za1bt0gmk6RSqSrUGIPWGikllUoFrTVC/J9l9fz58ys1NTVorYnFYpTLZSqVCul0ms3NTYrFIgMDA9TW1vL48WOMMQghUEphjCEajVIsFsnlciwtLSEvnvlavOzwzp071fmDBw+YmJigp6eH/v5+gH1PfnFTay1fjX4jtLWGbDaLlBIhBIlEAs/zcF23Cs1kMmQymX1qjh07huM4bGxssLq6SjabpfutPrRSmvMffymup69aIQSVSgXHcUgkEkd2hOu6uK7L+vo62WyW0Y8+E9YGaBDUOQ2cP31RXL/7k30B9DzvSODGxgae5/Ho0SOG3hsRvvEp/bODrqtx0FrTWN/Ap0NfiKu3f7T19fWvBeZyOXZ2dhjuHxVN9U17GdQhxLeff48xe+GUUiKVYGXtCb/c/fnIP+X0B2fEG9E3kYCUAhBoHeJfN0uyWOZohhcAAAAASUVORK5CYII="
+# the game's own coin pictures (24x24): Fist M2, Dash, PB, and the empty frame (the ring) - the Mana Dash coins and the Double
+# Jump coin are the Dash picture with the ring coloured blue / purple
+COIN_ICON_PNG = {"fist": "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAABn0lEQVR42tVWMWvCQBT+nroKInTI5ugfaMElQxeHFrK1xVWUTlJwyKBCoO2QQQidpOIa2i2Gdujq4tA/IHTpIDgIUuhsXwe5axIvqLW29CDk8ZLve3nf3X0XwhpDzxGr8oNXplXYBHY8aNVXAoDrNJX50sVVLLHoLhVMts0yAKBu92SsaVoskes0MZlMljB1u/d7EqWENG2zLCsHYwA4v+mrJaoZoe4jeAYACmofbDFIul8oKAs8D4cy7tSMP5JIzLaeI9Y0TT7oWiYA4PZpIHON06MQ+Pr+MdRFEC94pUSu05SrJZnNYy+T/iK6ewCIAGY0zo6XigBAtahjPhshyrWeRETh+yYSqZIVy1ZOLPMHLt0+WiVjuwJdy4SXSYOIwMwLGZhBlAAlE1KW4JxULBudmrGZFzHzQv8YeUSh7czuG7rHWvLYa/HYa7GeI3Z9n13f55fpVF4nhwfyLmLxXhS/ZBUApHFFd6vnqM2uWtRRsWyo8IJ39zs51qwCKyKZzYc6mr69AwDms5FcOXFmGTpwfvI8EFbx/49M+vd/FZ/UIfCSOZFdGgAAAABJRU5ErkJggg==",
+                 "dash": "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAABPUlEQVR42mP8//8/AyFgr8iEVdHB+/8YCellYqAxYCHkSgYGBoZlE2pI8hmy71iQBXvLkxkYGBgYijvnwtmSkpIMUQUtOC1+/vw5hp7izrl0DCKYN3vLk+E2I7MZGBgYMiZtxKo5Ks8fxffI+mHmMtopMP7HFkTIhppaWmK14PTx43D2jDz/AQoiWGzbKzL9l5SUxFBgamnJUB3ujVVz68qtKL5A1g8zFx5EyybUwFNLxqSN8GDBZTiyJbDgmgGNE2SzaB5Eg88CWJCQXFQQC6rDvUmyhOZBxAgrru0Vmf7DCrWoghZ4RiM2mc7I82dA1g8v7JBLRFjBhZ5bkYME2bI0dzuG1IZOBmz6YebSPohgGY2Uwm52QzkDAwMDw993N3AWdjA2ShxQsz6AxQF9UxGpVSYun6EUdkO+VQEAF++9NLg5Kk0AAAAASUVORK5CYII=",
+                 "pb": "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAABeElEQVR42tVWIU/DUBD+HtsvqKur7OwSxMxLpiYgQUJqRxYUaTIxscoiJpY0GAhktgFJAwI7M7E/gMRVLCEkaHIT7N1e09e0sAHZqev1vrved/feVaCCSEeQyT59JVGG3cMviyj7SgCIo8Bo9/ywMLCqrq4bx4MuAKA/mrBu23ZhoDgKkKZpDtMfTf6QIkXNeNDlzLoOADXLNYI/314y1ZvwQudeL/Hs8oHB+62WMcF8NmP9+vzofyiqq25LR5Bt2zkH/euHxwcAgIv7J36nV6HjeYoURXEU8LTULHcdmFYMCvOZUn63lsv4VSzKjal5DMRmFJU5KFrWQhmbouvHCTgAEYYnhwBEadBKCbihd49fNBVQla/wu5fdpj1Q4+T5IalLzfNDLOBWCrB4/+BTreNzYwqALy5deh2Jm+epsaG9jsxcyTpexd3KSaaybSUdQfOrUzLp0hHUbjao3WxQnCQUJwk/6z5F+MzC2eY+UD3Y/ZUpdv6vYgmPJ8/ifcVEnQAAAABJRU5ErkJggg==",
+                 "ring": "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAABPUlEQVR42tVWPU7DMBT+XuWpOYGXyhsbJ2h9EDrCAUg6sLQbSweibkzdoHPPELFxAdgQqpQTdO1jepFJ7TgpKVItWXp58ffJ/t6PTWgxrCH2+Ysvphh2gDMPiu0SADarudd/c/8YJJbTKdf59HALAJgt15WttQ4SbVZzlGV5hJkt1/8nEawhtob4/fmOfbY1xMwM33TXhPBHi+RniNQ3P15SquNltpPo+60xHa+meTBBlETbGmKttZ98NGYAyGxCAJAXey+hi69qRI6y2y68mqeTIaWTIdXtppi4XCqmjrvb0M57q+TMJoPMJqoLRkWD6+ifF/sDgEN/JxiNORbYP0t0KrG3onfbRZUBXQpNMsjFVzFwP6RxdR2frxnV8cLbS7NrquSTm930mqhNs/t14fR5H0iruPwrky7+VfEDoi1tAoCZLFMAAAAASUVORK5CYII="}
+RING_HUE = {"mana": 0.60, "jump": 0.77, "awk_dash": 0.63, "awk_pb": 0.63, "fisch_dash": 0.50, "fisch_pb": 0.50}      # blue (Dragon Sage / Faceless) / purple (Whisperer's Double Jump)
+RING_DARK = {"awk_dash": 0.62, "awk_pb": 0.62}   # (the ring's brightness is scaled by this: dark blue)
+_coin_cache = {}
+
+
+def coin_icon(kind):
+    """The 24x24 picture of a ready coin: the game's own icon (Mana Dash / Double Jump: the Dash icon with a blue / purple ring)."""
+    key = ("icon", kind)
+    if key not in _coin_cache:
+        src = {"awk_pb": "pb", "fisch_pb": "pb"}.get(kind, kind if kind in ("fist", "dash", "pb") else "dash")
+        img = Image.open(io.BytesIO(base64.b64decode(COIN_ICON_PNG[src]))).convert("RGBA")
+        if kind in RING_HUE:
+            ring = np.array(Image.open(io.BytesIO(base64.b64decode(COIN_ICON_PNG["ring"]))).convert("RGBA"))[..., 3] > 0
+            hsv = np.array(img.convert("RGB").convert("HSV")).astype(float)
+            hsv[..., 0] = np.where(ring, RING_HUE[kind] * 255, hsv[..., 0])
+            hsv[..., 1] = np.where(ring, np.clip(np.maximum(hsv[..., 1], 150), 0, 255), hsv[..., 1])
+            if kind in RING_DARK:                                  # Awakened: the whole border is a DARK blue
+                hsv[..., 2] = np.where(ring, hsv[..., 2] * RING_DARK[kind], hsv[..., 2])
+            rgb = Image.fromarray(hsv.astype(np.uint8), "HSV").convert("RGB").convert("RGBA")
+            rgb.putalpha(img.getchannel("A"))
+            img = rgb
+        _coin_cache[key] = img
+    return _coin_cache[key]
+
+
+def coin_art(kind, ready, size):
+    """The coin picture: the game's icon when ready, dark while on cooldown. size x size RGBA."""
+    size = max(2, int(round(size)))
+    key = (kind, bool(ready), size)
+    if key not in _coin_cache and kind == "rune":
+        base = Image.open(io.BytesIO(base64.b64decode(RUNE_PNG))).convert("RGBA")
+        if not ready:                                   # on cooldown: a black rune icon
+            black = Image.new("RGBA", base.size, (10, 10, 12, 255))
+            black.putalpha(base.getchannel("A"))
+            base = black
+        _coin_cache[key] = base.resize((size, size), Image.BICUBIC)
+    if key not in _coin_cache:
+        base = coin_icon(kind)
+        if not ready:                                   # cooldown: the same picture, dark and grey
+            a = np.array(base).astype(float)
+            g = a[..., :3].mean(axis=2, keepdims=True)
+            a[..., :3] = (a[..., :3] * 0.15 + g * 0.10)
+            base = Image.fromarray(a.astype(np.uint8), "RGBA")
+        _coin_cache[key] = base.resize((size, size), Image.LANCZOS)
+    return _coin_cache[key]
+
+
+BUFF_PNG = {"fire": "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",
+            "feather": "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"}      # the potion effect icons (Fire Resistance / Feather Feet), 96x96
+BUFF_OF = {"fire protection": ("fire", "fire_dur"), "feather feet": ("feather", "feather_dur")}   # potion -> (icon, setting with its length)
+_buff_cache = {}
+
+
+_manu_cache = []
+
+
+def _manufaktur_files():
+    """Manufaktur's font file: next to the program, or installed in Windows (the system / the user's Fonts folder)."""
+    if _manu_cache:
+        return _manu_cache[0]
+    out = []
+    dirs = [APP_DIR, RES_DIR]
+    if IS_WIN:
+        dirs += [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
+                 os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts")]
+    for base in dirs:
+        for pat in ("*anufaktur*.ttf", "*anufaktur*.otf", "*ANUFAKTUR*.TTF", "*ANUFAKTUR*.OTF"):
+            for fp in sorted(glob.glob(os.path.join(base, pat))):
+                if fp not in out:
+                    out.append(fp)
+    out += ["Manufaktur.ttf", "Manufaktur.otf"]                 # (last: let PIL look in the system's font folders by name)
+    _manu_cache.append(out)
+    return out
+
+
+def _num_font(px):
+    """The font of the numbers drawn into pictures (potion seconds): Manufaktur when its file is next to the program."""
+    for fp in _manufaktur_files():
+        try:
+            return ImageFont.truetype(fp, px)
+        except Exception:
+            pass
+    for n in ("arialbd.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"):
+        try:
+            return ImageFont.truetype(n, px)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def buff_art(kind, frac, size, text=""):
+    """A potion effect icon, size x size: the top part (what is used up) is dark, the rest is lit - it drains from the top
+    like the rune coin does while Soul Berserk runs. frac = 1.0 full ... 0.0 used up."""
+    size = max(4, int(round(size)))
+    n = int(round(min(1.0, max(0.0, float(frac))) * size))          # lit rows (from the bottom)
+    if text:                                                         # the seconds left, big and bold in the middle (white, black outline)
+        key = (kind, size, n, text)
+        if key not in _buff_cache:
+            img = buff_art(kind, frac, size).copy()
+            d = ImageDraw.Draw(img)
+            px = max(8, int(size * 0.5))
+            while px > 8:
+                f = _num_font(px)
+                bb = d.textbbox((0, 0), text, font=f, stroke_width=2)
+                if bb[2] - bb[0] <= size * 0.94:
+                    break
+                px -= 1
+            f = _num_font(px)
+            bb = d.textbbox((0, 0), text, font=f, stroke_width=2)
+            d.text(((size - (bb[2] - bb[0])) / 2 - bb[0], (size - (bb[3] - bb[1])) / 2 - bb[1]), text, font=f, fill=(255, 255, 255, 255),
+                   stroke_width=2, stroke_fill=(0, 0, 0, 255))
+            _buff_cache[key] = img
+        return _buff_cache[key]
+    key = (kind, size, n)
+    if key not in _buff_cache:
+        if len(_buff_cache) > 600:
+            _buff_cache.clear()
+        base = _buff_cache.get(("base", kind, size))
+        if base is None:
+            base = _buff_cache[("base", kind, size)] = Image.open(io.BytesIO(base64.b64decode(BUFF_PNG[kind]))).convert("RGBA").resize((size, size), Image.LANCZOS)
+        dark = Image.new("RGBA", base.size, (12, 12, 14, 255))        # (the used-up part is the icon's shape in black, like the rune coin)
+        dark.putalpha(base.getchannel("A"))
+        img = dark.copy()
+        if n > 0:
+            img.paste(base.crop((0, size - n, size, size)), (0, size - n))
+        _buff_cache[key] = img
+    return _buff_cache[key]
+
+
+BMOVE_PNG = {
+    "tempest": "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",
+    "flock": "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",
+    "bloodline": "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",
+    "redveil": "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",
+    "galvanize": "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",
+    "agility": "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",
+    "bane": "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",
+    "leviathan": "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",
+    "hyper": "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",
+    "silverguard": "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",
+    "dragonblood": "iVBORw0KGgoAAAANSUhEUgAAAEIAAABCCAYAAADjVADoAAARMElEQVR42t2ce3icVZ3HP+e87zvXZJL0QpJWRYQFqlybaUrBVliSfWAFUboUt1ppWUnF28pltxF04XEXSfECqKjtsys3BamLLuuiSMqiYIW2SR9EQQooSi8x2DbNdWbeed/z2z/mkpnJzGTSp93Hep4nT9Pznuvv9/1dzzlBRJju55pz50ot7f4cf/7xvDk1rd0GWLmoXprCNkopAFKeoTEc4Qub96rvrW6W61bPZnnbXHm4/0+ZBodYVp8z2wGCQAiIAA5gASlAss0msj8Addl2McC/Z8v+F2Yy33dWNUv3lXNZvnCOPLxjn1rVHpOmsI0BRCDpG6KBIF95clDZAOccG+KK1a1orRCBPb9L8Om7B1m5qFEuPy2KGJhwU3zsXU2iqJEWIoz5Gq0gYCuMQMjJ9BYB1xeMQNRRNIU0jp3p5guMpYSDSYOR4iE/smwWdo3TDycN714QwfdhIu1y5dlN8u4FdSxf1UwyYdAaXv3VKOu/PwaQQURjWBMMWfQ/OcT1m/ZzxcIoG298M799bpznX07gpYVF84N8qqsFx1GIqZkWAChdwO/cRpQqaFCwO8m2EQGlECP4nmDXSgEFYoSXd4yx7cUJjCcsnBfg2qta2PVyggs+/irnnxjm6jXN1Dc4mOwabICwpRj4Q5JrH9rPdUtjLDg1wqqbd+FY8A9tdVi2Yutul+u/tJcaaUBLVBO0FQLYWhFxMhupC2ZQ53owmjb4WbY7lsLRisaIJmwrbK0I2YrhlOHguGHU9fnjqMEHEmmZdv6ka3jv28NoK7P2rs/v4qIFEb7+0RY+ufEN5j+8j86/aczvxwbwBNKu4f2nRzjx5BCbt4xw+1XNfGLDIOMeHBhIseyURj7z0OsAtDYfw+OPfh+FcPHylbz2h130drUB0LZuHQAjB4d59o470UpxxXczov3kk08SkCQmnSIYCqO1hVKQTqfx0i5ucgLf8/B9j8/dehu/fnEnNy47ARHhqi98hkAwmN/o5u71AKz4Xj8AfX19xOPxImK0t9oc3J8mZGsuWhDm7PY6frB5mC+vmcuWrWOkU5JHtw3wnV9OkPAV558d48HHD3LNVc28umOUd53ayMr7XufGS1q55ZGB/AQp18WgUCgmEomyHIk1NjA7nFl4ws3M5gQj2GIjwXoEwWBQCHbAwgmEUNG5BFUKQfHawCiDIx4t4ShAERFqLdf9cB9jTpBHnx+m7RjNRS2z6FgY5QdPDnP5BU2suX0Pbz8mMkmIR54bUd9a2SxihP69KT5x2x4cBWctaADg3CXzOPfkeQVTaM7rfDdaax7sOh7MsbR1ZZDQvzHDKYYm0dFLpq69fTGNjQ088fiPcMRFMQlxpRQWhpVXfITh0RFuWzIf2ufS0bOuCAG5kqvflB07Ho+z6bIMKpuaSkmyh50HfK6/c4DRhM+FJ4VxU4b6gMPXfjqo8oT42LJGUcpi264DHBuzOP2EGB+973Xu23awAq0NB4ay38xxNXPIN4b9B4YQNACW7YAYfN8HpTCief7FlxARWNzC4SwP7RgB4IML6/nlQJr+/zrAWxuhu7NFenr/qOx7VzbLnTcdx8SYj1JgjLCzb4TuS+Zz/pLMYtou65kycC/dJTVNZaafWhcKOSgMgsLzvLwRMUZACeFQqETcmipsrbh+02VtdPT0lG2ZW+svXvsdH187n0BAY0zGEu19LcHyhXPEvuKBQbViYYMEbI2lYSxpWHZaIz2P7MkTIgP54o23dfWUrZ+unHTCCYTSE4iti+q1GEJ+gjPPOIUtz2yvuP1KpaOnh/7u7iIata0rJsxNvUNs25smFrYJWDCRFhojQR7esU9pgE07htWFJwVZ93ezOPGt9Xzq/tc5UsVNp4t9hvyvWb/CCEeyPPrCGPEWzY0fnINgs/HpAh0BELIgGrNx/WRNA+aQkENGrWXXngFC0ToSqQkKnVSlNeFwHTtfeXXGSAAyaKgRRhFHE6m3sfTkAuxiV5AjXsbHJ4iGGgFNyp3AiAEUju0QDtZz4OAw/x9FSvZql+V233YEiMcX5ZVN27oNmW/r15ZFRjld1r8+i5qeDdlxMn3nnngS8TNP5dt33Y6yNKLB2zfKce85n598eGFRn/7utWVVZm7scrqztG/nxkmnC2D7LRdMiZh0uT0EJYGNRzAYOGIcGRkdB0+Q3IoCmmg4fMTmCwQcNAZdIUiwYWrco7Pm7ZktT2OwiMfj9A6tzWriDSWcWXtIC0ulUnjhIBZ+RolGwqR9v3KHaeQ/h4JKSLDwcVMJLE11QhTqB4OFEsEhjauCR4RDewYGcVUQmzSg8LAZHRs/YojQGOoDpqIetAvD11yx8PDRWRdYijhSioBShBQhpamYQ6W6om3RWUQjYQJOgNHxcX585elT5Lsa54vm666OTMlF9oXRvlLVlWWmocZVNgbrCGpuYWy8MCF1BK0EmqSvCFpS1kxWJIRNmqUdFzN0cJjenjY6ujZVnWjz+hXTyneOax09m7LIWFHiE2xic/eK6v5LCedzY+X+LXatV+QDssaGGE898WOUeAWMUNWtRk5SLMviL6WMT0xgSrZbaCDsSg4GCKEyOYDNG1fkw+wZl6ZcUmVFWS5Oh4aySCzTpxw60mkPoXLG1a6GiGh05na9Y92m/KYrbqxp5hvPby7Xd+2KGZlay7KyRJAiHTWtaIDg2M5fjGi0HDMXW9JFjC6M76pajW/ffy8edsahyiqejnW900C1s4CLvVPqynKuiph1bMiOsbazbH3ZNWTbFjpUNh7iJ/FmIhqS9SAccUEJoVDgqEWC42QSQQofrQRPJgWkcvSZh41g4aOUIuDAMz9/mjPji7MmqbMIGZvXF/8/h4JqSJiClKbJ+nzdUDF3KyGg8Hs5JGgMsYBP2k1jqugCPV2o6rkpND6W1kclIiw80qkkCtAKlJKZWY1JO6uyiVYL3zVlrEQxMg7JrNag+Suia0PfNIGZyrrSChCMqJkjAiAYieJjk057RyUifCwidY04WZ9Ilbj4NSFCRBiZcGk/axmP37owi4C+LALiJcjoK+FgfFp2d/T0zdxP6ak8T+5bL/G8a23bmu3PPkNAXDSgs6JRaj51LcGK5x2daADwPJN1rWWKW12j+VTZBE0lD7KvQvAVn2T6UCVfIz4tdyv7KcV9a0OVZG1hcU2h+dTlAhCDJqVCeDhTApWjsyg8ZZPwdBkCVUGEhU9Qklz+oS5+s/OVTBheQTdQBTH5tofBkuQ4n0NENfSU6opF7e2csuBkvnvPNyevZwCeX6P5vO/++yZzltlBK4lEqWhsXh+vLD5VNlMJ6qVtq4lErm3n+uKcpecncHT5MLxKPkJKpOpoL4JV5dKNXY0QFgZ/Gs6XKs9aRCgP8xLRqUXx1WI+KyVvlZJi1pZLzOgydkVh0PgEAkdn0GXbNk2NDajsWYYqPcyTadL5uRIJ2BjjsfUXT3Fm/KwiBTTFgSqDgFzddHql2plFqW6opity83Wu78eyLPq2/gJbXOoiGsQhOZEqRkk5RJTzGNJuEhHBwca27aPKsWqI1eOIi4VHcny0KHVfju/Tuth5F0tV1xXluF5oQWrKP5Zr11SbA1f63batImUvU5OyRcTRlZO3kw1FWXief1Tph/37h0grJ+Mha2sKIjgURNy6/os8/s1s0NXVV5YT5bg5UyesmitfaYzC77nfc3psydLzuPiCTm664Xo0MiX6nFEYLih279171HoPb57fWvYEXM0kDAeI1sW4486vsjDeXtZq5DV1dz9TT5rih4yMWsYvnaO07Y6+bQQlCRW8Id9Mcy2gsCTGR7AITGM1FK0tc3lTayu/fullEonkEePwrFmNtLa0EKsLs2v3QBbUxRy3tCYajWLh5X2IctbClAu6rAqUEBGCOk3fs0/j4eSv+eY40dndT2vzMfz0we8gUQvXCuISZNGi9sNOhPnzmnnsvx/GwkcbHzWepnPVGl7fvZde4nR29+M4Nn3bnkHjUR92SJX4DoXFKReG+1I5rhBjCEgKCx/bLpYmrTWL4qcjdTaiNY6kCZIkGokcdkIsXbI4w2UxiFKYqMMZp52CZWlA09hQz8LTTyEgSQLi4iYmqmYoylqNsnQoeEqgEOodn/5nn8oc+ixajOM4DPzm16TTLmMj+1EWiILAGyMYc/jN7VPPbMcaSyERBwSUb7j9lpv5+he/wKUfWs3PnngMCx8LgwhIlfcUaibmExGUUnntmnZTBJWiIRLkue1bMFgMDe6BgAUBm3Cwjk99+ka2bO3nkTveMSNTW0lJTjGJ77uc0059O9/66pdx3SSul8JNp7j7G3fiaMH3DVJD1CwlxLBrucxRiAwRITE+QiCbIZagBSqDGFsHeORHP8lcJ+YtR0RZHhg6yPO/ejHzFiu3YQUaH5RGaZXFvaqKiFLxsKkp0aXKUtnCz0cuIsLY4F6CwRCJ0qcLuRPsjfFpM+G1mNj6ujrcZILCBIPWFr5XcMibJ0h5kah4vXAoaRgZShdlcCZRYSp0LxU0xTtO+itisbrp2x5q9lEpHGcq/4zJHFEqrdGWVUHpZcqYaxgeSmMXWA0lIqxqj0nIsTEIbspw5okx/vba+6sqzxIfLX+YohHSymHJsr/mkdvfmXXLe4sQUbUMleiKbJ/Otf1ordi+bSs2Po6kymTQVEGMlMVwyXpvuPIiZtcHMJK549kUDvGlzQPKvvcDzXJ3z/Ekxvz8Y7KXtg9zz79+gNX/8sCk1VBTp9XawhhTnAVCsCXNm+bNO+xomD1rFoFsaF1N6jPKXWXoonIiImy64VL+4+bjcByNiGBlnymsiM8VJSKsbG+QgNagIZk0LF7QyIXX3Ju9apMZPAM3CsyiQmuNiEFE0JaFZImitUXCWCw+5zySqRS9GzqKkFFTSD4FCduw8IhoL8trNbkWkYJzTvLnnbnvua+u6/KZrkuZXeeABt8XYsEgdz01mHmm8MC2YdVxQoB1K+Yw5sGLvx/hc12X8NjtqyZl0PfzF8hz1DfGz5tWY7IOq1L4voctHscfdyzBw5Dma4jFcMQlICl838usxffIOgtFiMi87DVFfowIdK++iK9cfzn1EYdlbwvx6cvnkPRs7nqq4JnCe8+ol8tOq8NzhSXHBrh6TQu/e36UH71oSCSS/Odta1h104MgObmbRF6e4jnzajInzikjPHT/v+MphyVLzyORSObvVtRSOtcW3nHw8b0ESoGla1PDOT/hoVtWsuCSz7JofpCPds3jtRfG6e3LPHpNpF2uPb9VvvzEQAYRHzozytnnNPDoz0d4z9IG7rn/DSINDj97/iAvbFzD378zwr3/9oEiJyT3xiR3oxWZFElLCxHbZFxy8WiIxQ6LjrC0VCVC7p6wyQLlf25ezvvPjbKh55+ZNzvAwO+T9PaNcfGyGJufHmHj9fMZGPUn/QgRsB3Foy8lmBezuHBZjH+6+w3mRjWxgKbxmAA7Xv0Tg5983yFt4MK3AW9r5IF7aj/9XrOkEYC7PtFxSHNOuMKlp0Soa3SwbcXmVzK+zfvOb+Dqbwxy9ZK6IqmyAcbTQsuxIe5YNZd1D+4jmRbuu/kt/Pa5MX65M/MkevGbglyztgXH1mXzf382JWv5du4YZdsLmSfR8fkBrutqZdfLE3xswyDLTw1zwaVzeGN3Mr8XG+BgwjA27HHSGfX8MF7PrlcSvP+zf6AxpPngGVFsR7F1d4pr1u8+ajJTSS+DCG0r+va4fOTzu7jw5DCPfe14EuMG4wvD+9L5lL4N8OyuFDtu212oe1nQHOXO/x1Q31/TKmKEkO1wz7P71Ut9Pw2R+XMGB0+On/tnnd9/cFWLiBGigSCb+v+kVi1ukJ/d8PviRE8kMBlUTfezdumco/YPaXz4nbWt/f8AxLIg+MqdYqAAAAAASUVORK5CYII=",
+    "frame": "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",
+    "flood": "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",
+    "floodfinite": "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",
+}
+_bm_cache = {}
+
+
+def _fit_text(d, text, maxw, px):
+    while px > 8:
+        f = _num_font(px)
+        bb = d.textbbox((0, 0), text, font=f, stroke_width=2)
+        if bb[2] - bb[0] <= maxw:
+            break
+        px -= 1
+    return _num_font(px)
+
+
+def draw_center_text(img, text, box=None):
+    """White text with a black outline, centred in `box` (x0, y0, x1, y1) of the picture (default: the whole picture)."""
+    d = ImageDraw.Draw(img)
+    x0, y0, x1, y1 = box or (0, 0, img.size[0], img.size[1])
+    f = _fit_text(d, text, (x1 - x0) * 0.94, max(8, int((y1 - y0) * 0.62)))
+    bb = d.textbbox((0, 0), text, font=f, stroke_width=2)
+    d.text((x0 + (x1 - x0 - (bb[2] - bb[0])) / 2 - bb[0], y0 + (y1 - y0 - (bb[3] - bb[1])) / 2 - bb[1]), text, font=f,
+           fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 255))
+    return img
+
+
+def bmove_num_h(size):
+    return max(10, int(round(size * 0.42)))
+
+
+def bmove_art(kind, frac, size, text=""):
+    """A buff move's icon (the game's own, with its coloured border): only the picture drains (dark from the top), the
+    border stays. Picture size x (size + room for the number above it). frac 1.0 = full ... 0.0 = used up."""
+    size = max(8, int(round(size)))
+    nh = bmove_num_h(size)
+    n = int(round(min(1.0, max(0.0, float(frac))) * 1000))
+    key = (kind, size, n // 8, text)
+    if key not in _bm_cache:
+        if len(_bm_cache) > 500:
+            _bm_cache.clear()
+        base = _bm_cache.get(("base", kind, size))
+        if base is None:
+            icon = Image.open(io.BytesIO(base64.b64decode(BMOVE_PNG[kind]))).convert("RGBA")
+            frame = np.array(Image.open(io.BytesIO(base64.b64decode(BMOVE_PNG["frame"]))).convert("RGBA"))[..., 3] > 0
+            inner = np.zeros(frame.shape, bool)
+            inner[6:60, 5:61] = True
+            inner &= ~frame
+            base = _bm_cache[("base", kind, size)] = (icon.resize((size, size), Image.LANCZOS),
+                                                      np.array(Image.fromarray((inner * 255).astype(np.uint8)).resize((size, size), Image.NEAREST)) > 0)
+        pic, inner = base
+        ys = np.nonzero(inner.any(axis=1))[0]
+        y0, y1 = int(ys.min()), int(ys.max()) + 1
+        top = y0 + int(round((y1 - y0) * (1.0 - (n // 8) * 8 / 1000.0)))
+        dark = np.zeros((size, size), bool)
+        dark[:top, :] = True
+        dark &= inner
+        a = np.array(pic)
+        a[dark] = (12, 12, 14, 255)
+        out = Image.new("RGBA", (size, size + nh), (0, 0, 0, 0))
+        out.alpha_composite(Image.fromarray(a, "RGBA"), (0, nh))
+        if text:
+            draw_center_text(out, text, (0, 0, size, nh))
+        _bm_cache[key] = out
+    return _bm_cache[key]
+
+
+def coin_filled(kind, frac, size):
+    """The coin on cooldown: black, filling up with its colour from the BOTTOM (frac 0 = black ... 1 = ready)."""
+    size = max(2, int(round(size)))
+    n = int(round(min(1.0, max(0.0, float(frac))) * size))
+    if n <= 0:
+        return coin_art(kind, False, size)
+    if n >= size:
+        return coin_art(kind, True, size)
+    key = ("fill", kind, n, size)
+    if key not in _coin_cache:
+        img = coin_art(kind, False, size).copy()
+        top = size - n
+        img.paste(coin_art(kind, True, size).crop((0, top, size, size)), (0, top))
+        _coin_cache[key] = img
+    return _coin_cache[key]
+
+
+def dash_art(kind, w, h, ready):
+    """The picture of one indicator, w x h: one coin or the row of mana coins. ready = how full the coin is: True / 1.0 =
+    ready, False / 0.0 = just started its cooldown, in between = filling up (a list of these for the mana coins)."""
+    w, h = max(2, int(round(w))), max(2, int(round(h)))
+    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    if kind == "mana":
+        flags = list(ready)[:MANA_COINS]
+        cell = w / float(MANA_COINS)
+        d = max(2, int(min(cell, h) * 0.95))
+        for i, ok in enumerate(flags):
+            out.alpha_composite(coin_filled("mana", float(ok), d), (int(round((i + 0.5) * cell - d / 2.0)), (h - d) // 2))
+    elif kind == "fisch_dash":                                         # Fischeran's 5 dodge coins: one row, cyan borders
+        flags = list(ready)[:5]
+        cell = w / 5.0
+        d = max(2, int(min(cell, h) * 0.95))
+        for i, ok in enumerate(flags):
+            out.alpha_composite(coin_filled("fisch_dash", float(ok), d), (int(round((i + 0.5) * cell - d / 2.0)), (h - d) // 2))
+    elif kind == "awk_dash":                                           # Dzin's 10 dodge coins: 2 rows of 5
+        flags = list(ready)[:AWK_COINS]
+        cw, ch = w / 5.0, h / 2.0
+        d = max(2, int(min(cw, ch) * 0.95))
+        for i, ok in enumerate(flags):
+            cx, cy = (i % 5 + 0.5) * cw, (i // 5 + 0.5) * ch
+            out.alpha_composite(coin_filled("awk_dash", float(ok), d), (int(round(cx - d / 2.0)), int(round(cy - d / 2.0))))
+    else:
+        d = min(w, h)
+        out.alpha_composite(coin_filled(kind, float(ready), d), ((w - d) // 2, (h - d) // 2))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Dzin's Awakened: the 'DODGES: x' text on the screen (a 1920x1080 picture of its label, so the macro can find it)
+# ----------------------------------------------------------------------------
+DODGE_LABEL = (
+    "####.###......####....####.###......##.#....#...###...###.....",
+    ".#...........#.........#...........##........#...#...#...#....",
+    ".#......#...##.....#...#......#...##.........#.......#........",
+    ".#......##..#......##..#......##..#..........#.......##.......",
+    ".#......##..#......##..#......##..#....#....##........#.....#.",
+    ".#.......#..#.......#..#.......#..#.....##...#..#......#....##",
+    ".#.......#..#.......#..#.......#..#.....##...#..........#.....",
+    ".#.......#..#......##..#.......#..#.....##..##...........#....",
+    ".#......#...##.....#...#......#...##....##..##.......#...#....",
+    ".#.....##....#....##...#.....##....#....##..##....#.##...#..#.",
+    "###..##..........##...###..##..........###..##..###.....#...#.",
+)
+DODGE_REGION_1080 = (895, 866, 125, 30)        # where the label may be on a 1920x1080 screen (x, y, w, h)
+DODGE_NUM_DX, DODGE_NUM_W = 66, 46            # the number starts this far right of the label's left edge (then this wide)
+_dodge_t = None
+
+
+def _dodge_tmpl():
+    global _dodge_t
+    if _dodge_t is None:
+        _dodge_t = np.array([[c == "#" for c in r] for r in DODGE_LABEL], dtype=bool)
+    return _dodge_t
+
+
+def text_mask(arr):
+    """The white game text of a picture: bright, nearly colourless pixels."""
+    a = arr.astype(np.int16)
+    return (a.min(axis=2) > 200) & ((a.max(axis=2) - a.min(axis=2)) < 40)
+
+
+def read_dodge_screen(arr, scale=1.0):
+    """arr = the DODGE_REGION_1080 area of the screen (scaled by `scale`). Returns (present, number picture): present = the
+    'DODGES:' label is there (None = can't tell: the picture is too full of white), number = a small bool picture of the digits."""
+    if abs(scale - 1.0) > 0.02:                                  # work in 1920x1080 pixels
+        w, h = max(2, int(round(arr.shape[1] / scale))), max(2, int(round(arr.shape[0] / scale)))
+        arr = np.array(Image.fromarray(arr.astype(np.uint8)).resize((w, h), Image.BILINEAR))
+    m = text_mask(arr)
+    T = _dodge_tmpl()
+    th, tw = T.shape
+    H, W = m.shape
+    if H < th or W < tw:
+        return None, None
+    ink = int(m.sum())
+    if ink > T.sum() * 6:
+        return None, None
+    best, bx, by = 0.0, 0, 0
+    tsum = float(T.sum())
+    for dy in range(0, H - th + 1):
+        for dx in range(0, W - tw + 1):
+            sc = float((m[dy:dy + th, dx:dx + tw] & T).sum()) / tsum
+            if sc > best:
+                best, bx, by = sc, dx, dy
+    if best < 0.55:
+        return False, None
+    x0 = bx + DODGE_NUM_DX
+    num = m[max(0, by - 2):by + th + 2, x0:x0 + DODGE_NUM_W]
+    return True, num
+
+
+def same_picture(a, b, need=0.85):
+    """Do two small bool pictures (the number of the dodge counter) show the same digits?"""
+    if a is None or b is None:
+        return a is b
+    h, w = min(a.shape[0], b.shape[0]), min(a.shape[1], b.shape[1])
+    a, b = a[:h, :w], b[:h, :w]
+    un = int((a | b).sum())
+    if un == 0:
+        return True
+    return float((a & b).sum()) / un >= need
+
+
+def default_dashpos(sw=1920, sh=1080):
+    fx, fy = (sw / 1920.0 if sw else 1.0), (sh / 1080.0 if sh else 1.0)
+    return {k: {"id": k, "x": round(v[0] * fx, 1), "y": round(v[1] * fy, 1),
+                "w": round(v[2] * fx, 1), "h": round(v[3] * fy, 1)} for k, v in DASH_POS_1080.items()}
+
+
+def default_popts():
+    return {k: False for k in POPT_KEYS}
+
+
+BREW_PREFIX = "brew#"                  # the name a Potion Brewer sequence's learned inventory card has (brew#<id>)
+
+
+def new_brew_seq(used=()):
+    n = 1
+    while f"s{n}" in used:
+        n += 1
+    return {"id": f"s{n}", "key": "", "clicks": 1}
+
+
+def new_recipe():
+    return {"seq": [new_brew_seq()], "count": 50, "pot": None, "spoon": None}
+
+
+def clean_brew(data):
+    """The Potion Brewer / Weapon Crafter recipes: {'active': name, 'recipes': {name: {seq: [{id, key, clicks}], count, pot, spoon}}}."""
+    recipes = {}
+    raw = data.get("recipes") if isinstance(data, dict) else None
+    if isinstance(raw, dict):
+        for name, r in list(raw.items())[:60]:
+            try:
+                name = " ".join(str(name).split())[:24]
+                if not name or not isinstance(r, dict) or name in recipes:
+                    continue
+                seq, used = [], set()
+                for q in (r.get("seq") or [])[:40]:
+                    sid = re.sub(r"[^a-z0-9]", "", str(q.get("id", "")).lower())[:10] or new_brew_seq(used)["id"]
+                    if sid in used:
+                        sid = new_brew_seq(used)["id"]
+                    used.add(sid)
+                    key = str(q.get("key", "")).strip()[-1:]
+                    seq.append({"id": sid, "key": key if key in HOTBAR_KEYS else "",
+                                "clicks": max(1, min(10, int(float(q.get("clicks", 1) or 1))))})
+                pts = {}
+                for k in ("pot", "spoon"):
+                    v = r.get(k)
+                    pts[k] = [int(v[0]), int(v[1])] if isinstance(v, (list, tuple)) and len(v) == 2 else None
+                recipes[name] = {"seq": seq, "count": max(1, min(99999, int(float(r.get("count", 50) or 50)))), **pts}
+            except Exception:
+                continue
+    if not recipes:
+        recipes = {"Potion 1": new_recipe()}
+    active = data.get("active") if isinstance(data, dict) else None
+    return {"active": active if active in recipes else next(iter(recipes)), "recipes": recipes}
+
+
+def clean_popts(data, profiles):
+    """Per-profile options (they travel with the profile in share codes): {profile: {"mana_dash": bool, "whisper_dj": bool, "soul_rip": bool}}."""
+    out = {}
+    for n in profiles:
+        d = data.get(n) if isinstance(data, dict) else None
+        out[n] = {k: (bool(d.get(k)) if isinstance(d, dict) else False) for k in POPT_KEYS}
+    return out
+
+
+INV_POTIONS = ("Feather Feet", "Fire Protection", "Health Potion")   # in EVERY profile's inventory, labelled "Potions" (can't be removed)
+
+
+INV_POTION_COLOR = {"Feather Feet": "#ffffff", "Fire Protection": "#ff8040", "Health Potion": "#46e060"}   # the box colour of each built-in potion
+
+
+def clean_hex(c):
+    """'#rrggbb' (any capitals) or '' (= the default colour)."""
+    c = str(c or "").strip()
+    return c.lower() if re.fullmatch(r"#[0-9a-fA-F]{6}", c) else ""
+
+
+def clean_inv(data):
+    """A profile's Inventory list -> [{"name", "cd", "cd2", "split", "potion", "builtin", "color"}]: the three potions always first
+    (builtin, only their colour is kept), then the user's moves (blank / repeated names dropped). color = the card box colour ('' = default)."""
+    data = data if isinstance(data, list) else []
+    col = {}
+    for e in data:
+        try:
+            col[_norm_name(e.get("name", ""))] = clean_hex(e.get("color"))
+        except Exception:
+            pass
+    out = [{"name": n, "cd": 0.0, "cd2": 0.0, "split": False, "potion": True, "builtin": True, "color": col.get(_norm_name(n)) or INV_POTION_COLOR[n]}
+           for n in INV_POTIONS]
+    seen = {_norm_name(n) for n in INV_POTIONS}
+    for e in data:
+        try:
+            nm = " ".join(str(e.get("name", "")).split())[:40]
+            if not nm or _norm_name(nm) in seen:
+                continue
+            seen.add(_norm_name(nm))
+            soul, awk, bmk = is_soul_name(nm), is_awk_name(nm), bmove_kind(nm)
+            special = soul or awk or bool(bmk)
+            out.append({"name": nm, "cd": 0.0 if special else max(0.0, float(e.get("cd") or 0.0)),
+                        "cd2": 0.0 if special else max(0.0, float(e.get("cd2") or 0.0)),
+                        "split": bool(e.get("split")), "potion": bool(e.get("potion")) and not special, "builtin": False,
+                        "color": clean_hex(e.get("color"))})
+            if soul:
+                out[-1]["soul"] = True
+            if awk:
+                out[-1]["awk"] = True
+            if bmk:
+                out[-1]["bmove"] = bmk
+        except Exception:
+            continue
+    return out[:60]
+
+
+def inv_of(cfg):
+    """The ACTIVE profile's Inventory list (made, with the three potions, when the profile has none yet)."""
+    d = cfg.setdefault("inv", {})
+    lst = d.get(cfg["active"])
+    if lst is None:
+        lst = d[cfg["active"]] = clean_inv(None)
+    return lst
+
+
+def inv_vkey(name):
+    """The Tracker key of an inventory move ("inv:fire protection")."""
+    return "inv:" + _norm_name(name)
+
+
+def default_kdapos():
+    return {"id": "kda", "x": 0.0, "y": 0.0, "w": 280.0, "h": 42.0, "follow": True}
+
+
+def clean_kdapos(d):
+    out = default_kdapos()
+    try:
+        x, y, w, h = (float(d[n]) for n in ("x", "y", "w", "h"))
+        if w >= 8 and h >= 8:
+            out.update(x=x, y=y, w=w, h=h, follow=bool(d.get("follow", False)))
+    except Exception:
+        pass
+    return out
+
+
+def default_pctpos():
+    return {"id": "pct", "x": 0.0, "y": 0.0, "w": 48.0, "h": 20.0, "follow": True}
+
+
+def clean_pctpos(d):
+    """The mana % number: its screen rectangle. follow = it sits above the mana bar by itself (until you move it)."""
+    out = default_pctpos()
+    try:
+        x, y, w, h = (float(d[n]) for n in ("x", "y", "w", "h"))
+        if w >= 8 and h >= 8:
+            out.update(x=x, y=y, w=w, h=h, follow=bool(d.get("follow", False)))
+    except Exception:
+        pass
+    return out
+
+
+def pct_follow_rect(m, w=None, h=20.0):
+    """Where the mana % sits by default: centred right above the mana bar picture."""
+    w = max(40.0, m["w"] * 0.9) if w is None else w
+    return (m["x"] + m["w"] / 2.0 - w / 2.0, m["y"] - h - 2.0, w, h)
+
+
+def mana_fill_boundary(arr, boxes=(), alpha=0.6, tol=24):
+    """arr = the screen strip of the mana bar from the 100 % line (row 0) down to the 0 % line. Returns the row where the
+    fill's top edge is (0 = full, len(arr) = empty). Rows are empty / filled by colour; thin tick lines of the overlay
+    picture are outvoted. boxes = [(row0, row1, (r, g, b))]: cast-mark boxes drawn over the bar, where the empty colour is
+    the blend of the box colour and the empty bar."""
+    a = np.asarray(arr)[..., :3].astype(np.int16)
+    n = a.shape[0]
+    if n == 0 or a.shape[1] == 0:
+        return 0
+    emp = [np.array(c, dtype=np.int16) for c in MANA_EMPTY_COLORS]
+    best = np.full(a.shape[:2], 10 ** 6)
+    for c in emp:
+        best = np.minimum(best, np.abs(a - c).sum(axis=2))
+    is_empty = (best <= tol).mean(axis=1) >= 0.5
+    for r0, r1, col in boxes:
+        r0, r1 = max(0, int(r0)), min(n, int(r1))
+        if r1 <= r0:
+            continue
+        bl = np.full((r1 - r0, a.shape[1]), 10 ** 6)
+        for c in emp:
+            exp = alpha * np.array(col, dtype=float) + (1 - alpha) * c
+            bl = np.minimum(bl, np.abs(a[r0:r1] - exp).sum(axis=2))
+        is_empty[r0:r1] = (bl <= tol).mean(axis=1) >= 0.5
+    cum_f = np.concatenate([[0], np.cumsum(~is_empty)])             # filled rows above row b are wrong
+    cum_e = np.concatenate([[0], np.cumsum(is_empty)])              # empty rows from row b down are wrong
+    cost = cum_f + (cum_e[-1] - cum_e)
+    return int(np.argmin(cost))
+
+
+MANA_BAR_EMPTY, MANA_PRESENT_TOL = (82, 64, 73), 0     # the empty mana bar's colour, and how far off it may be to count as "the bar is on screen"
+MANA_KEEP = 10.0     # seconds the mana overlay stays on after a charge / the mana ding even when the empty bar isn't seen
+
+
+def mana_bar_present(arr, boxes=()):
+    """arr = the screen strip inside the mana bar (as for mana_fill_boundary). True when the game's EMPTY mana bar colour is
+    there: at least two rows of the strip are (nearly) exactly that colour. The world / the menus behind it never match.
+    boxes = rows covered by cast-mark boxes (skipped)."""
+    a = np.asarray(arr)[..., :3].astype(np.int16)
+    n = a.shape[0]
+    if n < 8 or a.shape[1] == 0:
+        return True
+    keep = np.ones(n, dtype=bool)
+    for r0, r1, _c in boxes:
+        keep[max(0, int(r0)):max(0, min(n, int(r1)))] = False
+    if keep.sum() < 8:
+        return True
+    a = a[keep]
+    best = np.abs(a - np.array(MANA_BAR_EMPTY, dtype=np.int16)).sum(axis=2)        # (EXACTLY that colour: near colours don't count)
+    return int(((best <= MANA_PRESENT_TOL).mean(axis=1) >= 0.5).sum()) >= 2
+
+
+def mana_frame_present(arr):
+    """arr = the screen area of the mana bar. True when its frame is there: two long straight orange rails side by side
+    (the same lines the Find Mana Bar button uses). Only used while the overlay is OFF, because the overlay's own
+    frame sits on top of the game's."""
+    a = np.asarray(arr)[..., :3].astype(np.int16)
+    if a.shape[0] < 40 or a.shape[1] < 12:
+        return False
+    return find_rails(np.abs(a - np.array(RAIL)).sum(axis=2) <= 30, max(30, int(a.shape[0] * 0.6))) is not None
+
+
+def pct_edit_picture(w, h):
+    """What the on-screen editor shows for the mana % number: a sample '100' on the dark bar colour."""
+    pil = Image.new("RGB", (w, h), (66, 52, 62))
+    txt = Image.new("L", (40, 14), 0)
+    ImageDraw.Draw(txt).text((2, 1), "100", fill=255)
+    bb = txt.getbbox()
+    if bb:
+        txt = txt.crop(bb)
+        tw, th = max(1, int(w * 0.8)), max(1, int(h * 0.7))
+        mask = txt.resize((tw, th), Image.NEAREST).point(lambda v: 255 if v > 60 else 0)
+        pil.paste((255, 255, 255), ((w - tw) // 2, (h - th) // 2), mask)
+    return pil
+
+
+def screen_size(root):
+    """(width, height) of the screen; 1920x1080 if it can't be read."""
+    try:
+        w, h = int(root.winfo_screenwidth()), int(root.winfo_screenheight())
+        if w >= 640 and h >= 480:
+            return w, h
+    except Exception:
+        pass
+    return 1920, 1080
+
+
+def ref_anchor(sw=1920, sh=1080):
+    """The hotbar the coin defaults were measured against (a 1920x1080 full screen), scaled to this screen."""
+    f = sh / 1080.0 if sh else 1.0
+    return {"x": DEFAULT_BAR["x"] * (sw / 1920.0 if sw else 1.0), "y": DEFAULT_BAR["y"] * f, "p": DEFAULT_BAR["pitch"] * f, "cl": 0.0}
+
+
+def bar_anchor(bar, cl=None):
+    """The hotbar ('Find hotbar') as an anchor: its top-left, its slot pitch, and where the game window's client area starts (x)."""
+    return {"x": float(bar["x"]), "y": float(bar["y"]), "p": float(bar["pitch"]), "cl": cl}
+
+
+def valid_anchor(a):
+    try:
+        return isinstance(a, dict) and float(a["p"]) > 4 and all(isinstance(float(a[k]), float) for k in ("x", "y")) and \
+            (a.get("cl") is None or isinstance(float(a["cl"]), float))
+    except Exception:
+        return False
+
+
+def move_item(it, A, B, left=False):
+    """Moves / scales a picture item (x, y, w, h) from the hotbar A to the hotbar B (both anchors). `left` = an item that
+    hangs on the LEFT edge of the game window (the rune coin): its x follows the window's left edge instead of the hotbar."""
+    k = B["p"] / A["p"] if A["p"] else 1.0
+    if left and A.get("cl") is not None and B.get("cl") is not None:
+        it["x"] = round(B["cl"] + (it["x"] - A["cl"]) * k, 1)
+    else:
+        it["x"] = round(B["x"] + (it["x"] - A["x"]) * k, 1)
+    it["y"] = round(B["y"] + (it["y"] - A["y"]) * k, 1)
+    it["w"], it["h"] = round(it["w"] * k, 1), round(it["h"] * k, 1)
+    return it
+
+
+def ref_point(A, x, y, w, h):
+    """A rectangle given in the 1920x1080 picture (hotbar at the default place) -> where it is for the hotbar A."""
+    k = A["p"] / DEFAULT_BAR["pitch"]
+    return (A["x"] + (x - DEFAULT_BAR["x"]) * k, A["y"] + (y - DEFAULT_BAR["y"]) * k, w * k, h * k)
+
+
+def clean_dashpos(data):
+    """Saved coin positions -> a clean dict with all three indicators (missing / broken ones get the defaults)."""
+    out = default_dashpos()
+    for k in DASH_IDS:
+        try:
+            d = data[k]
+            x, y, w, h = (float(d[n]) for n in ("x", "y", "w", "h"))
+        except Exception:
+            continue
+        if w >= 8 and h >= 8:
+            out[k] = {"id": k, "x": x, "y": y, "w": w, "h": h}
+    return out
+
+
+def cd_value(settings, key):
+    """A cooldown from the settings in seconds (a wrong / negative value falls back to the default)."""
+    try:
+        v = float(settings.get(key, DASH_CD_DEFAULT[key]))
+        return v if v >= 0 else DASH_CD_DEFAULT[key]
+    except (TypeError, ValueError):
+        return DASH_CD_DEFAULT[key]
+
+
+def letter_key(text, default):
+    t = str(text).strip().lower()[-1:]
+    return t if t.isalpha() and t.isascii() else default
+
+
+class DashCD:
+    """The cooldown state of the Dash coin, the PB coin and the 5 mana dash coins (no screen / Windows needed).
+    Pressing a key that is on cooldown does nothing (the cooldown never restarts)."""
+
+    def __init__(self, n=MANA_COINS):
+        self.dash_until = self.pb_until = self.mana_lock = 0.0
+        self.dash_len = self.pb_len = 0.0
+        self.fist_until = self.fist_len = 0.0
+        self.jump_until = self.jump_len = 0.0          # Whisperer's Double Jump
+        self.jump_first = -1e9                         # when the first Space press of a possible double jump was
+        self.coins = [0.0] * n
+        self.coin_len = [0.0] * n
+
+    def press_jump(self, t, cd, window):
+        """Space pressed: the SECOND press within `window` seconds of the first one is a double jump (starts the cooldown).
+        While the cooldown runs, presses do nothing."""
+        if self.jump_until > t:
+            self.jump_first = -1e9
+            return False
+        if 0 <= t - self.jump_first <= window:
+            self.jump_until, self.jump_len = t + cd, cd
+            self.jump_first = -1e9
+            return True
+        self.jump_first = t
+        return False
+
+    def press_fist(self, t, cd):
+        """A right click (M2) with a bare fist: starts the Fist M2 cooldown. A press while it runs does nothing."""
+        if self.fist_until <= t:
+            self.fist_until = t + cd
+            self.fist_len = cd
+            return True
+        return False
+
+    def _take_coin(self, t, mana_cd, timeout):
+        for i, until in enumerate(self.coins):
+            if until <= t:
+                self.coins[i] = t + mana_cd
+                self.coin_len[i] = mana_cd
+                self.mana_lock = t + max(0.0, timeout)
+                return True
+        return False
+
+    def press_dash(self, t, cd, mana_cd=5.2, mana_has=False, use_mana=False, timeout=0.0, both=False, force_normal=False):
+        """'mana' = a mana dash (the leftmost free blue coin goes on cooldown), 'dash' = a normal dash, None = nothing.
+        'both' = G and the dash key were pressed together: the dash eats a normal Dash coin AND a blue coin.
+        timeout: after a mana dash every dash press is ignored for this many seconds.
+        With mana dashes on and some mana, the press is a mana dash: when every blue coin is on cooldown it does
+        nothing (the normal Dash coin is never used up by it). While the normal Dash is on cooldown a dash press does
+        nothing at all: no blue coin goes on cooldown either."""
+        if force_normal:                           # Ctrl + dash key: always a NORMAL dash (never a blue coin, whatever the mana is)
+            if self.dash_until <= t:
+                self.dash_until = t + cd
+                self.dash_len = cd
+                return "dash"
+            return None
+        if t < self.mana_lock:
+            return None
+        if use_mana and (both or mana_has) and self.dash_until > t:
+            return None                            # the normal Dash is on cooldown: the game ignores the dash, so no blue coin goes on cooldown
+        if use_mana and both:
+            took = self._take_coin(t, mana_cd, timeout)
+            used = False
+            if self.dash_until <= t:
+                self.dash_until = t + cd
+                self.dash_len = cd
+                used = True
+            return "both" if took and used else ("mana" if took else ("dash" if used else None))
+        if use_mana and mana_has:
+            return "mana" if self._take_coin(t, mana_cd, timeout) else None
+        if self.dash_until <= t:
+            self.dash_until = t + cd
+            self.dash_len = cd
+            return "dash"
+        return None
+
+    def add_mana(self, t, mana_cd, timeout=0.0):
+        """G came just AFTER the dash: the blue coin is added to the normal dash that was already counted."""
+        return self._take_coin(t, mana_cd, timeout)
+
+    def press_pb(self, t, cd):
+        if self.pb_until <= t:
+            self.pb_until = t + cd
+            self.pb_len = cd
+            return True
+        return False
+
+    @staticmethod
+    def _fill(until, ln, t):
+        return 1.0 if until <= t or ln <= 0 else min(1.0, max(0.0, 1.0 - (until - t) / ln))
+
+    def progress(self, t):
+        """How full every coin is: 1.0 = ready, 0.0 = cooldown just started (it fills up as the cooldown runs out)."""
+        return {"dash": self._fill(self.dash_until, self.dash_len, t), "pb": self._fill(self.pb_until, self.pb_len, t),
+                "fist": self._fill(self.fist_until, self.fist_len, t), "jump": self._fill(self.jump_until, self.jump_len, t),
+                "mana": [self._fill(u, ln, t) for u, ln in zip(self.coins, self.coin_len)]}
+
+    def ready(self, t):
+        return {"dash": self.dash_until <= t, "pb": self.pb_until <= t, "fist": self.fist_until <= t,
+                "jump": self.jump_until <= t, "mana": [u <= t for u in self.coins]}
+
+    def reset(self):
+        self.dash_until = self.pb_until = self.mana_lock = 0.0
+        self.dash_len = self.pb_len = 0.0
+        self.fist_until = self.fist_len = 0.0
+        self.jump_until = self.jump_len = 0.0
+        self.jump_first = -1e9
+        self.coins = [0.0] * len(self.coins)
+        self.coin_len = [0.0] * len(self.coins)
+
+
+def valid_mana(m):
+    try:
+        return (isinstance(m, dict) and m["w"] >= 8 and m["h"] >= 8
+                and all(isinstance(m[k], (int, float)) for k in ("x", "y", "w", "h"))
+                and 0 <= m["zone"][0] < m["zone"][1] <= 1)
+    except Exception:
+        return False
+
+
+def valid_bar(b):
+    try:
+        return (isinstance(b, dict) and b["w"] >= 8 and b["h"] >= 8 and b["pitch"] > b["w"]
+                and all(isinstance(b[k], (int, float)) for k in ("x", "y", "w", "h", "pitch")))
+    except Exception:
+        return False
+
+
+ALWAYS_ON = ("only_in_game", "click_equip", "inv_equip", "detect_disarm", "cancel_on_repeat", "awk_read", "dblood_sound", "fist_need_cross")
+
+
+# ---------------- Checklists (Extras > Other Stuff > Checklist) ----------------
+EDICT_LISTS = (("seer", "Seer"), ("healer", "Healer"), ("blademaster", "Blademaster"), ("jester", "Jester"))
+EDICT_DEFAULTS = {                       # the built-in Edicts checklists: a name, or (name, target) for a number counter
+    "seer": ["Scroom Guy Quest", "Liquid Wisdom Quest", "Sick Girl Quest", "Homeless Man", "Ice Protection Quest", "Turnip Quest",
+             "Toilet Hand Quest", "Flower Delivery Quest", "Painting", "Sky Gazing", "Wraithknight Door Quest", "Reynauld's Quest",
+             "Dragon Speech", "Kyley's Promise", "Enter Castle Rock", "Gulnir's Delivery Quest", "Crystal Root Quest",
+             "Obtain your Uber Title", "Day 12"],
+    "healer": ["Sick Girl Quest", "Rem's Training", ("Health Potion Forcefeeds", 50), ("Total Spells", 15),
+               "Obtain your Uber Title", ("Sacrifice to Spire", 5)],
+    "blademaster": ["Obtain an Uber Title", ("Uber Grips", 150), "Obtain Rank 25 or higher"],
+    "jester": [],
+}
+CL_MAX_LISTS, CL_MAX_ITEMS = 40, 80
+
+
+def cl_new_item(kind="check", name="Checklist Placeholder", mx=50):
+    return {"id": "i" + os.urandom(3).hex(), "t": "count" if kind == "count" else "check", "name": str(name)[:60],
+            "done": False, "n": 0, "max": max(1, int(mx))}
+
+
+def cl_new_list(name="Name", fixed=False, lid=None, items=None):
+    return {"id": lid or "c" + os.urandom(3).hex(), "name": str(name)[:24] or "Name", "fixed": bool(fixed),
+            "items": items if items is not None else []}
+
+
+def default_checklists():
+    lists = []
+    for lid, nm in EDICT_LISTS:
+        its = [cl_new_item("count", e[0], e[1]) if isinstance(e, tuple) else cl_new_item("check", e) for e in EDICT_DEFAULTS[lid]]
+        lists.append(cl_new_list(nm, True, lid, its))
+    return {"shown": "", "collapsed": False, "lists": lists}
+
+
+def _clean_cl_item(d):
+    if not isinstance(d, dict):
+        return None
+    try:
+        t = "count" if d.get("t") == "count" else "check"
+        mx = max(1, min(99999, int(d.get("max", 50))))
+        return {"id": str(d.get("id") or "i" + os.urandom(3).hex())[:12], "t": t, "name": str(d.get("name", ""))[:60],
+                "done": bool(d.get("done", False)), "n": max(0, min(mx, int(d.get("n", 0)))), "max": mx}
+    except (TypeError, ValueError):
+        return None
+
+
+def clean_checklists(data):
+    """The saved checklists: the four Edicts ones are always there (items editable, never deleted / renamed)."""
+    base = default_checklists()
+    if not isinstance(data, dict):
+        return base
+    saved = {}
+    custom = []
+    for l in data.get("lists", []) if isinstance(data.get("lists"), list) else []:
+        if not isinstance(l, dict):
+            continue
+        its = [i for i in (_clean_cl_item(x) for x in (l.get("items") or [])) if i][:CL_MAX_ITEMS]
+        lid = str(l.get("id", ""))[:12]
+        if lid in dict(EDICT_LISTS):
+            saved[lid] = its
+        elif lid and len(custom) < CL_MAX_LISTS:
+            custom.append(cl_new_list(str(l.get("name", "Name")).strip() or "Name", False, lid, its))
+    for l in base["lists"]:
+        if l["id"] in saved:
+            l["items"] = saved[l["id"]]
+    base["lists"] += custom
+    ids = {l["id"] for l in base["lists"]}
+    base["shown"] = data.get("shown") if data.get("shown") in ids else ""
+    base["collapsed"] = bool(data.get("collapsed", False))
+    return base
+
+
+def make_cl_code(lists):
+    """A code to share checklists (their items only, not what is ticked)."""
+    payload = {"v": 1, "lists": [{"name": l["name"], "items": [{"t": i["t"], "name": i["name"], "max": i["max"]} for i in l["items"]]}
+                                 for l in lists]}
+    return "CL1:" + base64.urlsafe_b64encode(zlib.compress(json.dumps(payload, separators=(",", ":")).encode("utf-8"))).decode()
+
+
+def read_cl_code(code):
+    """-> [(name, [item, ...])]; ValueError for a code that isn't a checklist code."""
+    code = str(code).strip()
+    if not code.startswith("CL1:"):
+        raise ValueError("That isn't a checklist code")
+    try:
+        d = json.loads(zlib.decompress(base64.urlsafe_b64decode(code[4:].encode())).decode("utf-8"))
+        out = []
+        for l in d["lists"][:CL_MAX_LISTS]:
+            its = []
+            for i in l["items"][:CL_MAX_ITEMS]:
+                its.append(cl_new_item("count" if i.get("t") == "count" else "check", str(i.get("name", ""))[:60] or "Checklist Placeholder",
+                                       int(i.get("max", 50))))
+            out.append((str(l.get("name", "Name"))[:24] or "Name", its))
+        if not out:
+            raise ValueError("empty")
+        return out
+    except Exception:
+        raise ValueError("That checklist code is broken")
+
+
+def cl_done(it):
+    return it["n"] >= it["max"] if it["t"] == "count" else bool(it["done"])
+
+
+def cl_text(it):
+    return f"{it['n']}/{it['max']} {it['name']}" if it["t"] == "count" else it["name"]
+
+
+CL_ROW, CL_PAD = 27, 9                   # row height / top padding (px at the normal size)
+
+
+def cl_scale(mana_h):
+    return min(1.5, max(0.7, float(mana_h) / 359.0))
+
+
+def cl_content_h(n, s):
+    return int(CL_PAD * s) * 2 + n * int(CL_ROW * s)
+
+
+def cl_scroll_max(n, ph, s):
+    return max(0, cl_content_h(n, s) - int(ph))
+
+
+def load_cfg():
+    cfg = {"version": 5, "bar": dict(DEFAULT_BAR), "active": DEFAULT_PROFILE,
+           "profiles": seed_profiles(), "snaps": {}, "settings": dict(DEFAULT_SETTINGS),
+           "mana": dict(DEFAULT_MANA, zone=list(DEFAULT_MANA["zone"])), "marks": {}, "decor": [], "dashpos": default_dashpos(), "pctpos": default_pctpos(), "kdapos": default_kdapos(), "popts": {}, "inv": {}, "brew": clean_brew(None), "checklists": default_checklists(), "mascot": None, "_dash_fresh": True, "charged": {DEFAULT_PROFILE: clean_charged(SEED_CHARGED)}}
+    data = {}
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if valid_bar(data.get("bar")):               # (the old drag-a-box "area" is dropped on purpose)
+                cfg["bar"] = {k: data["bar"][k] for k in ("x", "y", "w", "h", "pitch")}
+            profs = data.get("profiles")
+            if isinstance(profs, dict) and profs:
+                cfg["profiles"] = {str(k): clean_moves(v, m2=True) for k, v in profs.items()}
+            snaps = data.get("snaps")
+            if isinstance(snaps, dict):
+                cfg["snaps"] = {str(k): clean_moves(v) for k, v in snaps.items() if str(k) in cfg["profiles"]}
+            if valid_mana(data.get("mana")):
+                cfg["mana"] = {"x": float(data["mana"]["x"]), "y": float(data["mana"]["y"]),
+                               "w": float(data["mana"]["w"]), "h": float(data["mana"]["h"]),
+                               "image": str(data["mana"].get("image", "")),
+                               "zone": [float(data["mana"]["zone"][0]), float(data["mana"]["zone"][1])]}
+            cfg["decor"] = clean_decor(data.get("decor"))
+            cfg["brew"] = clean_brew(data.get("brew"))
+            cfg["checklists"] = clean_checklists(data.get("checklists"))
+            cfg["mascot"] = clean_mascot(data.get("mascot"))
+            if isinstance(data.get("kdapos"), dict):
+                cfg["kdapos"] = clean_kdapos(data["kdapos"])
+            if isinstance(data.get("pctpos"), dict):
+                cfg["pctpos"] = clean_pctpos(data["pctpos"])
+            if isinstance(data.get("dashpos"), dict):
+                cfg["dashpos"] = clean_dashpos(data["dashpos"])
+                cfg.pop("_dash_fresh", None)
+                cfg["_dash_new"] = [k for k in DASH_IDS if k not in data["dashpos"]]      # (coins added by a newer version: placed on the first start)
+            if valid_anchor(data.get("dash_anchor")):
+                cfg["dash_anchor"] = {"x": float(data["dash_anchor"]["x"]), "y": float(data["dash_anchor"]["y"]), "p": float(data["dash_anchor"]["p"]),
+                                      "cl": None if data["dash_anchor"].get("cl") is None else float(data["dash_anchor"]["cl"])}
+            ch = data.get("charged")
+            if isinstance(ch, dict):
+                cfg["charged"] = {str(k): clean_charged(v) for k, v in ch.items() if str(k) in cfg["profiles"]}
+            marks = data.get("marks")
+            if isinstance(marks, dict):
+                cfg["marks"] = {str(k): clean_marks(v) for k, v in marks.items() if str(k) in cfg["profiles"]}
+            cfg["active"] = data.get("active", "")
+            for k, v in (data.get("settings") or {}).items():
+                if k in DEFAULT_SETTINGS:
+                    cfg["settings"][k] = True if k in ALWAYS_ON else v      # (ALWAYS_ON: these used to be switches, a saved "off" is ignored)
+    except Exception:
+        pass
+    if cfg["active"] not in cfg["profiles"]:
+        cfg["active"] = next(iter(cfg["profiles"]))
+    raw_popts = data.get("popts") if isinstance(data, dict) else None
+    cfg["popts"] = clean_popts(raw_popts, cfg["profiles"])
+    if isinstance(data, dict) and raw_popts is None and isinstance(data.get("settings"), dict) \
+            and data["settings"].get("mana_dash_on"):         # (the first version had ONE switch for all profiles)
+        cfg["popts"][cfg["active"]]["mana_dash"] = True
+    cfg["charged"] = {k: v for k, v in cfg["charged"].items() if k in cfg["profiles"]}
+    raw_inv = data.get("inv") if isinstance(data, dict) else None
+    cfg["inv"] = {n: clean_inv(raw_inv.get(n) if isinstance(raw_inv, dict) else None) for n in cfg["profiles"]}
+    for name in cfg["profiles"]:
+        cfg["snaps"].setdefault(name, [])                 # every profile has its own snap spell list
+        cfg["marks"].setdefault(name, [])                 # ...and its own cast marks on the mana bar
+        cfg["charged"].setdefault(name, clean_charged(None))   # ...and its own Charged Blow cooldowns (Solan)
+    cfg["pack"] = str(data.get("pack") or "") if isinstance(data, dict) else ""
+    first_run = cfg["pack"] != DEFAULT_PACK_VERSION        # the first start of this version
+    added = merge_default_pack(cfg)                        # the default profiles of this version, once
+    if first_run:
+        cfg["settings"]["opacity"] = 0.3                   # 1.2.0: everyone's Red Box Strength starts at 0.3 (changeable afterwards)
+        cfg["pack"] = DEFAULT_PACK_VERSION                 # (saved with the next save: until then the same thing happens again, which changes nothing)
+    if added:
+        cfg["_pack_added"] = added
+        save_cfg(cfg)
+    return cfg
+
+
+def save_cfg(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=1)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# Updates: version.txt in the update folder says what the newest version is.
+#   version=1.1.0                 (required)
+#   notes=what changed            (optional, one line)
+#   script_sha256=...  exe_sha256=...   (optional but recommended: the file is rejected if it doesn't match)
+#   script_url=...  exe_url=...   (optional full https links; default = <folder>/CooldownIndicator.py / .exe)
+# Nothing is installed without a click. The old script is kept as CooldownIndicator.py.bak.
+# ----------------------------------------------------------------------------
+UPDATE_SCRIPT_NAME = "CooldownIndicator.py"
+UPDATE_EXE_NAME = "Rogue.Lineage.Assist.Tool.exe"      # (GitHub turns the spaces of "Rogue Lineage Assist Tool.exe" into dots)
+UPDATE_INFO_NAME = "version.txt"
+UPDATE_MAX_SCRIPT = 6 * 1024 * 1024
+UPDATE_MAX_EXE = 250 * 1024 * 1024
+
+
+class UpdateError(Exception):
+    pass
+
+
+def parse_version(text):
+    """'v1.2.10' -> (1, 2, 10); None if it isn't a version."""
+    m = re.fullmatch(r"v?(\d+(?:\.\d+){0,3})", str(text or "").strip().lower())
+    return tuple(int(p) for p in m.group(1).split(".")) if m else None
+
+
+def newer_version(a, b):
+    """True when version text a is newer than b."""
+    pa, pb = parse_version(a), parse_version(b)
+    if pa is None or pb is None:
+        return False
+    n = max(len(pa), len(pb))
+    return pa + (0,) * (n - len(pa)) > pb + (0,) * (n - len(pb))
+
+
+def parse_update_info(text):
+    info = {}
+    for line in str(text or "")[:20000].splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            k, v = line.split("=", 1)
+            info[k.strip().lower()] = v.strip()
+    if parse_version(info.get("version")) is None:
+        raise UpdateError("version.txt has no valid 'version=' line.")
+    return info
+
+
+def _https(url):
+    url = str(url or "").strip()
+    if not url.lower().startswith("https://"):
+        raise UpdateError("The update link must start with https://")
+    return url
+
+
+def fetch_url(url, limit, timeout=15):
+    """Download up to `limit` bytes from an https link."""
+    req = urllib.request.Request(_https(url), headers={"User-Agent": "CooldownIndicator-updater"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            buf = bytearray()
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > limit:
+                    raise UpdateError("The download is far bigger than expected - cancelled.")
+            return bytes(buf)
+    except UpdateError:
+        raise
+    except Exception as ex:
+        raise UpdateError(f"Couldn't download it ({ex.__class__.__name__}: {ex}).")
+
+
+def update_urls(base, info):
+    base = str(base or "").strip()
+    if base and not base.endswith("/"):
+        base += "/"
+    return {"info": base + UPDATE_INFO_NAME,
+            "script": info.get("script_url") or base + UPDATE_SCRIPT_NAME,
+            "exe": info.get("exe_url") or base + UPDATE_EXE_NAME}
+
+
+def check_for_update(base, current=APP_VERSION, fetch=None):
+    """-> (info dict, True when it is newer than `current`). Raises UpdateError."""
+    fetch = fetch or fetch_url
+    if not str(base or "").strip():
+        raise UpdateError("No update link is set (Settings > Update link).")
+    raw = fetch(update_urls(base, {})["info"], 40000)
+    info = parse_update_info(raw.decode("utf-8", "replace"))
+    return info, newer_version(info["version"], current)
+
+
+def _check_sha(data, info, key):
+    want = (info.get(key) or "").strip().lower()
+    if want and hashlib.sha256(data).hexdigest() != want:
+        raise UpdateError("The downloaded file doesn't match its checksum - NOT installed.")
+
+
+def verify_script(data, info):
+    if not 50000 < len(data) <= UPDATE_MAX_SCRIPT:
+        raise UpdateError("The downloaded script has a strange size - NOT installed.")
+    _check_sha(data, info, "script_sha256")
+    try:
+        src = data.decode("utf-8")
+        ast.parse(src)
+    except Exception:
+        raise UpdateError("The downloaded script isn't valid Python - NOT installed.")
+    m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', src, re.M)
+    if not m or parse_version(m.group(1)) != parse_version(info["version"]):
+        raise UpdateError("The script's version doesn't match version.txt - NOT installed.")
+
+
+def verify_exe(data, info):
+    if not 1_000_000 < len(data) <= UPDATE_MAX_EXE or data[:2] != b"MZ":
+        raise UpdateError("The downloaded file isn't a Windows program - NOT installed.")
+    _check_sha(data, info, "exe_sha256")
+
+
+def install_script(data, dest):
+    """Replace the script at `dest`; the old one is kept as dest + '.bak'."""
+    tmp = dest + ".new"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    try:
+        if os.path.exists(dest):
+            with open(dest, "rb") as a, open(dest + ".bak", "wb") as b:
+                b.write(a.read())
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def install_exe(data, exe_path):
+    """Windows lets a running exe be RENAMED but not overwritten: park it as .old, put the new one in its place.
+    (.old is deleted at the next start.) Rolls back if anything fails."""
+    new, old = exe_path + ".new", exe_path + ".old"
+    with open(new, "wb") as f:
+        f.write(data)
+    try:
+        if os.path.exists(old):
+            os.remove(old)
+        os.replace(exe_path, old)
+        try:
+            os.replace(new, exe_path)
+        except Exception:
+            os.replace(old, exe_path)
+            raise
+    except Exception:
+        try:
+            os.remove(new)
+        except Exception:
+            pass
+        raise
+
+
+def run_update(base, frozen, target, fetch=None):
+    """Download + check + install the newest version. Returns the new version text. Raises UpdateError."""
+    fetch = fetch or fetch_url
+    info, newer = check_for_update(base, fetch=fetch)
+    if not newer:
+        raise UpdateError("You already have the newest version.")
+    urls = update_urls(base, info)
+    _https(urls["exe"] if frozen else urls["script"])          # (a script_url / exe_url in version.txt must be https too)
+    try:
+        if frozen:
+            data = fetch(urls["exe"], UPDATE_MAX_EXE, 120)
+            verify_exe(data, info)
+            install_exe(data, target)
+        else:
+            data = fetch(urls["script"], UPDATE_MAX_SCRIPT, 60)
+            verify_script(data, info)
+            install_script(data, target)
+    except UpdateError:
+        raise
+    except Exception as ex:
+        raise UpdateError(f"Couldn't install it ({ex.__class__.__name__}: {ex}).")
+    return info["version"]
+
+
+def restart_command(frozen, target, environ):
+    """-> (command, Popen keyword arguments) for starting the program again after an update."""
+    env = {k: v for k, v in environ.items() if k != "_MEIPASS2" and not k.startswith("_PYI")}
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"         # (PyInstaller 6.9+: the new copy unpacks itself fresh)
+    if frozen:
+        cmd = f'cmd /c ping -n 4 127.0.0.1 >nul & start "" "{target}"'      # wait ~3 s: the old copy (and its temp folder) is gone by then
+        # CREATE_NO_WINDOW only: with DETACHED_PROCESS the cmd has no console and `ping` opens its own visible one.
+        kw = {"env": env, "shell": True, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0), "close_fds": True}
+        if hasattr(subprocess, "STARTUPINFO"):                              # (Windows) and start everything hidden
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 1)
+            si.wShowWindow = 0                                              # SW_HIDE
+            kw["startupinfo"] = si
+        return cmd, kw
+    return [sys.executable, target] + sys.argv[1:], {"env": env}
+
+
+def cleanup_old_exe():
+    """After an exe update the previous exe is parked as .old: remove it."""
+    if getattr(sys, "frozen", False):
+        try:
+            os.remove(sys.executable + ".old")
+        except Exception:
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Cooldown logic (no GUI, no Windows calls - easy to test)
+# ----------------------------------------------------------------------------
+class Tracker:
+    """key pressed -> armed;  LEFT click -> that move's cooldown starts;  RIGHT click -> snap spell.
+
+    Snap spells share one cooldown: using one puts EVERY snap spell of the profile on the cooldown of
+    the one that was used."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.lock = threading.Lock()
+        self.on = True               # always on: only closing the program stops it
+        self.armed = None            # (key, time pressed)
+        self.item = None             # (name, time, is_potion) of an inventory POTION equipped by clicking its card (other inventory moves are armed as "inv:<name>")
+        self.drink = None            # (name, end time) while a potion is being drunk
+        self.buffs = []              # potion effects that are on: [(icon kind, start, length)], the oldest first
+        self.potion_until = self.potion_len = 0.0     # the cooldown shared by ALL potions (starts when a drink is finished)
+        self.ready_at = {}           # normal moves: key -> time the cooldown ends
+        self.total = {}              # normal moves: key -> length of the running cooldown
+        self.snap_ready = {}         # snap spells: key -> time the (shared) cooldown ends
+        self.snap_total = {}         # snap spells: key -> length of the shared cooldown
+        self.m2_ready = {}           # normal moves' right-click (M2) cooldown: key -> time it ends
+        self.m2_total = {}           # ...and its length. Independent of the snap cooldown.
+        self.running = None          # key of a RUNNING snap spell (Gelidus) waiting for the left click that stops it
+        self.dive = None             # Rift Dive / Blade Crash: (key, time you went under / up, Azure variant?) while it lasts
+        self.azure_on, self.azure_at = False, 0.0    # Vanguard: Azure Ignition is on (since when)
+        self.held_weapon = None      # Solan: weapon key that was armed before a Charge / Charged Blow key
+        self.charge_at = 0.0         # when the remembered Charge was activated
+        self.last_charge = None      # Solan: the Charge that is active ('thunder' ...), kept after Charged Blow
+        self.history = []            # the last moves USED, newest last: dicts (key, name, kind, started, time)
+        self.disarmed = False        # the Weapon is gone from the hotbar (the game removes the moves that need it)
+        self.absent = frozenset()    # while disarmed: hotbar keys that are not on the bar any more
+        self.seen = set()            # hotbar keys that have been seen on the bar at least once (this session)
+        self._flip = 0               # debounce: consecutive scans that disagree with the current state
+        self.soul = None             # Wraith Knight: Soul Berserk (key, buff start, buff end, cooldown end, buff length, cooldown length)
+        self.song = None             # the Song being played: {key, t0, last (fraction left), seen (last time the meter was there), low, done}
+        self.song_pend = None        # (key, time) of the last left click with a Song
+        self.bl_passive = None       # Bloodline's passive (HP below 20%): {t0, t1} - the buff for 40 s with no cooldown and no Red Veil
+        self.bm = {}                 # the buff moves: {kind: {key, t0 start, t1 end of the duration, t2 end of the cooldown, dur, cd}}
+        self.fisch = None            # Fischeran: the passive dodges (dict, see fisch_feed)
+        self.awk = None              # Dzin: Awakened (a dict: key, t0 start, t1 end of the duration, t2 end of the cooldown, dur, cd, left, ...)
+
+    def reset_soul(self):
+        with self.lock:
+            self.soul = None
+            self.awk = None
+            self.bm = {}
+            self.bl_passive = None
+            self._song_release()
+            self.song = self.song_pend = None
+
+    def inv_entry(self, name):
+        """The active profile's Inventory entry called `name` (any capitals / spaces), or None."""
+        n = _norm_name(name)
+        for e in inv_of(self.cfg):
+            if _norm_name(e["name"]) == n:
+                return e
+        return None
+
+    def move_for(self, key):
+        if isinstance(key, str) and key.startswith("inv:"):     # an Inventory move: a Moves-style dict made from its entry
+            e = self.inv_entry(key[4:])
+            if e is None or e.get("potion"):
+                return None
+            d = {"key": key, "name": e["name"], "cd": float(e.get("cd") or 0.0), "cd2": float(e.get("cd2") or 0.0),
+                 "split": bool(e.get("split")), "unequip": False, "inv": True}
+            if is_soul_name(e["name"]):
+                d["soul"] = True
+            if is_awk_name(e["name"]):
+                d["awk"] = True
+            if bmove_kind(e["name"]):
+                d["bmove"] = bmove_kind(e["name"])
+            return d
+        for m in self.cfg["profiles"][self.cfg["active"]]:
+            if m["key"] == key:
+                return m
+        return None
+
+    def snap_list(self):
+        return self.cfg["snaps"].get(self.cfg["active"], [])
+
+    def snap_for(self, key):
+        for m in self.snap_list():
+            if m["key"] == key:
+                return m
+        return None
+
+    def reset(self):
+        with self.lock:
+            self.held_weapon = None
+            self.item = None
+            self.drink = None
+            self.buffs = []
+            self.potion_until = self.potion_len = 0.0
+            self.dive = None
+            self.soul = None
+            self.awk = None
+            self.bm = {}
+            self.bl_passive = None
+            self._song_release()
+            self.song = self.song_pend = None
+            self.fisch = None
+            self.azure_on = False
+            self.armed = None
+            self.running = None
+            self.disarmed, self.absent, self._flip = False, frozenset(), 0
+            self.history = []
+            self.last_charge = None
+            for d in (self.ready_at, self.total, self.snap_ready, self.snap_total, self.m2_ready, self.m2_total):
+                d.clear()
+
+    def clear_key(self, key, snap=False):
+        with self.lock:
+            for d in ((self.snap_ready, self.snap_total) if snap
+                      else (self.ready_at, self.total, self.m2_ready, self.m2_total)):
+                d.pop(key, None)
+            if snap and self.running == key:
+                self.running = None
+            if not snap and self.dive and self.dive[0] == key:
+                self.dive = None
+            if not snap and self.soul and self.soul[0] == key:
+                self.soul = None
+            if not snap and self.awk and self.awk["key"] == key:
+                self.awk = None
+            if not snap:
+                for k_ in [k_ for k_, v_ in self.bm.items() if v_["key"] == key and not v_.get("toggle")]:
+                    self.bm.pop(k_)
+            if self.armed and self.armed[0] == key:
+                self.armed = None
+
+    @staticmethod
+    def is_weapon(mv):
+        """A move whose main cooldown is blank / 0 is a weapon (it only exists so the macro knows it is one).
+        (Solan's Charges and Charged Blow are never weapons, whatever their cooldown box says.)"""
+        return (bool(mv) and float(mv.get("cd") or 0.0) <= 0 and charge_kind(mv.get("name")) is None
+                and not is_charged_blow(mv.get("name")) and not is_dark_charged_blow(mv.get("name"))
+                and not is_dive_move(mv.get("name"))
+                and not is_azure_ignition(mv.get("name")) and azure_kind(mv.get("name")) is None
+                and not mv.get("spell") and not mv.get("soul") and not mv.get("awk") and not mv.get("bmove"))      # (Soul Rip / Awakened / the buff moves have a blank cooldown but are no weapons)
+
+    def is_spell(self, key):
+        """A key is a SPELL when it has a snap spell or a cast mark on the mana bar (spells need no weapon).
+        A spell stays armed after it is cast, like a weapon does."""
+        mv = self.move_for(key)
+        return (self.snap_for(key) is not None or bool(mv and mv.get("spell"))
+                or any(m["key"] == key for m in self.cfg.get("marks", {}).get(self.cfg["active"], [])))
+
+    def _live_armed(self, now):
+        """The armed (key, time) - or None once it has timed out (a weapon never times out: it stays
+        equipped). Call with the lock held."""
+        S = self.cfg["settings"]
+        if (self.armed and S["arm_timeout"] > 0 and now - self.armed[1] > S["arm_timeout"]
+                and not self.is_weapon(self.move_for(self.armed[0]))):
+            self.armed = None
+        return self.armed
+
+    def swap_keys(self, a, b, snap=False):
+        """Two moves traded hotbar keys: their running cooldowns (kept per key) travel with them."""
+        with self.lock:
+            for d in ((self.snap_ready, self.snap_total) if snap
+                      else (self.ready_at, self.total, self.m2_ready, self.m2_total)):
+                va, vb = d.pop(a, None), d.pop(b, None)
+                if vb is not None:
+                    d[a] = vb
+                if va is not None:
+                    d[b] = va
+            if snap and self.running in (a, b):
+                self.running = b if self.running == a else a
+            if not snap and self.dive and self.dive[0] in (a, b):
+                self.dive = (b if self.dive[0] == a else a,) + self.dive[1:]
+            if self.armed and self.armed[0] in (a, b):
+                self.armed = None                # "armed" meant the key that was pressed, not the move
+
+    def armed_key(self, now):
+        """The key that is armed right now (or None)."""
+        with self.lock:
+            a = self._live_armed(now)
+            return a[0] if a else None
+
+    def update_hotbar(self, present, unknown=0):
+        """One look at the hotbar. present = set of hotbar keys that are on the bar (None = couldn't tell),
+        unknown = number of slots seen but not recognised. Returns a message when the state flips.
+
+        Disarmed = a Weapon (a move with a blank cooldown) that WAS on the bar is gone. The game then removes
+        the moves that need a weapon and resets their cooldowns, so those timers are cleared here too, and
+        keys of removed slots are ignored until the weapon is back. Two agreeing looks are needed to flip."""
+        with self.lock:
+            S = self.cfg["settings"]
+            weapons = {m["key"] for m in self.cfg["profiles"].get(self.cfg["active"], []) if self.is_weapon(m)}
+            if present is not None:
+                self.seen |= present
+            if present is None or unknown or not present or not S.get("detect_disarm", True) or not weapons:
+                self._flip = 0
+                return None
+            want = bool(weapons & self.seen) and any(w in self.seen and w not in present for w in weapons)
+            if want == self.disarmed:
+                self._flip = 0
+                if want:                          # still disarmed: keep the removed-slot list current
+                    self._drop({k for k in HOTBAR_KEYS if k not in present})
+                return None
+            self._flip += 1
+            if self._flip < 2:
+                return None
+            self._flip = 0
+            self.disarmed = want
+            if self.cfg["popts"].get(self.cfg["active"], {}).get("whisper_dj"):
+                self._agility_reset(time.time())      # Whisperer: losing / getting back the weapon resets Agility's cooldown
+            if want:
+                self.last_charge = None      # disarmed: the Charge is gone too
+                self.azure_on = False
+            if not want:
+                self.absent = frozenset()
+                return "Weapon is back - armed again."
+            self._drop({k for k in HOTBAR_KEYS if k not in present})
+            return "DISARMED - moves that need the weapon are gone: their cooldowns were reset."
+
+    def _drop(self, keys):
+        """Keys that left the bar: their move / M2 timers are cleared. (lock held)"""
+        self.absent = frozenset(keys)
+        for k in keys:
+            for d in (self.ready_at, self.total, self.m2_ready, self.m2_total):
+                d.pop(k, None)
+        if self.armed and self.armed[0] in keys:
+            self.armed = None
+
+    def press(self, key, now):
+        """A hotbar key went down. Any hotbar key changes what is selected in the game.
+        A different key arms that move; the SAME key again (while it is armed) un-arms it."""
+        if key not in HOTBAR_KEYS:
+            return
+        S = self.cfg["settings"]
+        with self.lock:
+            self._live_item(now)                 # (a drink that was finished in the meantime counts first)
+            self.item = None                     # a hotbar key swaps whatever was equipped from the inventory (and is no drinking)
+            self.drink = None
+            if key in self.absent:
+                return                           # disarmed: that slot is gone from the bar, the key does nothing
+            armed = self._live_armed(now)
+            solan = self._is_solan_key(key)
+            held = None                          # Solan: the weapon that was equipped before a Charge / Charged Blow key
+            if solan:
+                if armed and self.is_weapon(self.move_for(armed[0])):
+                    held = armed[0]
+                elif armed and self._is_solan_key(armed[0]):
+                    held = self.held_weapon
+            self.held_weapon = held
+            cancelled = bool(armed and armed[0] == key and S["cancel_on_repeat"])
+            if cancelled:
+                self.armed = (held, now) if held else None     # cancelling a Charge key goes back to the weapon
+            else:
+                self.armed = (key, now) if (self.move_for(key) or self.snap_for(key)) else None
+            self._charge_azure_rules(key, cancelled)
+
+    def equip_item(self, name, now):
+        """An inventory card was clicked (equipped). The weapon / move in hand is gone; the same card again puts it away.
+        A POTION waits for a click on the screen (see click); any other inventory move is armed like a hotbar move."""
+        with self.lock:
+            self._live_item(now)                          # (a drink that was finished in the meantime counts first)
+            e = self.inv_entry(name)
+            name = e["name"] if e else name
+            self.drink = None
+            if e is not None and not e.get("potion"):
+                vk = inv_vkey(name)
+                same = bool(self.armed and self.armed[0] == vk and self.cfg["settings"]["cancel_on_repeat"])
+                self.item = None
+                self.held_weapon = None
+                self.armed = None if same else (vk, now)
+                return f"{name} (inventory) - " + ("put away" if same else "equipped")
+            same = bool(self.item and self.item[0] == name and self.cfg["settings"]["cancel_on_repeat"])
+            self.armed = None
+            self.held_weapon = None
+            self.item = None if same else (name, now, True)
+            return f"{name} (inventory) - " + ("put away" if same else "equipped: click the screen to drink it")
+
+    DRINK_TIME = 2.0
+
+    def _live_item(self, now):
+        S = self.cfg["settings"]
+        if self.drink and now >= self.drink[1]:          # drunk: the potion is gone from your hand ...
+            self._add_buff(self.drink[0], self.drink[1])  # ... and its effect starts (Fire Protection, Feather Feet)
+            try:
+                cd = max(0.0, float(self.cfg["settings"].get("potion_cd") or 0.0))
+            except (TypeError, ValueError):
+                cd = 0.0
+            self.potion_until, self.potion_len = self.drink[1] + cd, cd          # ... and ALL potions are on cooldown
+            self.item = self.drink = None
+        if self.item and not self.drink and S["arm_timeout"] > 0 and now - self.item[1] > S["arm_timeout"]:
+            self.item = None
+        return self.item
+
+    def _add_buff(self, name, at):
+        """A potion was drunk: its effect icon starts (drinking it again restarts it). Lock held."""
+        hit = BUFF_OF.get(_norm_name(name))
+        if not hit:
+            return
+        kind, key = hit
+        try:
+            ln = float(self.cfg["settings"].get(key) or 0.0)
+        except (TypeError, ValueError):
+            ln = 0.0
+        self.buffs = [b for b in self.buffs if b[0] != kind]
+        if ln > 0:
+            self.buffs.append((kind, at, ln))
+
+    def buff_snapshot(self, now):
+        """[(icon kind, fraction left 1..0)] of the potion effects that are on, the NEWEST first (it sits next to the 1st slot)."""
+        with self.lock:
+            self._live_item(now)
+            self.buffs = [b for b in self.buffs if now < b[1] + b[2]]
+            return [(k, max(0.0, min(1.0, 1.0 - (now - t0) / ln))) for k, t0, ln in reversed(self.buffs)]
+
+    def buff_times(self, now):
+        """{icon kind: seconds left} of the potion effects that are on."""
+        with self.lock:
+            self._live_item(now)
+            return {k: max(0.0, t0 + ln - now) for k, t0, ln in self.buffs if now < t0 + ln}
+
+    def drinking(self, now):
+        """(potion name, seconds left) while a potion is being drunk, else None."""
+        with self.lock:
+            self._live_item(now)
+            return (self.drink[0], self.drink[1] - now) if self.drink else None
+
+    HISTORY_LEN = 12
+
+    def _note(self, key, kind, started, now):
+        """Remember a move that was used. kind: 'move' (left click) / 'weapon' (left click, no cooldown) / 'm2'
+        (the move's right click) / 'snap' (snap spell) / 'stop' (the left click that stopped a running spell).
+        started = False when the click was ignored (still cooling down). Call with the lock held."""
+        mv = self.move_for(key)
+        sp = self.snap_for(key)
+        nm = (sp["name"] if kind in ("snap", "stop") and sp else (mv["name"] if mv else (sp["name"] if sp else ""))) or key
+        self.history.append({"key": key, "name": nm, "kind": kind, "started": bool(started), "time": now})
+        del self.history[:-self.HISTORY_LEN]
+
+    def last_used(self):
+        """The most recent move used (dict) or None."""
+        with self.lock:
+            return dict(self.history[-1]) if self.history else None
+
+    KIND_TEXT = {"move": "left click", "weapon": "weapon", "m2": "M2 (right click)", "snap": "snap (right click)",
+                 "stop": "stopped"}
+
+    def last_text(self, now=None):
+        """'Skewer (3) - left click, 2.3s ago' or None."""
+        u = self.last_used()
+        if not u:
+            return None
+        ago = (time.time() if now is None else now) - u["time"]
+        return (f"{u['name']} ({u['key']}) - {self.KIND_TEXT.get(u['kind'], u['kind'])}"
+                + ("" if u["started"] else ", ignored") + f", {int(max(ago, 0))}s ago")
+
+    def click(self, now, button="left", runes=None):
+        """A mouse click ('left' or 'right'). Returns a message when something started / stopped, else None.
+        runes = the rune count read from the screen (Soul Rip), None = couldn't be read."""
+        S = self.cfg["settings"]
+        with self.lock:
+            msgs = []
+            stopped = None
+            if button == "left" and self._live_item(now) and self.item[2]:      # a potion in hand: a click on the screen drinks it
+                if self.drink is None:
+                    if now < self.potion_until:
+                        return f"Potions are on cooldown ({self.potion_until - now:.0f}s left)"
+                    self.drink = (self.item[0], now + self.DRINK_TIME)
+                    return f"Drinking {self.item[0]} ({self.DRINK_TIME:g}s)"
+                return None
+            if button == "left":
+                self._dive_tick(now)                        # (after 5 s you came up by yourself)
+                if self.dive:
+                    key, t0 = self.dive[0], self.dive[1]
+                    if now - t0 < DIVE_LOCK:
+                        return None                         # failsafe: clicks in the first second do nothing
+                    m = self._surface(now)                  # ANY left click brings you up
+                    self._note(key, "stop", True, now)
+                    return m
+            if button == "left" and self.running:          # ANY left click stops a running snap spell
+                stopped = self.running
+                m = self._stop_running(now)
+                if m:
+                    msgs.append(m)
+            armed = self._live_armed(now)
+            if stopped is not None:
+                self._note(stopped, "stop", True, now)
+            if armed and armed[0] != stopped:              # (the click that stops a running spell is only that)
+                key = armed[0]
+                # left click: the normal move.  right click: the snap spell on this key AND / OR the
+                # move's own M2 cooldown - two separate things with separate timers.
+                if button == "right":
+                    got = []
+                    mv0 = self.move_for(key)
+                    if mv0 and mv0.get("soul"):                # Wraith Knight: the right click of Soul Rip = Soul Berserk
+                        m = self._soul_click(key, now, S, runes)
+                        if m:
+                            msgs.append(m)
+                            if self.soul and self.soul[0] == key and self.soul[1] == now:
+                                self._note(key, "m2", True, now)
+                                got.append("m2")
+                    for fn, kind in ((self._snap_click, "snap"), (self._m2_click, "m2")):
+                        m = fn(key, now, S)
+                        if m:
+                            msgs.append(m)
+                            self._note(key, kind, True, now)
+                            got.append(kind)
+                    if not got:                            # a right click that did nothing (cooling down / no variant)
+                        mv = self.move_for(key)
+                        if self.snap_for(key):
+                            self._note(key, "snap", False, now)
+                        elif mv and float(mv.get("cd2") or 0.0) > 0:
+                            self._note(key, "m2", False, now)
+                else:
+                    m = self._move_click(key, now, S)
+                    if m:
+                        msgs.append(m)
+                    mv = self.move_for(key)
+                    if mv:
+                        self._note(key, "weapon" if self.is_weapon(mv) else "move", bool(m) or self.is_weapon(mv), now)
+                if self.is_weapon(self.move_for(key)):
+                    self.armed = armed           # a weapon stays equipped: no click un-arms it
+                elif self.is_spell(key) and self.armed is not None:
+                    self.armed = (key, now)      # a spell stays armed after the cast (the timeout restarts from it)
+            return " | ".join(msgs) or None
+
+    def _soul_click(self, key, now, S, runes):
+        """Soul Berserk: a right click with Soul Rip armed. It needs a rune (runes == 0: nothing happens). The buff lasts
+        soul_dur seconds, then Soul Rip is on cooldown for soul_cd seconds. Call with the lock held."""
+        if self.soul and now < self.soul[3] - S["grace"]:
+            return None                                       # the buff is running / Soul Rip is cooling down
+        if runes is not None and runes <= 0:
+            return "Soul Berserk: no runes - nothing happens"
+        dur, cd = cd_value(S, "soul_dur"), cd_value(S, "soul_cd")
+        if dur <= 0:
+            return None
+        self.soul = (key, now, now + dur, now + dur + cd, dur, cd)
+        return f"Soul Berserk ({key}): buff {dur:g}s, then {cd:g}s cooldown"
+
+    def soul_active(self, now):
+        """True while the Soul Berserk buff runs (any key, hotbar or inventory)."""
+        with self.lock:
+            st = self.soul
+            return bool(st and st[1] <= now < st[2])
+
+    def flood_active(self, now):
+        """True while the Flood Infinite buff runs (not the Flood Finite debuff after it)."""
+        with self.lock:
+            st = self.bm.get("flood")
+            return bool(st and st["t0"] <= now < st["t1"])
+
+    def soul_snapshot(self, now):
+        """{key: (seconds left, total)} while the Soul Berserk buff runs (its box is black)."""
+        with self.lock:
+            st = self.soul
+            if st and st[1] <= now < st[2] and not st[0].startswith("inv:") and self.move_for(st[0]):
+                return {st[0]: (st[2] - now, st[4])}
+        return {}
+
+    def soul_progress(self, now):
+        """How full the rune coin is: draining 1 -> 0 while the buff runs, then filling 0 -> 1 during the cooldown."""
+        with self.lock:
+            st = self.soul
+        if not st or now >= st[3]:
+            return 1.0
+        if now < st[1]:
+            return 1.0
+        if now < st[2]:
+            return max(0.0, min(1.0, (st[2] - now) / st[4]))
+        return max(0.0, min(1.0, (now - st[2]) / st[5])) if st[5] > 0 else 1.0
+
+    # ---------- Dzin: Awakened ----------
+    def _awk_click(self, key, now, S):
+        """Awakened is a toggle. On: it lasts awk_dur seconds (or until the dodges run out), then it cools down for awk_cd
+        seconds. Clicked again while on: it is switched off and the cooldown starts at once. Call with the lock held."""
+        a = self.awk
+        if a and a["t0"] <= now < a["t1"]:
+            self._awk_end(now)
+            return f"Awakened off ({key}): cooldown {a['cd']:g}s"
+        if a and now < a["t2"] - S["grace"]:
+            return None                                       # cooling down: the game ignores the click
+        dur, cd = cd_value(S, "awk_dur"), cd_value(S, "awk_cd")
+        if dur <= 0:
+            return None
+        try:
+            n = max(1, min(AWK_COINS, int(float(S.get("awk_dodges", AWK_COINS)))))
+        except (TypeError, ValueError):
+            n = AWK_COINS
+        self.awk = {"key": key, "t0": now, "t1": now + dur, "t2": now + dur + cd, "dur": dur, "cd": cd, "n": n, "left": n,
+                    "sig": None, "pend": None, "pend_n": 0, "seen": False, "gone": None, "learn": {}}
+        return f"Awakened ({key}): {dur:g}s, {n} dodges, then {cd:g}s cooldown"
+
+    def _awk_end(self, now):
+        a = self.awk
+        if a and a["t0"] <= now < a["t1"]:
+            a["t1"], a["t2"], a["left"] = now, now + a["cd"], 0
+
+    # ---------- the buff moves: Agility, Bane, Leviathan Plunge, Hyper Body ----------
+    def bm_duration(self, kind, S):
+        """Bane lasts longer with Dragon Sage / Faceless dashes on (its own setting)."""
+        if kind == "bane" and self.cfg["popts"].get(self.cfg["active"], {}).get("mana_dash"):
+            return cd_value(S, "bane_dur_mana")
+        return cd_value(S, BMOVES[kind][1])
+
+    def _bm_click(self, key, kind, now, S):
+        """A LEFT click with the move armed: it lasts `duration` seconds, then it is on cooldown. Call with the lock held."""
+        st = self.bm.get(kind)
+        if kind in TOGGLE_BM:                                 # Silverguard / Dragon Blood: a click turns it on, the next one (armed) off
+            if st:
+                if now - st["t0"] < TOGGLE_LOCK:
+                    return None                               # can't be turned off in its first second
+                self.bm.pop(kind, None)
+                return f"{BMOVES[kind][0]} ({key}): turned off"
+            self.bm[kind] = {"key": key, "t0": now, "t1": math.inf, "t2": math.inf, "dur": 0.0, "cd": 0.0, "toggle": True}
+            return f"{BMOVES[kind][0]} ({key}): on until it is turned off"
+        if st and now < st["t2"] - S["grace"]:
+            return None                                       # lasting / cooling down
+        if kind == "bloodline":
+            hf = getattr(self, "hp_frac", None)                   # only at less than 5% HP (unknown = the bar can't be read: allowed)
+            if hf and hf[0] is not None and time.time() - hf[1] < 1.0 and hf[0] >= HP_LOW_FRAC:
+                return None
+        dur, cd = self.bm_duration(kind, S), cd_value(S, BMOVES[kind][2])
+        if dur <= 0:
+            return None
+        t0 = now + (GALVANIZE_DELAY if kind == "galvanize" else 0.0)       # Galvanize: the debuff starts 1.8 s after the click
+        dk, deb = BM_DEBUFF.get(kind, (None, 0.0))
+        if kind == "bloodline":
+            self.bl_passive = None                            # using Bloodline puts the timer back to its own 30 s
+        self.bm[kind] = {"key": key, "t0": t0, "t1": t0 + dur, "tc": t0 + dur + deb, "t2": t0 + dur + deb + cd, "dur": dur, "cd": cd}
+        if dk:
+            self.bm[kind]["deb"], self.bm[kind]["debk"] = deb, dk
+        back = ""
+        if kind == "bane" and self.disarmed:                  # Bane gives the weapon back: the macro knows at once (no waiting for the screen)
+            self.disarmed, self.absent, self._flip = False, frozenset(), 0
+            if self.cfg["popts"].get(self.cfg["active"], {}).get("whisper_dj"):
+                self._agility_reset(now)
+            back = " - weapon is back, armed again"
+        if dk:
+            return f"{BM_TITLE[kind]} ({key}): {dur:g}s, then the {BM_TITLE[dk]} debuff for {deb:g}s ({cd:g}s cooldown after it)"
+        if kind == "galvanize":
+            return f"{BM_TITLE[kind]} ({key}): starts in {GALVANIZE_DELAY:g}s, lasts {dur:g}s ({cd:g}s cooldown after it)"
+        return f"{BMOVES[kind][0]} ({key}): {dur:g}s, then {cd:g}s cooldown{back}"
+
+    def dragon_blood_on(self, now=None):
+        with self.lock:
+            return "dragonblood" in self.bm
+
+    def dragon_blood_heard(self, now):
+        """Dragon Blood's turning-off sound (low health) was heard: it is off now - unless it was only just turned on
+        (the sound of turning it on is the same one) or can't be turned off yet."""
+        with self.lock:
+            st = self.bm.get("dragonblood")
+            if not st or now - st["t0"] < DBLOOD_DEAF:
+                return None
+            self.bm.pop("dragonblood", None)
+        return "Dragon Blood turned itself off (low health)"
+
+    def _agility_reset(self, now):
+        """Agility's cooldown is reset (a running buff keeps going: it just has no cooldown after it). Call with the lock held."""
+        st = self.bm.get("agility")
+        if not st:
+            return
+        if now < st["t1"]:
+            st["t2"], st["cd"] = st["t1"], 0.0
+        elif now < st["t2"]:
+            self.bm.pop("agility", None)
+
+    def bm_icons(self, now):
+        """[(kind, fraction left, seconds left)] of the buff moves that are lasting now, the newest first."""
+        with self.lock:
+            live = [(v["t0"], k, (1.0 if v.get("toggle") else max(0.0, min(1.0, (v["t1"] - now) / v["dur"]))),
+                     None if v.get("toggle") else v["t1"] - now) for k, v in self.bm.items() if v["t0"] <= now < v["t1"]]
+            for v in self.bm.values():                       # Flood Finite / Red Veil: the debuff after the buff (same place as the buffs)
+                deb = v.get("deb")
+                if deb and v["t1"] <= now < v["t1"] + deb:
+                    left = v["t1"] + deb - now
+                    live.append((v["t1"], v["debk"], max(0.0, min(1.0, left / deb)), left))
+            p = self.bl_passive
+            if p and p["t0"] <= now < p["t1"] and not any(k == "bloodline" for _t, k, _f, _l in live):
+                live.append((p["t0"], "bloodline", max(0.0, min(1.0, (p["t1"] - now) / (p["t1"] - p["t0"]))), p["t1"] - now))
+        live.sort(key=lambda t: -t[0])
+        return [(k, f, left) for _, k, f, left in live]
+
+    def bloodline_key(self):
+        """The key of the Bloodline move (profile Moves or Inventory) or None when it isn't added."""
+        try:
+            for m in self.cfg["profiles"][self.cfg["active"]]:
+                if m.get("bmove") == "bloodline":
+                    return m["key"]
+            for e in inv_of(self.cfg):
+                if bmove_kind(e["name"]) == "bloodline":
+                    return inv_vkey(e["name"])
+        except Exception:
+            pass
+        return None
+
+    def bloodline_passive(self, frac, now):
+        """Bloodline's passive: when the HP drops below 20% the Last Stand buff comes by itself for 40 s (the move itself isn't put on
+        cooldown and there is no Red Veil after it). frac = how full the HP bar is (None = unknown). It starts when the HP CROSSES 20%."""
+        with self.lock:
+            if frac is None:
+                return False
+            low = frac < BLOODLINE_PASSIVE_HP
+            was = getattr(self, "_bl_low", False)
+            self._bl_low = low
+            if not low or was or self.bloodline_key() is None:
+                return False
+            st, bp = self.bm.get("bloodline"), self.bl_passive
+            if (st and st["t0"] <= now < st["t1"]) or (bp and bp["t0"] <= now < bp["t1"]):
+                return False                                      # the move itself / the passive is running
+            self.bl_passive = {"t0": now, "t1": now + BLOODLINE_PASSIVE_SECS}
+            return True
+
+    def reset_flood(self):
+        """The hotbar disappeared (rejoined / the Menu button): Flood is ready again and its buff / debuff are gone."""
+        with self.lock:
+            return self.bm.pop("flood", None) is not None
+
+    def bm_snapshot(self, now):
+        """{hotbar key: (seconds left, total)} while a buff move lasts (its box is black)."""
+        out = {}
+        with self.lock:
+            for v in self.bm.values():
+                if v["t0"] <= now < v["t1"] and not v.get("toggle") and not v["key"].startswith("inv:") and self.move_for(v["key"]):
+                    out[v["key"]] = (v["t1"] - now, v["dur"])
+        return out
+
+    def awk_reading(self, now):
+        """Is Awakened running (the screen's dodge counter is worth reading)?"""
+        with self.lock:
+            a = self.awk
+            return bool(a and a["t0"] <= now < a["t1"])
+
+    def awk_feed(self, now, present, num):
+        """One look at the screen's 'Dodges: x'. present: True / False / None (can't tell); num: the number's picture.
+        A new stable picture = one dodge used; the counter running out, or the label gone for a while = Awakened ends."""
+        with self.lock:
+            a = self.awk
+            if not a or not (a["t0"] <= now < a["t1"]) or present is None:
+                if a and present is None:
+                    a["gone"] = None
+                return
+            if not present:
+                if a["seen"]:
+                    if a["gone"] is None:
+                        a["gone"] = now
+                    elif now - a["gone"] >= AWK_GONE:
+                        self._awk_end(now)                    # the text went away: Awakened is over
+                return
+            a["seen"], a["gone"] = True, None
+            if num is None:
+                return
+            if a["sig"] is None:
+                a["sig"] = num
+                a["learn"][a["left"]] = num
+                return
+            if same_picture(num, a["sig"]):
+                a["pend"], a["pend_n"] = None, 0
+                return
+            if a["pend"] is not None and same_picture(num, a["pend"]):
+                a["pend_n"] += 1
+            else:
+                a["pend"], a["pend_n"] = num, 1
+            if a["pend_n"] < 3:
+                return                                        # (the picture must stay different for a moment)
+            new = a["left"] - 1
+            for v, pic in a["learn"].items():                 # a picture seen before tells the number itself
+                if v != a["left"] and same_picture(num, pic):
+                    new = v
+                    break
+            a["sig"], a["pend"], a["pend_n"] = num, None, 0
+            a["left"] = max(0, min(a["n"], new))
+            a["learn"][a["left"]] = num
+            if a["left"] <= 0:
+                self._awk_end(now)                            # no dodges left: the cooldown starts right away
+
+    # ---------- Fischeran: 5 passive dodges ----------
+    def fisch_feed(self, now, present, num, S):
+        """One look at the screen's 'Dodges: x'. The text only shows after a hit (4 left): that starts the regeneration (fisch_cd
+        seconds, the big PB fills). Every new stable picture after that = one more dodge used. The text gone = all back."""
+        with self.lock:
+            f = self.fisch
+            if f is not None and f["t0"] is not None and now >= f["t0"] + f["cd"]:
+                f = self.fisch = None                                 # regenerated
+            if present is None:
+                if f:
+                    f["gone"] = None
+                return
+            if not present:
+                if f and f["seen"]:
+                    if f["gone"] is None:
+                        f["gone"] = now
+                    elif now - f["gone"] >= AWK_GONE:
+                        if f["left"] <= 0 or (f["left"] == 1 and f["gone"] - f.get("chg", f["t0"]) <= 3.0):
+                            f["left"] = 0                         # the text went away right after the last dodge: all used up (0 left removes
+                            # the text too) - nothing is back, the timer just keeps running until it is up
+                        else:
+                            self.fisch = None                     # the text is gone for another reason: the dodges are back
+                return
+            try:
+                n = max(1, min(AWK_COINS, int(float(S.get("fisch_dodges", 5)))))
+            except (TypeError, ValueError):
+                n = 5
+            if f is None:
+                self.fisch = {"t0": now, "cd": cd_value(S, "fisch_cd"), "n": n, "left": n - 1, "sig": num, "pend": None, "pend_n": 0,
+                              "seen": True, "gone": None, "learn": {n - 1: num}}
+                return
+            f["gone"] = None
+            if num is None or f["sig"] is None:
+                f["sig"] = f["sig"] if f["sig"] is not None else num
+                return
+            if same_picture(num, f["sig"]):
+                f["pend"], f["pend_n"] = None, 0
+                return
+            if f["pend"] is not None and same_picture(num, f["pend"]):
+                f["pend_n"] += 1
+            else:
+                f["pend"], f["pend_n"] = num, 1
+            if f["pend_n"] < 3:
+                return
+            new = f["left"] - 1
+            for v, pic_ in f["learn"].items():
+                if v != f["left"] and same_picture(num, pic_):
+                    new = v
+                    break
+            f["sig"], f["pend"], f["pend_n"] = num, None, 0
+            f["left"] = max(0, min(f["n"], new))
+            f["chg"] = now
+            f["learn"][f["left"]] = num
+
+    def fisch_state(self, now, n=5):
+        """{'pb': fill, 'dodges': [fill x n]}: idle = the PB is black and all the coins are lit; after a hit the PB fills over the cooldown."""
+        with self.lock:
+            f = self.fisch
+            if f is not None and now >= f["t0"] + f["cd"]:
+                f = self.fisch = None
+            if f is None:
+                return {"pb": 0.0, "dodges": [1.0] * n}
+            pb = max(0.0, min(1.0, (now - f["t0"]) / f["cd"])) if f["cd"] > 0 else 1.0
+            return {"pb": pb, "secs": f["t0"] + f["cd"] - now, "dodges": [1.0 if i < f["left"] else 0.0 for i in range(f["n"])]}
+
+    def awk_state(self, now):
+        """None while idle, else {'pb': fill, 'dodges': [fill x 10], 'on': bool}: during the duration the PB drains and the dodge coins
+        show what is left; during the cooldown everything fills back up."""
+        with self.lock:
+            a = self.awk
+            if not a or now >= a["t2"] or now < a["t0"]:
+                return None
+            if now < a["t1"]:
+                left = a["left"]
+                return {"on": True, "pb": max(0.0, min(1.0, (a["t1"] - now) / a["dur"])), "secs": a["t1"] - now,
+                        "dodges": [1.0 if i < left else 0.0 for i in range(AWK_COINS)]}
+            f = max(0.0, min(1.0, (now - a["t1"]) / a["cd"])) if a["cd"] > 0 else 1.0
+            return {"on": False, "pb": f, "secs": a["t2"] - now, "dodges": [f] * AWK_COINS}
+
+    def awk_snapshot(self, now):
+        """{key: (seconds left, total)} while Awakened runs (its box is black)."""
+        with self.lock:
+            a = self.awk
+            if a and a["t0"] <= now < a["t1"] and not a["key"].startswith("inv:") and self.move_for(a["key"]):
+                return {a["key"]: (a["t1"] - now, a["dur"])}
+        return {}
+
+    def _unequip_after(self, key, snap=False):
+        """Moves stay armed after use, except the ones marked 'unequips' (right-click their name box)."""
+        mv = self.snap_for(key) if snap else self.move_for(key)
+        if mv and mv.get("unequip"):
+            w = self.held_weapon if (not snap and self._is_solan_key(key)) else None
+            self.armed = (w, time.time()) if w else None
+
+    def _dive_len(self, key):
+        """How long Rift Dive (DIVE_MAX) / Blade Crash (BLADE_MAX) lasts when you don't click again."""
+        mv = self.move_for(key)
+        return BLADE_MAX if (mv and is_blade_crash(mv.get("name"))) else DIVE_MAX
+
+    def _dive_tick(self, now):
+        """Rift Dive / Blade Crash: after its length you come back by yourself (the cooldown starts then). Lock held."""
+        if self.dive and now - self.dive[1] >= self._dive_len(self.dive[0]):
+            self._surface(self.dive[1] + self._dive_len(self.dive[0]))
+
+    def _surface(self, at):
+        key, _t0, variant = self.dive
+        self.dive = None
+        mv = self.move_for(key)
+        akind = azure_kind(mv.get("name")) if mv else None
+        cd = (self._azure_cd(akind) if variant else float(mv.get("cd") or 0.0)) if mv else 0.0
+        start = at + DIVE_CD_DELAY                      # the cooldown starts a moment after you are back
+        if cd > 0:
+            if variant:
+                self.m2_ready[key], self.m2_total[key] = start + cd, cd
+                self.ready_at.pop(key, None)
+                self.total.pop(key, None)
+            else:
+                self.ready_at[key], self.total[key] = start + cd, cd
+                if akind:
+                    self.m2_ready.pop(key, None)
+                    self.m2_total.pop(key, None)
+        what = "back down" if is_blade_crash(mv.get("name") if mv else "") else "back up"
+        return f"{(mv['name'] if mv else '') or 'Dive'} ({key}): {what}" + (f" - cooldown {cd:g}s started" if cd > 0 else "")
+
+    def dive_snapshot(self, now):
+        """{key: (seconds left under the ground / in the air, DIVE_MAX)} while Rift Dive / Blade Crash is active."""
+        with self.lock:
+            self._dive_tick(now)
+            if not self.dive or not self.move_for(self.dive[0]):
+                return {}
+            ln = self._dive_len(self.dive[0])
+            return {self.dive[0]: (ln - (now - self.dive[1]), ln)}
+
+    def _dive_click(self, key, mv, now, S):
+        akind = azure_kind(mv.get("name"))
+        variant = bool(akind and self._azure_active(now) and self._azure_cd(akind) > 0)
+        shared = bool(akind) or self._shared(mv)
+        busy = max(self.ready_at.get(key, 0.0), self.m2_ready.get(key, 0.0)) if shared else self.ready_at.get(key, 0.0)
+        if busy - now > S["grace"]:
+            return None                      # still cooling down
+        self.dive = (key, now, variant)
+        self._unequip_after(key)
+        where = "in the air" if is_blade_crash(mv.get("name")) else "underground"
+        return (f"{'Azure ' if variant else ''}{mv['name'] or key} ({key}): {where} - left click to end it "
+                f"(not in the first {DIVE_LOCK:g}s), or wait {self._dive_len(key):g}s")
+
+    def _azure_active(self, now):
+        if self.azure_on and now - self.azure_at > AZURE_LIFETIME:
+            self.azure_on = False
+        return self.azure_on
+
+    def _azure_cd(self, kind):
+        try:
+            return float(self.cfg.get("charged", {}).get(self.cfg["active"], {}).get(kind) or 0.0)
+        except Exception:
+            return 0.0
+
+    def azure_text(self, now=None):
+        with self.lock:
+            return "Azure Ignition" if self._azure_active(time.time() if now is None else now) else None
+
+    def _is_solan_key(self, key):
+        mv = self.move_for(key)
+        return bool(mv and (charge_kind(mv.get("name")) or is_charged_blow(mv.get("name"))
+                            or is_dark_charged_blow(mv.get("name")) or is_azure_ignition(mv.get("name"))))
+
+    def _charge_azure_rules(self, key, cancelled=False):
+        """Solan's Charge and Vanguard's Azure Ignition are removed when (1) you hover a spell from the NORMAL SPELLS
+        section or a SNAP spell, or (2) you un-arm (you pressed the armed key again and nothing is armed any more).
+        Every move in the Moves section is a "class move": picking one keeps the Charge / Azure. Profiles with no
+        weapon move only use rule (1) and the 30 s timers. Call with the lock held (after the key press was applied)."""
+        if not (self.last_charge or self.azure_on):
+            return
+        pressed = self.move_for(key)
+        spell = bool(pressed and pressed.get("spell")) or self.snap_for(key) is not None   # Normal Spells + snap spells
+        has_weapon = any(self.is_weapon(m) for m in self.cfg["profiles"].get(self.cfg["active"], []))
+        gone = spell or (has_weapon and cancelled and self.armed is None)
+        if gone:
+            self.last_charge = None
+            self.azure_on = False
+
+    def _expire_charge(self, now):
+        if self.last_charge and now - self.charge_at > CHARGE_LIFETIME:
+            self.last_charge = None
+
+    def charge_text(self, now=None):
+        with self.lock:
+            self._expire_charge(time.time() if now is None else now)
+            return (CHARGE_LABEL[self.last_charge]) if self.last_charge else None
+
+    def _blow_click(self, key, mv, now, S):
+        """Charged Blow (Solan) / Dark Charged Blow (Wraith Knight): keeps the active Charge remembered and puts THAT
+        Charge's slot on the blow's cooldown for that Charge (blue, next to the Charge's own red activation cooldown -
+        same look as M1 / M2). Each blow only uses the Charges of its own class."""
+        self._expire_charge(now)
+        dark = is_dark_charged_blow(mv.get("name"))
+        kind = self.last_charge
+        if kind is None or kind not in (WK_KINDS if dark else SOLAN_KINDS):
+            return None                      # no (matching) Charge active: nothing to blow
+        name = (f"{CHARGE_LABEL[kind]} Dark Charged Blow" if dark
+                else f"{CHARGE_LABEL[kind].replace(' Charge', '')} Charged Blow")
+        cd = float(self.cfg.get("charged", {}).get(self.cfg["active"], {}).get(kind) or 0.0)
+        ck = next((m["key"] for m in self.cfg["profiles"][self.cfg["active"]] if charge_kind(m["name"]) == kind), None)
+        if ck is not None and self.m2_ready.get(ck, 0.0) - now > S["grace"]:
+            return None                      # that blow is still cooling down: the click does nothing
+        # the Charge stays remembered (it is NOT removed): the next blow uses it again
+        self._unequip_after(key)
+        if ck is None:
+            return f"{name}: add a move called '{CHARGE_LABEL[kind]}' to this profile to see its cooldown"
+        if cd <= 0:
+            return f"{name}: type its cooldown in the Moves list ({'Dark ' if dark else ''}Charged Blow section)"
+        self.m2_ready[ck] = now + cd
+        self.m2_total[ck] = cd
+        return f"{name}: {CHARGE_LABEL[kind]} on cooldown {cd:g}s"
+
+    def _move_click(self, key, now, S):
+        mv = self.move_for(key)
+        if not mv:
+            return None                      # this key only has a snap spell: a left click does nothing
+        if is_charged_blow(mv.get("name")) or is_dark_charged_blow(mv.get("name")):
+            return self._blow_click(key, mv, now, S)
+        if is_dive_move(mv.get("name")):
+            return self._dive_click(key, mv, now, S)
+        if mv.get("awk"):
+            return self._awk_click(key, now, S)
+        if mv.get("bmove"):
+            return self._bm_click(key, mv["bmove"], now, S)
+        if is_shard_name(mv.get("name")) and not mv.get("spell"):
+            return self._shard_click(key, now, S)
+        if is_song_name(mv.get("name")) and not mv.get("spell"):
+            self.song_pend = (key, now)                      # the Error Meter shows up on the screen next (see song_meter)
+            return None
+        kind = charge_kind(mv.get("name"))
+        ign = is_azure_ignition(mv.get("name"))
+        akind = azure_kind(mv.get("name"))
+        cd = float(mv.get("cd") or 0.0)
+        acd = self._azure_cd(akind) if (akind and self._azure_active(now)) else 0.0
+        variant = acd > 0                    # Azure Ignition is on: this move is its Azure variant (typed cooldown, blue box)
+        if cd <= 0 and not variant and kind is None and not ign:
+            return None                      # a weapon: its left click has no cooldown (and keeps it armed)
+        shared = self._shared(mv)
+        if kind or ign:                      # a Charge / Azure Ignition only waits for its OWN activation cooldown
+            busy = self.ready_at.get(key, 0.0)
+        elif akind:                          # Brandish / Puncture share ONE cooldown with their Azure variant
+            busy = max(self.ready_at.get(key, 0.0), self.m2_ready.get(key, 0.0))
+        else:
+            busy = max(self.ready_at.get(key, 0.0), self.m2_ready.get(key, 0.0)) if shared else self.ready_at.get(key, 0.0)
+        if busy - now > S["grace"]:
+            return None                      # still cooling down (shared: M2 counts too): the game ignores that click
+        if variant:                          # the Azure variant: blue box, the normal move's red timer is replaced
+            self.m2_ready[key] = now + acd
+            self.m2_total[key] = acd
+            self.ready_at.pop(key, None)
+            self.total.pop(key, None)
+            self._unequip_after(key)
+            return f"{AZURE_LABEL[akind]} ({key}): cooldown {acd:g}s started (shared with {mv['name']})"
+        if cd > 0:
+            self.ready_at[key] = now + cd
+            self.total[key] = cd
+        if kind:
+            self.last_charge = kind          # remembered; Charged Blow does not remove it
+            self.charge_at = now             # ...for CHARGE_LIFETIME seconds
+        if ign:
+            self.azure_on, self.azure_at = True, now
+        if shared or akind:                  # ONE shared timer: it shows red because M1 started it
+            self.m2_ready.pop(key, None)
+            self.m2_total.pop(key, None)
+        self._unequip_after(key)
+        if (kind or ign) and cd <= 0:
+            return f"{mv['name'] or key} ({key}): {'ignition' if ign else 'charge'} ready"
+        return f"{mv['name'] or key} ({key}): cooldown {cd:g}s started" + (" (M2 shares it)" if shared else "")
+
+    @staticmethod
+    def _shared(mv):
+        """M1 and M2 share one cooldown (the default) - only meaningful when the move has BOTH cooldowns
+        (a weapon has no M1 cooldown, so there is nothing to share)."""
+        return float(mv.get("cd") or 0.0) > 0 and float(mv.get("cd2") or 0.0) > 0 and not mv.get("split")
+
+    def song_keys(self):
+        """The Tracker keys of every Song in the profile (hotbar Moves and Inventory)."""
+        keys = [m["key"] for m in self.cfg["profiles"][self.cfg["active"]] if is_song_name(m.get("name")) and not m.get("spell")]
+        keys += [inv_vkey(e["name"]) for e in inv_of(self.cfg) if is_song_name(e["name"]) and not e.get("potion")]
+        return keys
+
+    def song_active(self):
+        with self.lock:
+            return bool(self.song)
+
+    def _song_hold(self):
+        """While the Error Meter is up all the Songs sit in a blue box with no number that doesn't drain (a cooldown that has no end yet)."""
+        for k in self.song_keys():
+            self.m2_ready[k] = float("inf")
+            self.m2_total[k] = 0.0
+            self.ready_at.pop(k, None)
+            self.total.pop(k, None)
+
+    def _song_release(self):
+        for k in list(self.m2_ready):
+            if self.m2_ready[k] == float("inf"):
+                self.m2_ready.pop(k, None)
+                self.m2_total.pop(k, None)
+
+    def song_meter(self, frac, now):
+        """One look at the Error Meter: frac = how much of it is left (0 - 1), None = it isn't on the screen. While it is there all the
+        Songs show a blue box without a number. It running empty = Song Fail, it going away before that = Song Switch: the other Songs
+        go on a cooldown (song_fail_cd / song_switch_cd). Returns a message or None."""
+        S = self.cfg["settings"]
+        with self.lock:
+            st = self.song
+            if frac is not None:
+                if st is None:
+                    keys = self.song_keys()
+                    if not keys:
+                        return None
+                    pk = self.song_pend
+                    key = pk[0] if (pk and now - pk[1] < 4.0 and pk[0] in keys) else None
+                    if key is None and self.armed and self.armed[0] in keys:
+                        key = self.armed[0]
+                    self.song = st = {"key": key or (pk[0] if pk and pk[0] in keys else keys[0]), "t0": now, "last": frac, "seen": now,
+                                      "low": 0, "done": False}
+                    self._song_hold()
+                st["last"], st["seen"] = frac, now
+                if not st["done"]:
+                    st["low"] = st["low"] + 1 if frac <= SONG_FAIL_FRAC else 0
+                    if st["low"] >= 2:
+                        st["done"] = True
+                        return self._song_end(st, now, "fail", S)
+                return None
+            if st is None:
+                return None
+            if now - st["seen"] < 0.3:
+                return None                                   # (a look or two without it doesn't end the song)
+            self.song = None
+            if st["done"]:
+                return None
+            return self._song_end(st, st["seen"], "fail" if st["last"] <= SONG_FAIL_FRAC else "switch", S, ended=True)
+
+    def _song_end(self, st, now, how, S, ended=False):
+        cd = cd_value(S, "song_fail_cd" if how == "fail" else "song_switch_cd")
+        keys = self.song_keys()                                  # ALL the songs (the one that was playing too)
+        self._song_release()
+        if cd > 0:
+            for k in keys:
+                self.m2_ready[k] = now + cd
+                self.m2_total[k] = cd
+                self.ready_at.pop(k, None)
+                self.total.pop(k, None)
+        mv = self.move_for(st["key"]) or {}
+        label = "Song Fail" if how == "fail" else "Song Switch"
+        return f"{label} ({mv.get('name') or st['key']}): all songs are on cooldown {cd:g}s"
+
+    def shard_keys(self):
+        """The Tracker keys of every shard in the profile (hotbar Moves and Inventory)."""
+        keys = [m["key"] for m in self.cfg["profiles"][self.cfg["active"]] if is_shard_name(m.get("name")) and not m.get("spell")]
+        keys += [inv_vkey(e["name"]) for e in inv_of(self.cfg) if is_shard_name(e["name"]) and not e.get("potion")]
+        return keys
+
+    def _shard_click(self, key, now, S):
+        """Using a Sapphire / Opal / Ruby Shard (like a snap): ALL the shards go on the same cooldown (a blue box)."""
+        cd = cd_value(S, "shard_cd")
+        if cd <= 0:
+            return None
+        keys = self.shard_keys() or [key]
+        if max((self.m2_ready.get(k, 0.0) for k in keys), default=0.0) - now > S["grace"]:
+            return None                                      # the shared shard cooldown is still running
+        for k in set(keys) | {key}:
+            self.m2_ready[k] = now + cd
+            self.m2_total[k] = cd
+            self.ready_at.pop(k, None)
+            self.total.pop(k, None)
+        self._unequip_after(key)
+        mv = self.move_for(key)
+        return f"{(mv or {}).get('name') or key} ({key}): all shards on cooldown {cd:g}s"
+
+    def _m2_click(self, key, now, S):
+        mv = self.move_for(key)
+        if mv and is_shard_name(mv.get("name")) and not mv.get("spell"):
+            return self._shard_click(key, now, S)
+        cd = float(mv.get("cd2") or 0.0) if mv and not mv.get("spell") else 0.0
+        if cd <= 0:
+            return None                      # M2 left blank: a right click does nothing for this move
+        shared = self._shared(mv)
+        busy = max(self.m2_ready.get(key, 0.0), self.ready_at.get(key, 0.0)) if shared else self.m2_ready.get(key, 0.0)
+        if busy - now > S["grace"]:
+            return None                      # its M2 cooldown (shared: M1's too) is still running
+        self.m2_ready[key] = now + cd
+        self.m2_total[key] = cd
+        if shared:                           # ONE shared timer: it shows blue because M2 started it
+            self.ready_at.pop(key, None)
+            self.total.pop(key, None)
+        self._unequip_after(key)
+        return f"{mv['name'] or key} ({key}) M2: cooldown {cd:g}s started" + (" (M1 shares it)" if shared else "")
+
+    def _snap_click(self, key, now, S):
+        sp = self.snap_for(key)
+        if not sp:
+            return None                      # this key has no snap spell: a right click does nothing
+        cd = float(sp["cd"])
+        if cd <= 0:
+            return None
+        keys = [m["key"] for m in self.snap_list()]
+        if max((self.snap_ready.get(k, 0.0) for k in keys), default=0.0) - now > S["grace"]:
+            return None                      # the shared snap cooldown is still running
+        if self.is_running_spell(sp):        # Gelidus: no cooldown yet - it runs until the next left click
+            if self.running == key:
+                return None                  # already running
+            self.running = key
+            self._unequip_after(key, snap=True)
+            return f"Snap {sp['name'] or key} ({key}) RUNNING - left click to stop it and start the {cd:g}s cooldown"
+        self._apply_snap_cd(cd, now)
+        self._unequip_after(key, snap=True)
+        return f"Snap {sp['name'] or key} ({key}): all snap spells on cooldown {cd:g}s"
+
+    @staticmethod
+    def is_running_spell(sp):
+        name = str(sp.get("name", "")).lower()
+        return any(w and w in name for w in RUNNING_SNAPS)
+
+    def _apply_snap_cd(self, cd, now):
+        """EVERY snap spell of the profile gets the cooldown of the one that was used."""
+        for m in self.snap_list():
+            self.snap_ready[m["key"]] = now + cd
+            self.snap_total[m["key"]] = cd
+
+    def _stop_running(self, now):
+        key, self.running = self.running, None
+        sp = self.snap_for(key)
+        cd = float(sp["cd"]) if sp else 0.0
+        if not sp or cd <= 0:
+            return None
+        self._apply_snap_cd(cd, now)
+        return f"Snap {sp['name'] or key} stopped: all snap spells on cooldown {cd:g}s"
+
+    def snapshot(self, now):
+        """{key: (seconds left, total)} for every normal move that is cooling down in this profile."""
+        out = {}
+        with self.lock:
+            self._dive_tick(now)
+            for key, t_end in self.ready_at.items():
+                left = t_end - now
+                if left > 0 and not key.startswith("inv:") and self.move_for(key):
+                    tot = self.total.get(key, left)
+                    out[key] = (min(left, tot), tot)             # (a cooldown that starts in a moment shows full)
+        return out
+
+    def inv_snapshot(self, now):
+        """{inventory move name (normalised): (seconds left, total, "m1"/"m2")} for the cooldowns of the Inventory moves (shown on their cards)."""
+        out = {}
+        with self.lock:
+            for d, kind in ((self.ready_at, "m1"), (self.m2_ready, "m2")):
+                for key, t_end in d.items():
+                    if key.startswith("inv:") and t_end - now > 0 and self.move_for(key):
+                        tot = (self.total if kind == "m1" else self.m2_total).get(key, t_end - now)
+                        cur = out.get(key[4:])
+                        if t_end == float("inf"):                         # a Song while the Error Meter is up: full blue box, no number
+                            out[key[4:]] = (1.0, 0.0, kind)
+                        elif cur is None or t_end - now > cur[0]:
+                            out[key[4:]] = (min(t_end - now, tot), tot, kind)
+            self._live_item(now)
+            potions = [_norm_name(e["name"]) for e in inv_of(self.cfg) if e.get("potion")]
+            if self.drink:                                                       # drinking: a blue box on that potion's card
+                out[_norm_name(self.drink[0])] = (max(0.0, self.drink[1] - now), self.DRINK_TIME, "drink")
+            elif self.potion_until > now and self.potion_len > 0:               # then ALL the potions: a red cooldown box
+                for n in potions:
+                    out[n] = (self.potion_until - now, self.potion_len, "m1")
+            st = self.soul
+            if st and st[0].startswith("inv:") and st[1] <= now < st[3] and self.move_for(st[0]):
+                out[st[0][4:]] = (st[2] - now if now < st[2] else st[3] - now, st[4] if now < st[2] else st[5], "soul")
+            a = self.awk
+            if a and a["key"].startswith("inv:") and a["t0"] <= now < a["t2"] and self.move_for(a["key"]):
+                out[a["key"][4:]] = ((a["t1"] - now, a["dur"], "soul") if now < a["t1"] else (a["t2"] - now, a["cd"], "m2"))
+            for v in self.bm.values():
+                if v.get("toggle") and v["key"].startswith("inv:") and self.move_for(v["key"]):
+                    out[v["key"][4:]] = (1.0, 0.0, "m2")
+                elif v["key"].startswith("inv:") and v["t0"] <= now < v["t2"] and self.move_for(v["key"]):
+                    tc = v.get("tc", v["t1"])
+                    if now < v["t1"]:
+                        out[v["key"][4:]] = (v["t1"] - now, v["dur"], "soul")
+                    elif now < tc:                                    # the debuff after the buff (Flood Finite / Red Veil)
+                        out[v["key"][4:]] = (tc - now, v.get("deb") or 1.0, "soul")
+                    else:
+                        out[v["key"][4:]] = (v["t2"] - now, v["cd"], "m2")
+        return out
+
+    def m2_snapshot(self, now):
+        """Same for the M2 (right-click) cooldowns of the normal moves in this profile."""
+        out = {}
+        with self.lock:
+            for key, t_end in self.m2_ready.items():
+                left = t_end - now
+                if left > 0 and not key.startswith("inv:") and self.move_for(key):
+                    tot = self.m2_total.get(key, left)
+                    out[key] = (1.0, 0.0) if t_end == float("inf") else (min(left, tot), tot)
+            st = self.soul
+            if st and st[2] <= now < st[3] and not st[0].startswith("inv:") and self.move_for(st[0]) and st[5] > 0:      # Soul Rip's cooldown after the buff (blue)
+                out[st[0]] = (st[3] - now, st[5])
+            a = self.awk
+            if a and a["t1"] <= now < a["t2"] and not a["key"].startswith("inv:") and self.move_for(a["key"]) and a["cd"] > 0:   # Awakened's cooldown (blue)
+                out[a["key"]] = (a["t2"] - now, a["cd"])
+            for v in self.bm.values():
+                if v.get("toggle") and not v["key"].startswith("inv:") and self.move_for(v["key"]):
+                    out[v["key"]] = (1.0, 0.0)                    # Silverguard / Dragon Blood: a full blue box, no number, while it is on
+            for v in self.bm.values():                                                                                      # the buff moves' cooldown (blue)
+                if not v.get("toggle") and v.get("tc", v["t1"]) <= now < v["t2"] and not v["key"].startswith("inv:") and self.move_for(v["key"]) and v["cd"] > 0:
+                    out[v["key"]] = (v["t2"] - now, v["cd"])
+        return out
+
+    def snap_snapshot(self, now):
+        """Same for the snap spells of this profile."""
+        out = {}
+        with self.lock:
+            for key, t_end in self.snap_ready.items():
+                left = t_end - now
+                if left > 0 and self.snap_for(key):
+                    out[key] = (left, self.snap_total.get(key, left))
+        return out
+
+    def running_text(self, now=None):
+        with self.lock:
+            self._dive_tick(time.time() if now is None else now)
+            if self.dive and self.move_for(self.dive[0]):
+                nm = self.move_for(self.dive[0])["name"] or "Rift Dive"
+                return f"{nm} ({self.dive[0]}) - {'in the air' if is_blade_crash(nm) else 'underground'}"
+            key = self.running
+        sp = self.snap_for(key) if key else None
+        return f"{(sp['name'] if sp else '') or key} ({key})" if key and sp else None
+
+    def armed_text(self, now=None):
+        with self.lock:
+            nw = time.time() if now is None else now
+            a = self._live_armed(nw)
+            it = self._live_item(nw) if not a else None
+        if it:
+            dr = self.drinking(nw)
+            return (f"Drinking {it[0]} ({dr[1]:.0f}s)" if dr else f"{it[0]} (potion)")
+        if not a:
+            return None
+        mv = self.move_for(a[0]) or self.snap_for(a[0])
+        if mv and mv.get("inv"):
+            return f"{mv['name']} (inventory)" + (" [weapon]" if self.is_weapon(mv) else "")
+        return f"{(mv['name'] if mv else '') or a[0]} ({a[0]})" + (" [weapon]" if self.is_weapon(self.move_for(a[0])) else "")
+
+
+def box_text(left, total, tenths_under):
+    """The number in a cooldown box ('' for the ones that last forever: total 0)."""
+    return fmt_time(left, tenths_under) if total > 0 else ""
+
+
+def fmt_time(left, tenths_under):
+    if tenths_under > 0 and left < tenths_under:
+        return f"{max(left, 0.0):.1f}"
+    return str(int(math.ceil(left)))
+
+
+# ----------------------------------------------------------------------------
+# Finding the hotbar on the screen (pure numpy)
+# ----------------------------------------------------------------------------
+def _runs(flags, min_len=1):
+    out, s = [], None
+    for i, f in enumerate(list(flags) + [False]):
+        if f and s is None:
+            s = i
+        elif not f and s is not None:
+            if i - s >= min_len:
+                out.append((s, i - 1))
+            s = None
+    return out
+
+
+def detect_hotbar(rgb, n=12):
+    """Find the n evenly spaced parchment squares (the slot interiors) in the lower part of a screenshot.
+    Returns {x, y, w, h, pitch} of slot 1's interior, or None."""
+    H = rgb.shape[0]
+    y_lo = int(H * 0.55)
+    a = rgb[y_lo:].astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    d = r - b
+    mask = (r >= 185) & (g >= 170) & (b >= 150) & (d >= 4) & (d <= 52)     # light, slightly warm grey
+    rows = mask.sum(axis=1)
+    if rows.size == 0 or rows.max() < n * 20:
+        return None
+    for y0, y1 in sorted(_runs(rows >= 0.5 * rows.max(), 15), key=lambda t: t[0] - t[1]):   # tallest band first
+        h = y1 - y0 + 1
+        runs = _runs(mask[y0:y1 + 1].sum(axis=0) >= 0.5 * h, 20)
+        for i in range(len(runs) - n + 1):
+            seq = runs[i:i + n]
+            ws = np.array([e - s + 1 for s, e in seq])
+            st = np.array([s for s, _ in seq])
+            gaps = np.diff(st)
+            if ws.max() - ws.min() <= 3 and gaps.max() - gaps.min() <= 3 and gaps.min() > ws.max():
+                return {"x": int(st[0]), "y": int(y_lo + y0), "w": int(round(np.median(ws))), "h": int(h),
+                        "pitch": float(st[-1] - st[0]) / (n - 1)}
+    return None
+
+
+def bar_from_clicks(p1, p2, n=12):
+    """Two clicks (centre of slot 1, centre of the last slot) -> bar dict, or None if they make no sense."""
+    pitch = (p2[0] - p1[0]) / (n - 1)
+    if pitch < 20:
+        return None
+    w, h = int(round(pitch * 0.75)), int(round(pitch * 0.735))      # same proportions as the real slots
+    cy = (p1[1] + p2[1]) / 2.0
+    return {"x": int(round(p1[0] - w / 2.0)), "y": int(round(cy - h / 2.0)), "w": w, "h": h, "pitch": float(pitch)}
+
+
+DEFAULT_GLYPHS = {
+    '1': '.##../###../.##../.##../.##../.##../.##../#####',
+    '2': '.####./.#.##./....##/...##./...##./..##../.###../######',
+    '3': '####./#.##./...##/..##./.###./...##/#..##/####.',
+    '4': '...##./..###./.####./.####./##.##./######/...##./...##.',
+    '5': '#####/##.../##.../####./...##/...##/#..##/####.',
+    '6': '..####/.##.../.#..../#####./###.##/##..##/.##.##/..###.',
+    '7': '######/....##/...##./...##./..##../..##../..##../..##..',
+    '8': '.####./.##.##/.##.##/.####./.####./##..##/.#..##/.####.',
+    '9': '.####./.#..#./##..##/##..##/.#####/....##/...##./.###..',
+    '0': '..###./.##.#./##..##/##..##/##..##/.#..##/.##.#./..###.',
+    '-': '####',
+    '=': '######/....../######',
+}
+TAB_FILL = (255, 221, 162)           # the cream number tab above every slot
+
+
+def _glyph(sub):
+    """Dark pixels of a tab's interior as a trimmed text bitmap ('#' = ink), or None."""
+    ink = (sub.astype(np.int16).sum(axis=2) // 3) < 150
+    ys, xs = np.where(ink)
+    if not len(ys):
+        return None
+    return "/".join("".join("#" if ink[y, x] else "." for x in range(xs.min(), xs.max() + 1))
+                    for y in range(ys.min(), ys.max() + 1))
+
+
+def scan_tabs(strip, scale=1.0):
+    """strip = RGB pixels just above the slots (any width). Finds the cream number tabs.
+    Returns [(centre_x, glyph)] sorted left to right. The tabs sit above the slots, so the red cooldown
+    boxes never cover them, and a slot's tab is exactly centred on the slot."""
+    a = strip.astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    # the tab's cream colour shifts with the game's lighting / screenshot tint, so accept a band of warm creams
+    fill = (np.abs(a - np.array(TAB_FILL)).sum(axis=2) <= 24) | (
+        (r >= 215) & (g >= 195) & (b >= 140) & (b <= 215) & (r - g >= 10) & (r - g <= 45) & (g - b >= 15) & (g - b <= 70))
+    out = []
+    for x0, x1 in _runs(fill.sum(axis=0) >= 2, max(8, int(10 * scale))):
+        w = x1 - x0 + 1
+        if w > 26 * scale:
+            continue
+        ys = np.where(fill[:, x0:x1 + 1].sum(axis=1) >= max(3, w // 4))[0]
+        if len(ys) < 8 * scale or ys[-1] - ys[0] + 1 > 18 * scale:
+            continue
+        out.append(((x0 + x1) / 2.0, _glyph(strip[ys[0]:ys[-1] + 1, x0:x1 + 1])))
+    return out
+
+
+def _gdist(a, b):
+    if a is None or b is None:
+        return 99
+    ra, rb = a.split("/"), b.split("/")
+    if len(ra) != len(rb) or len(ra[0]) != len(rb[0]):
+        return 99
+    return sum(x != y for r1, r2 in zip(ra, rb) for x, y in zip(r1, r2))
+
+
+def _gfuzzy(a, b, R=8, C=6):
+    """Distance between two glyph bitmaps of any size (both squeezed onto an R x C grid); 99 if unreadable."""
+    if a is None or b is None:
+        return 99
+    def grid(g):
+        rows = g.split("/"); h, w = len(rows), len(rows[0])
+        return [[rows[min(h - 1, i * h // R)][min(w - 1, j * w // C)] == "#" for j in range(C)] for i in range(R)]
+    ga, gb = grid(a), grid(b)
+    return sum(x != y for r1, r2 in zip(ga, gb) for x, y in zip(r1, r2))
+
+
+def _identify_fuzzy(tabs, templates, limit=12):
+    """Tabs whose digits are blurred / tinted by the game's lighting: give the tabs increasing hotbar keys
+    (slots never swap places) with the smallest total glyph distance. None if any tab fits badly."""
+    n, m = len(tabs), len(HOTBAR_KEYS)
+    if not n or n > m:
+        return None
+    cost = [[_gfuzzy(g, templates.get(k)) for k in HOTBAR_KEYS] for _, g in tabs]
+    INF = 10 ** 6
+    dp = [[INF] * (m + 1) for _ in range(n + 1)]       # dp[i][j]: first i tabs use keys < j
+    for j in range(m + 1):
+        dp[0][j] = 0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            dp[i][j] = min(dp[i][j - 1], dp[i - 1][j - 1] + cost[i - 1][j - 1])
+    if dp[n][m] >= INF:
+        return None
+    out, j = [None] * n, m
+    for i in range(n, 0, -1):
+        while dp[i][j] == dp[i][j - 1]:
+            j -= 1
+        out[i - 1] = j - 1
+        j -= 1
+    if any(cost[i][out[i]] > limit for i in range(n)):
+        return None
+    return [HOTBAR_KEYS[k] for k in out]
+
+
+def identify_tabs(tabs, templates):
+    """tabs from scan_tabs -> (keys, unknown): keys[i] = hotbar key of tab i or None. Tabs that can't be
+    read are filled in from their neighbours when the order leaves no doubt (slots never swap places)."""
+    keys, unknown = _identify_exact(tabs, templates)
+    if unknown:
+        fz = _identify_fuzzy(tabs, templates)
+        if fz:
+            return fz, 0
+    return keys, unknown
+
+
+def _identify_exact(tabs, templates):
+    keys = []
+    for _, g in tabs:
+        sc = sorted((_gdist(g, tg), k) for k, tg in templates.items())
+        keys.append(sc[0][1] if sc and sc[0][0] <= 2 and (len(sc) < 2 or sc[1][0] > sc[0][0]) else None)
+    idx = [HOTBAR_KEYS.index(k) if k else None for k in keys]
+    known = [i for i in idx if i is not None]
+    if known != sorted(set(known)):
+        return [None] * len(tabs), len(tabs)               # inconsistent order: trust nothing
+    n = len(tabs)
+    i = 0
+    while i < n:
+        if idx[i] is not None:
+            i += 1
+            continue
+        j = i
+        while j < n and idx[j] is None:
+            j += 1
+        lo = idx[i - 1] + 1 if i else 0
+        hi = idx[j] if j < n else len(HOTBAR_KEYS)
+        if hi - lo == j - i:                               # exactly as many free keys as unread tabs
+            for t in range(i, j):
+                idx[t] = lo + t - i
+        i = j
+    keys = [HOTBAR_KEYS[i] if i is not None else None for i in idx]
+    return keys, sum(k is None for k in keys)
+
+
+# ----------------------------------------------------------------------------
+# Mana overlay: finding the in-game mana bar, fitting the picture to it, % <-> screen position
+# ----------------------------------------------------------------------------
+RAIL = (230, 171, 113)               # the orange side rails of the in-game mana bar frame (and of the picture)
+
+
+def find_rails(mask, min_len):
+    """Two long vertical orange rails side by side -> ((xa, xb, ya, yb), (xa, xb, ya, yb)) or None.
+    Each rail is a group of neighbouring columns (the frame's rail is 2 px wide)."""
+    cols = []
+    for x in range(mask.shape[1]):
+        c = mask[:, x]
+        if c.sum() < min_len:
+            continue
+        runs = _runs(c, min_len)
+        if runs:
+            ya, yb = max(runs, key=lambda r: r[1] - r[0])
+            cols.append((x, ya, yb))
+    rails = []
+    for x, ya, yb in cols:
+        if rails and x == rails[-1][1] + 1 and abs(ya - rails[-1][2]) <= 2 and abs(yb - rails[-1][3]) <= 2:
+            rails[-1] = (rails[-1][0], x, min(ya, rails[-1][2]), max(yb, rails[-1][3]))
+        else:
+            rails.append((x, x, ya, yb))
+    best = None
+    for i, a in enumerate(rails):
+        for b in rails[i + 1:]:
+            if 10 <= b[0] - a[0] <= 300 and abs(a[2] - b[2]) <= 3 and abs(a[3] - b[3]) <= 3:
+                if best is None or a[3] - a[2] > best[0]:
+                    best = (a[3] - a[2], a, b)
+    return (best[1], best[2]) if best else None
+
+
+def find_mana_bar(rgb):
+    """Screenshot -> the two rails of the mana bar frame (left part of the screen), or None."""
+    H, W = rgb.shape[:2]
+    a = rgb[:, : int(W * 0.4)].astype(np.int16)
+    return find_rails(np.abs(a - np.array(RAIL)).sum(axis=2) <= 24, max(60, int(H * 0.12)))
+
+
+def image_rails(img):
+    a = np.array(img.convert("RGBA")).astype(np.int16)
+    mask = (a[..., 3] > 128) & (np.abs(a[..., :3] - np.array(RAIL)).sum(axis=2) <= 24)
+    return find_rails(mask, max(20, img.height // 4))
+
+
+def mana_inner(img):
+    """x range (fractions of the picture's width) of the inside of the bar: where the cast-mark boxes go."""
+    r = image_rails(img)
+    if r:
+        return (r[0][1] + 2) / float(img.width), (r[1][0] - 1) / float(img.width)
+    return 0.1, 0.75
+
+
+def fit_mana(game, img):
+    """Place the whole picture so its frame sits exactly on the game's frame. game / picture rails as from
+    find_rails. A picture without a frame of its own is stretched over the game frame instead."""
+    (gl, gr), ir = game, image_rails(img)
+    if ir:
+        il, irr = ir
+        sx = (gr[0] - gl[0]) / float(irr[0] - il[0])
+        sy = (gl[3] - gl[2] + 1) / float(il[3] - il[2] + 1)
+        return {"x": gl[0] - il[0] * sx, "y": gl[2] - il[2] * sy, "w": img.width * sx, "h": img.height * sy}
+    return {"x": gl[0] - 4.0, "y": gl[2] - 4.0, "w": gr[1] - gl[0] + 9.0, "h": gl[3] - gl[2] + 9.0}
+
+
+def pct_to_y(m, pct):
+    z0, z1 = m["zone"]
+    return m["y"] + m["h"] * (z0 + (z1 - z0) * (1.0 - pct / 100.0))
+
+
+def y_to_pct(m, y):
+    z0, z1 = m["zone"]
+    return 100.0 * (1.0 - ((y - m["y"]) / float(m["h"]) - z0) / (z1 - z0))
+
+
+def mana_boxes(m, inner, marks):
+    """Cast marks -> [(x0, y0, x1, y1, colour)] in SCREEN pixels."""
+    x0, x1 = m["x"] + m["w"] * inner[0], m["x"] + m["w"] * inner[1]
+    return [(x0, pct_to_y(m, mk["hi"]), x1, pct_to_y(m, mk["lo"]), mk["color"]) for mk in marks]
+
+
+def compose_mana(img, w, h, zone, inner, marks, bg=(66, 52, 62), alpha=0.6):
+    """The picture with the cast marks under it, over a dark mana-bar colour, as an RGB image (for previews)."""
+    base = Image.new("RGBA", (w, h), bg + (255,))
+    lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(lay)
+    for x0, y0, x1, y1, col in mana_boxes({"x": 0, "y": 0, "w": w, "h": h, "zone": zone}, inner, marks):
+        d.rectangle([int(round(x0)), int(round(y0)), int(round(x1)) - 1, int(round(y1)) - 1],
+                    fill=tuple(int(col[i:i + 2], 16) for i in (1, 3, 5)) + (int(255 * min(1.0, max(0.1, alpha))),))
+    base.alpha_composite(lay)
+    base.alpha_composite(img.resize((w, h), Image.BICUBIC))
+    return base.convert("RGB")
+
+
+def compose_decor(img, w, h, opacity, bg=(66, 52, 62)):
+    """A decoration at its opacity over a dark colour, as an RGB image (for the on-screen editor)."""
+    pic = img.resize((w, h), Image.BICUBIC)
+    a = np.array(pic)
+    a[..., 3] = (a[..., 3] * min(1.0, max(0.1, opacity))).astype(np.uint8)
+    base = Image.new("RGBA", (w, h), bg + (255,))
+    base.alpha_composite(Image.fromarray(a, "RGBA"))
+    return base.convert("RGB")
+
+
+def default_mana_image():
+    return Image.open(io.BytesIO(base64.b64decode("".join(MANA_PNG)))).convert("RGBA")
+
+
+def load_mana_image(path):
+    """The picture to draw: the built-in one, or the user's own PNG (None if it can't be read)."""
+    if not path:
+        return default_mana_image()
+    try:
+        img = Image.open(path)
+        if img.width * img.height > 25_000_000:
+            return None                                   # absurdly big: not a decoration
+        img = img.convert("RGBA")
+        if img.width > 1500 or img.height > 1500:
+            img.thumbnail((1500, 1500))
+        return img
+    except Exception:
+        return None
+
+
+MAX_ANIM_FRAMES = 150
+
+
+def load_decor(path):
+    """A decoration picture: (frames, durations in seconds). A normal picture has one frame; an animated PNG (APNG, also an
+    animated GIF / WebP) has all of its frames. None if it can't be read."""
+    try:
+        im = Image.open(path)
+        n = getattr(im, "n_frames", 1)
+        if n <= 1:
+            one = load_mana_image(path)
+            return None if one is None else ([one], [0.0])
+        if im.width * im.height > 4_000_000:
+            return None                                       # (an animation this big would eat the memory)
+        frames, durs = [], []
+        for i in range(min(n, MAX_ANIM_FRAMES)):
+            im.seek(i)
+            fr = im.convert("RGBA")
+            if fr.width > 600 or fr.height > 600:
+                fr.thumbnail((600, 600))
+            frames.append(fr.copy())
+            durs.append(max(0.02, float(im.info.get("duration", 100) or 100) / 1000.0))
+        return frames, durs
+    except Exception:
+        return None
+
+
+def frame_at(durs, t):
+    """Which frame of an animation is showing at time t (it loops)."""
+    total = sum(durs)
+    if len(durs) <= 1 or total <= 0:
+        return 0
+    pos = t % total
+    for i, d in enumerate(durs):
+        if pos < d:
+            return i
+        pos -= d
+    return len(durs) - 1
+
+
+def keyed_image(img, w, h, thr=110):
+    """Picture scaled to w x h as a plain RGB image: see-through pixels become the window's key colour
+    (#010101), so the game shows through them."""
+    w, h = max(1, int(round(w))), max(1, int(round(h)))
+    a = np.array(img.resize((w, h), Image.LANCZOS if w * h < img.width * img.height else Image.BICUBIC))
+    rgb = np.maximum(a[..., :3], 2)                                   # (never the key colour by accident)
+    rgb[a[..., 3] < thr] = (1, 1, 1)
+    return Image.fromarray(rgb.astype(np.uint8), "RGB")
+
+
+def slot_rects(bar, grow=0):
+    """12 slot rectangles (x, y, w, h) in screen pixels."""
+    g = int(grow)
+    return [(bar["x"] + i * bar["pitch"] - g, bar["y"] - g, bar["w"] + 2 * g, bar["h"] + 2 * g)
+            for i in range(len(HOTBAR_KEYS))]
+
+
+# ----------------------------------------------------------------------------
+# Windows helpers
+# ----------------------------------------------------------------------------
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+
+_FUNC = ctypes.WINFUNCTYPE if IS_WIN else ctypes.CFUNCTYPE
+HOOKPROC = _FUNC(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+if IS_WIN:
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    # explicit types: handles are 64-bit on 64-bit Python and ctypes would truncate them otherwise
+    u32.GetParent.argtypes, u32.GetParent.restype = [wintypes.HWND], wintypes.HWND
+    u32.GetWindowLongW.argtypes, u32.GetWindowLongW.restype = [wintypes.HWND, ctypes.c_int], ctypes.c_long
+    u32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+    u32.SetWindowLongW.restype = ctypes.c_long
+    u32.ShowWindow.argtypes, u32.ShowWindow.restype = [wintypes.HWND, ctypes.c_int], wintypes.BOOL
+    u32.IsWindowVisible.argtypes, u32.IsWindowVisible.restype = [wintypes.HWND], wintypes.BOOL
+    u32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wintypes.UINT]
+    u32.SetWindowPos.restype = wintypes.BOOL
+    u32.GetAsyncKeyState.argtypes, u32.GetAsyncKeyState.restype = [ctypes.c_int], ctypes.c_short
+    u32.GetCursorPos.argtypes, u32.GetCursorPos.restype = [ctypes.POINTER(wintypes.POINT)], wintypes.BOOL
+    u32.GetForegroundWindow.argtypes, u32.GetForegroundWindow.restype = [], wintypes.HWND
+    u32.GetWindowTextLengthW.argtypes, u32.GetWindowTextLengthW.restype = [wintypes.HWND], ctypes.c_int
+    u32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u32.GetWindowTextW.restype = ctypes.c_int
+    u32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+    u32.SetWindowsHookExW.restype = wintypes.HHOOK
+    u32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    u32.CallNextHookEx.restype = ctypes.c_ssize_t
+    u32.UnhookWindowsHookEx.argtypes, u32.UnhookWindowsHookEx.restype = [wintypes.HHOOK], wintypes.BOOL
+    u32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+    u32.GetMessageW.restype = ctypes.c_int
+    u32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    u32.PostThreadMessageW.restype = wintypes.BOOL
+    k32.GetModuleHandleW.argtypes, k32.GetModuleHandleW.restype = [wintypes.LPCWSTR], wintypes.HMODULE
+    k32.GetCurrentThreadId.argtypes, k32.GetCurrentThreadId.restype = [], wintypes.DWORD
+
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE = 0x20, 0x80, 0x80000, 0x08000000
+WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
+WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_QUIT = 0x100, 0x101, 0x104, 0x105, 0x12
+WM_LBUTTONDOWN, WM_RBUTTONDOWN = 0x201, 0x204
+WM_LBUTTONUP, WM_RBUTTONUP, WM_MOUSEWHEEL = 0x202, 0x205, 0x20A
+
+
+def hwnd_of(tkwin):
+    wid = tkwin.winfo_id()
+    return u32.GetParent(wid) or wid
+
+
+def flush_win(w, x=None, y=None, W=None, H=None):
+    """Make Windows apply a moved / redrawn overlay window RIGHT NOW (Tk would do it later, when it is idle, and a
+    layered always-on-top window could keep showing its old picture until the game lost / got focus again)."""
+    try:
+        w.update_idletasks()
+    except Exception:
+        pass
+    if not IS_WIN:
+        return
+    try:
+        h = hwnd_of(w)
+        if x is None:
+            x, y, W, H = w.winfo_x(), w.winfo_y(), w.winfo_width(), w.winfo_height()
+        # HWND_TOPMOST = -1; SWP_NOACTIVATE 0x10 | SWP_SHOWWINDOW 0x40
+        u32.SetWindowPos(h, wintypes.HWND(-1), int(x), int(y), int(W), int(H), 0x10 | 0x40)
+        u32.RedrawWindow.argtypes = [wintypes.HWND, ctypes.c_void_p, ctypes.c_void_p, wintypes.UINT]
+        u32.RedrawWindow(h, None, None, 0x1 | 0x4 | 0x100 | 0x80)     # INVALIDATE | ERASE | UPDATENOW | ALLCHILDREN
+    except Exception:
+        pass
+
+
+def ctrl_down():
+    """Is a Control key held right now?"""
+    if not IS_WIN:
+        return False
+    try:
+        return bool(u32.GetAsyncKeyState(0x11) & 0x8000)
+    except Exception:
+        return False
+
+
+def make_click_through(hwnd):
+    """Click-through + no taskbar button + never takes focus from the game."""
+    ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    u32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TRANSPARENT
+                       | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+
+
+def is_roblox_window(h):
+    """True for the Roblox game client itself (its window class / program), not for anything that only has 'Roblox' in
+    its title (a browser tab, a video, Discord ...)."""
+    try:
+        cls = ctypes.create_unicode_buffer(256)
+        u32.GetClassNameW(h, cls, 256)
+        if cls.value.upper() == "WINDOWSCLIENT":                # the Roblox player's window class
+            return True
+        pid = wintypes.DWORD(0)
+        u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        hp = k32.OpenProcess(0x1000, False, pid.value)         # PROCESS_QUERY_LIMITED_INFORMATION
+        if not hp:
+            return False
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = wintypes.DWORD(1024)
+            k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+            if k32.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(n)):
+                exe = buf.value.replace("/", "\\").split("\\")[-1].lower()
+                return exe.startswith("roblox")                 # RobloxPlayerBeta.exe ...
+        finally:
+            k32.CloseHandle(hp)
+    except Exception:
+        pass
+    return False
+
+
+def foreground_title(title_hint="roblox"):
+    """The active window's title. A window whose title only MENTIONS Roblox (a browser tab, a video) gives '' when it is
+    not the Roblox client itself."""
+    if not IS_WIN:
+        return ""
+    try:
+        h = u32.GetForegroundWindow()
+        n = u32.GetWindowTextLengthW(h)
+        buf = ctypes.create_unicode_buffer(n + 1)
+        u32.GetWindowTextW(h, buf, n + 1)
+        t = buf.value
+        if "roblox" in t.lower() and not is_roblox_window(h):
+            return ""
+        return t
+    except Exception:
+        return ""
+
+
+def foreground_center():
+    """Screen position of the middle of the active window's client area (None if it can't be told)."""
+    if not IS_WIN:
+        return None
+    try:
+        h = u32.GetForegroundWindow()
+        rc = wintypes.RECT()
+        u32.GetClientRect(h, ctypes.byref(rc))
+        pt = wintypes.POINT(rc.right // 2, rc.bottom // 2)
+        u32.ClientToScreen(h, ctypes.byref(pt))
+        return pt.x, pt.y
+    except Exception:
+        return None
+
+
+def game_client_left(title="Roblox"):
+    """Screen x where the game window's client area starts (None if it can't be told). The window found by its title."""
+    if not IS_WIN:
+        return None
+    try:
+        h = u32.FindWindowW(None, str(title).strip() or "Roblox")
+        if not h:
+            fg = u32.GetForegroundWindow()
+            if str(title).strip().lower() not in foreground_title().lower():
+                return None
+            h = fg
+        pt = wintypes.POINT(0, 0)
+        u32.ClientToScreen(h, ctypes.byref(pt))
+        return float(pt.x)
+    except Exception:
+        return None
+
+
+# ---- reading the rune count (Wraith Knight): the number to the right of the rune icon, bottom left of the game ----
+_rune_cache = {}
+GLYPH_W, GLYPH_H = 8, 12                 # every digit picture is shrunk to this size before it is compared
+
+
+def rune_glyph_mask(rgb):
+    """The white digits of the game's counter (white, not coloured, and bright)."""
+    a = np.asarray(rgb)[..., :3].astype(float)
+    lum = a.mean(axis=2)
+    return (lum > 200) & ((a.max(axis=2) - a.min(axis=2)) < 60)
+
+
+def rune_split(mask, min_h):
+    """[(x0, x1, y0, y1)] of the digit-sized white shapes in a mask, left to right."""
+    cols = mask.any(axis=0)
+    runs, start = [], None
+    for x, v in enumerate(list(cols) + [False]):
+        if v and start is None:
+            start = x
+        elif not v and start is not None:
+            runs.append((start, x))
+            start = None
+    out = []
+    for a, b in runs:
+        ys = np.nonzero(mask[:, a:b].any(axis=1))[0]
+        if len(ys) and ys.max() + 1 - ys.min() >= min_h and b - a >= 2:
+            out.append((a, b, int(ys.min()), int(ys.max()) + 1))
+    return out
+
+
+def rune_norm(m):
+    img = Image.fromarray(m.astype(np.uint8) * 255).resize((GLYPH_W, GLYPH_H), Image.BOX)
+    return np.asarray(img).astype(float) / 255.0
+
+
+def rune_templates():
+    """The ten digits as small pictures (drawn with a bold system font: the shapes are all that is compared)."""
+    if "rune_tp" not in _rune_cache:
+        f = None
+        for n in ("arialbd.ttf", "segoeuib.ttf", "DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf"):
+            try:
+                f = ImageFont.truetype(n, 48)
+                break
+            except Exception:
+                pass
+        out = {}
+        for d in "0123456789":
+            im = Image.new("L", (90, 90), 0)
+            ImageDraw.Draw(im).text((10, 5), d, fill=255, font=f)
+            m = np.asarray(im) > 128
+            ys, xs = np.nonzero(m)
+            out[d] = rune_norm(m[ys.min():ys.max() + 1, xs.min():xs.max() + 1])
+        _rune_cache["rune_tp"] = out
+    return _rune_cache["rune_tp"]
+
+
+def _corr(a, b):
+    a, b = a - a.mean(), b - b.mean()
+    n = float(np.sqrt((a * a).sum() * (b * b).sum()))
+    return float((a * b).sum() / n) if n > 0 else 0.0
+
+
+def glyph_is_zero(g):
+    """A '0': ink all round, and an empty hole in the middle (an 8 has its waist, 6 / 9 / 4 / 2 / 7 miss a side)."""
+    h, w = g.shape
+    if h < 7 or w < 4:
+        return False
+    r0, r1 = int(h * 0.3), max(int(h * 0.7) + 1, int(h * 0.3) + 2)
+    c0, c1 = int(w * 0.35), max(int(w * 0.65) + 1, int(w * 0.35) + 1)
+    lw = max(1, int(w * 0.3))
+    band = g[r0:r1]
+    return bool(g[r0:r1, c0:c1].mean() < 0.1 and band[:, :lw].any(axis=1).all() and band[:, w - lw:].any(axis=1).all()
+                and g[:max(1, int(h * 0.2)), c0:c1].any() and g[h - max(1, int(h * 0.2)):, c0:c1].any())
+
+
+def read_rune_count(rgb, min_h=4):
+    """The number in a picture of the rune counter -> an int, or None when it can't be read for sure. A single '0' is
+    recognised by its shape (that is the one that matters: no rune = Soul Berserk does nothing)."""
+    mask = rune_glyph_mask(rgb)
+    boxes = rune_split(mask, min_h)
+    if not boxes or len(boxes) > 3:
+        return None
+    tp, digits = rune_templates(), []
+    for x0, x1, y0, y1 in boxes:
+        g = mask[y0:y1, x0:x1]
+        if glyph_is_zero(g):
+            digits.append("0")
+            continue
+        sc = sorted(((_corr(rune_norm(g), t), k) for k, t in tp.items() if k != "0"), reverse=True)
+        if sc[0][0] < 0.35 or sc[0][0] - sc[1][0] < 0.1:
+            return None
+        digits.append(sc[0][1])
+    return int("".join(digits))
+
+
+def cursor_pos():
+    pt = wintypes.POINT()
+    u32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+# ----------------------------------------------------------------------------
+# Snap Training (Extras tab): press the spell key (equip), click once, press the key again (unequip), wait 100 ms,
+# repeat - G is held until the mana ding is heard first, then again every few seconds. The input is sent with SendInput and tagged (TRAIN_TAG) so the
+# macro's own hooks ignore it.
+# ----------------------------------------------------------------------------
+TRAIN_TAG = 0x534E4150                       # dwExtraInfo on everything the trainer sends ("SNAP")
+TRAIN_STEP = 0.005                           # wait after the key press / after the click (5 ms)
+TRAIN_REST = 0.100                           # wait after un-equipping (100 ms)
+TRAIN_HOLD = 0.001                           # how long a key / the mouse button stays down
+TRAIN_MANA_WAIT = 0.5                        # training stops when the mana is empty; G is held this long after
+TRAIN_MONITOR_EVERY = 0.008                  # Perfect %: how often the mana bar is read (about 120 times a second)
+TRAIN_G_HOLD = 0.200                         # each G spam press is held down for 200 ms
+TRAIN_G_GAP = 0.020                          # while training, G is tapped every 20 ms
+TRAIN_G_MAX = 12.0                           # ...but never longer than this (safety: G is let go)
+TRAIN_MILESTONE = 10                         # "Trained N times" is announced every 10 casts
+SEND_VK = {name: vk for vk, name in VK_NAME.items() if name != "esc"}
+SEND_VK["g"] = 0x47
+SEND_VK["shift"] = 0xA0                        # (left Shift: the Shiftlock key)
+
+
+MANA_EMPTY_COLORS = ((82, 64, 73), (91, 72, 79), (65, 51, 58))    # the in-game mana bar when nothing fills it
+
+
+def mana_strip_empty(arr, need=0.5, tol=24):
+    """arr: a small strip of the screen (H x W x 3) across the mana bar at the 'empty' mark. True when most of it
+    still has the empty-bar colour (so the fill doesn't reach that mark). A thin tick line of the overlay picture
+    across the strip doesn't matter: only the majority counts."""
+    a = np.asarray(arr)[..., :3].astype(np.int16)
+    if a.size == 0:
+        return False
+    best = np.full(a.shape[:2], 10 ** 6)
+    for c in MANA_EMPTY_COLORS:
+        best = np.minimum(best, np.abs(a - np.array(c)).sum(axis=2))
+    return float((best <= tol).mean()) >= need
+
+
+class DingDetector:
+    """Recognises the mana 'ding': two high tones in a row (about 3.2 kHz, then about 4.8 kHz). Works on tone
+    contrast (how far a narrow band sticks out of the rest of the spectrum), so the volume doesn't matter.
+    feed() takes mono float samples; the audio source can be anything (real loopback or a test)."""
+    BLOCK = 512
+    LOW, HIGH = (3050.0, 3350.0), (4650.0, 5000.0)
+    CONTRAST = 15.0                              # a peak must stick out this many times above the median level
+    GAP = 0.35                                   # the high tone must follow the low one within this long (s)
+    REFRACTORY = 0.6                             # one ding = one hit (it has an echo)
+    FLOOR = 5e-3                                 # ignore digital silence (FFT magnitude)
+
+    def __init__(self, on_heard=None, clock=time.time):
+        self.on_heard, self.clock = on_heard, clock
+        self.buf = np.zeros(0)
+        self.last_heard = float('-inf')
+        self.count = 0
+        self.low_at = None
+        self._rate = None
+
+    def _prep(self, rate):
+        self._rate = rate
+        fr = np.fft.rfftfreq(self.BLOCK, 1.0 / rate)
+        self._win = np.hanning(self.BLOCK)
+        self._ref = (fr >= 500) & (fr <= 8000)
+        self._lo = (fr >= self.LOW[0]) & (fr <= self.LOW[1])
+        self._hi = (fr >= self.HIGH[0]) & (fr <= self.HIGH[1])
+
+    def feed(self, samples, rate):
+        if rate != self._rate:
+            self._prep(rate)
+            self.buf = np.zeros(0)
+        self.buf = np.concatenate([self.buf, np.asarray(samples, dtype=float)])
+        while len(self.buf) >= self.BLOCK:
+            self._block(self.buf[:self.BLOCK])
+            self.buf = self.buf[self.BLOCK // 2:]                   # 50 % overlap
+
+    def _block(self, seg):
+        mag = np.abs(np.fft.rfft(seg * self._win))
+        med = float(np.median(mag[self._ref])) + 1e-9
+        now = self.clock()
+        lo, hi = float(mag[self._lo].max()), float(mag[self._hi].max())
+        if lo > self.FLOOR and lo / med >= self.CONTRAST:
+            self.low_at = now
+        if hi > self.FLOOR and hi / med >= self.CONTRAST and self.low_at is not None \
+                and now - self.low_at <= self.GAP and now - self.last_heard >= self.REFRACTORY:
+            self.low_at = None
+            self.count += 1
+            self.last_heard = now
+            if self.on_heard:
+                self.on_heard(self.count)
+
+    def heard_since(self, t):
+        return self.last_heard >= t
+
+
+# spectrum shape (20 bands, 1.2-16 kHz) at the loudest moment of the recorded spell-cast sound
+CAST_TEMPLATE = [0.14, 0.062, 0.111, 0.062, 0.091, 0.108, 0.156, 0.211, 0.231, 0.412, 0.371, 0.361, 0.318, 0.259, 0.248, 0.175, 0.16, 0.178, 0.17, 0.185]
+
+
+class CastDetector:
+    """Recognises the spell-cast sound: a short, sudden, noisy burst (a few kHz up to ~14 kHz) that dies away
+    within ~100 ms. It looks for a loudness peak that jumps well above the sound just before it, and compares the
+    spectrum shape at the peak with the recorded cast sound (cosine match, volume doesn't matter)."""
+    BLOCK, HOP, BANDS = 1024, 256, 20
+    F_LO, F_HI = 1200.0, 16000.0
+    JUMP = 6.0                       # peak power must be this many times the power 5 frames earlier
+    FLOOR = 1e-4                     # ... and not digital silence
+    REFRACTORY = 0.05                # seconds between two casts (the trainer casts about 8 times a second)
+    LOOK = 3                         # a peak must be the loudest of +-3 frames
+    TEMPLATE = CAST_TEMPLATE
+
+    def __init__(self, on_heard=None, clock=time.time, match=0.99):
+        self.on_heard, self.clock, self.match = on_heard, clock, match
+        self.buf = np.zeros(0)
+        self.count = 0
+        self.last_heard = float("-inf")
+        self.last_score = 0.0
+        self.hist = []                    # recent (total power, band powers)
+        self._rate = None
+
+    def _prep(self, rate):
+        self._rate = rate
+        fr = np.fft.rfftfreq(self.BLOCK, 1.0 / rate)
+        edges = np.geomspace(self.F_LO, min(self.F_HI, rate / 2 - 100), self.BANDS + 1)
+        m = np.array([(fr >= a) & (fr < b) for a, b in zip(edges[:-1], edges[1:])], dtype=float)
+        for i in range(self.BANDS):
+            if not m[i].any():
+                m[i, int(np.argmin(np.abs(fr - (edges[i] + edges[i + 1]) / 2)))] = 1.0
+        self._bands, self._win = m, np.hanning(self.BLOCK)
+        self._tmpl = np.asarray(self.TEMPLATE, dtype=float)
+        self._tmpl = self._tmpl / np.linalg.norm(self._tmpl)
+
+    def feed(self, samples, rate):
+        if rate != self._rate:
+            self._prep(rate)
+            self.buf, self.hist = np.zeros(0), []
+        self.buf = np.concatenate([self.buf, np.asarray(samples, dtype=float)])
+        while len(self.buf) >= self.BLOCK:
+            p = self._bands @ (np.abs(np.fft.rfft(self.buf[:self.BLOCK] * self._win)) ** 2)
+            self.buf = self.buf[self.HOP:]
+            self.hist.append((float(p.sum()), p))
+            if len(self.hist) > 12:
+                del self.hist[0]
+            self._check()
+
+    def _check(self):
+        h, L = self.hist, self.LOOK
+        if len(h) < 12:
+            return
+        k = len(h) - 1 - L                                        # candidate peak (needs L newer frames)
+        tot = h[k][0]
+        if tot < self.FLOOR or tot != max(x[0] for x in h[k - L:k + L + 1]) or tot < self.JUMP * h[k - 5][0]:
+            return
+        v = np.sqrt(h[k][1] / (tot + 1e-30))
+        score = float(v @ self._tmpl / (np.linalg.norm(v) + 1e-30))
+        self.last_score = score
+        now = self.clock()
+        match = self.match() if callable(self.match) else self.match
+        if score >= match and now - self.last_heard >= self.REFRACTORY:
+            self.count += 1
+            self.last_heard = now
+            if self.on_heard:
+                self.on_heard(self.count)
+
+
+DBLOOD_TEMPLATE = [   # Dragon Blood's sound: 42 frames (2048 samples at 48 kHz, hop 1024) x 9 bands, dB above the quiet before it
+    [0,0,2,0,1,2,3,13,0],
+    [3,0,4,6,6,4,5,7,0],
+    [13,17,23,26,14,15,16,11,4],
+    [10,9,19,18,11,11,11,8,2],
+    [8,13,22,19,8,8,11,6,2],
+    [4,4,14,14,6,10,9,5,4],
+    [12,6,14,11,6,9,9,5,3],
+    [0,9,9,9,3,8,6,4,5],
+    [6,1,4,7,2,8,8,6,5],
+    [1,4,7,4,6,7,6,4,3],
+    [14,15,21,17,11,11,8,7,5],
+    [32,31,27,21,18,15,12,8,5],
+    [30,23,26,19,11,11,7,5,4],
+    [17,9,7,12,5,7,4,5,4],
+    [3,4,8,5,3,5,3,4,4],
+    [9,7,2,4,3,7,3,3,4],
+    [8,0,7,5,4,6,6,4,3],
+    [6,9,5,8,5,6,5,4,2],
+    [0,2,4,3,3,4,1,3,1],
+    [0,0,3,2,2,3,3,3,2],
+    [1,0,0,2,1,2,0,2,1],
+    [2,0,1,0,0,1,1,2,1],
+    [0,3,0,5,0,1,2,2,1],
+    [8,12,27,17,11,12,12,9,3],
+    [14,18,28,24,14,17,17,15,5],
+    [17,20,32,30,15,22,20,19,8],
+    [26,24,32,29,24,25,25,24,12],
+    [24,25,37,32,23,27,28,27,17],
+    [27,32,40,31,27,28,31,28,21],
+    [22,31,31,36,33,33,32,30,21],
+    [36,27,30,37,33,35,34,30,23],
+    [37,32,32,41,37,37,34,32,25],
+    [38,34,36,39,33,35,33,30,26],
+    [34,33,43,38,32,33,32,31,32],
+    [30,38,31,34,29,34,34,37,34],
+    [38,31,34,37,31,31,32,33,32],
+    [38,23,39,24,25,27,32,30,25],
+    [41,30,35,23,22,24,27,23,19],
+    [42,30,38,27,19,22,29,29,15],
+    [40,28,30,21,23,27,29,28,16],
+    [36,28,32,25,26,23,28,23,14],
+    [35,29,25,26,17,20,18,18,7]]
+
+
+class DragonBloodDetector:
+    """Recognises the sound Dragon Blood makes when it turns itself off at low health: two thumps and a boom, then
+    a whoosh (about 1 s). Compares 42 frames of 9 loudness bands (how far each rose above the sound just before it)
+    with the recorded sound - the volume of the game doesn't matter, steady noise / music don't match."""
+    EDGES = (20, 60, 120, 250, 500, 1000, 2000, 4000, 8000, 16000)
+    FRAMES, THUMPS, BEFORE = 42, 21, 190             # frames in the sound / of them the thumps / frames of 'before' used as the floor
+    MIN_RISE = 6.0                                   # dB the sound must rise above what was playing before it, on average
+    MATCH, MATCH_THUMPS = 0.80, 0.50
+    REFRACTORY = 3.0
+    TEMPLATE = DBLOOD_TEMPLATE
+
+    def __init__(self, on_heard=None, clock=time.time):
+        self.on_heard, self.clock = on_heard, clock
+        self.buf = np.zeros(0)
+        self.count = 0
+        self.last_heard = float("-inf")
+        self.last_score = 0.0
+        self.hist = []
+        self._rate = None
+        t = np.asarray(self.TEMPLATE, dtype=float)
+        self._t_all, self._t_thump = self._centre(t), self._centre(t[:self.THUMPS])
+
+    @staticmethod
+    def _centre(a):
+        a = a.ravel() - a.mean()
+        return a, float(np.linalg.norm(a))
+
+    def _prep(self, rate):
+        self._rate = rate
+        self._block = int(round(2048 * rate / 48000.0))        # (the same stretch of time at every sample rate)
+        self._hop = self._block // 2
+        fr = np.fft.rfftfreq(self._block, 1.0 / rate)
+        self._bands = np.array([(fr >= a) & (fr < b) for a, b in zip(self.EDGES[:-1], self.EDGES[1:])], dtype=float)
+        self._win = np.hanning(self._block)
+
+    def feed(self, samples, rate):
+        if rate != self._rate:
+            self._prep(rate)
+            self.buf, self.hist = np.zeros(0), []
+        self.buf = np.concatenate([self.buf, np.asarray(samples, dtype=float)])
+        while len(self.buf) >= self._block:
+            p = self._bands @ (np.abs(np.fft.rfft(self.buf[:self._block] * self._win)) ** 2)
+            self.buf = self.buf[self._hop:]
+            self.hist.append(10.0 * np.log10(p + 1e-12))
+            if len(self.hist) > self.BEFORE + self.FRAMES:
+                del self.hist[0]
+            self._check()
+
+    @staticmethod
+    def _pearson(win, ref):
+        a = win.ravel() - win.mean()
+        d = float(np.linalg.norm(a)) * ref[1]
+        return float(a @ ref[0] / d) if d > 1e-9 else 0.0
+
+    def _check(self):
+        n = self.FRAMES
+        if len(self.hist) < n + 60:
+            return
+        h = np.array(self.hist)
+        win, before = h[-n:], h[:-n]
+        e = np.maximum(0.0, win - np.median(before, axis=0))
+        if e.mean() < self.MIN_RISE:
+            return
+        score, thump = self._pearson(e, self._t_all), self._pearson(e[:self.THUMPS], self._t_thump)
+        self.last_score = score
+        now = self.clock()
+        if score >= self.MATCH and thump >= self.MATCH_THUMPS and now - self.last_heard >= self.REFRACTORY:
+            self.count += 1
+            self.last_heard = now
+            if self.on_heard:
+                self.on_heard(self.count)
+
+
+EXPLODE_TEMPLATE = [   # the Cauldron explosion's sound: 20 frames (2048 samples at 48 kHz, hop 1024) x 9 bands, loudness in dB
+    [-18.7, -18.1, -15.9, -24.5, -20.8, -32.3, -33.0, -33.6, -27.1],
+    [-18.2, -12.5, -19.4, -17.4, -20.2, -15.9, -28.3, -31.3, -26.7],
+    [1.6, 4.0, 3.6, -9.5, -21.1, -27.5, -31.3, -31.8, -26.9],
+    [-4.4, -7.4, -11.6, -11.9, -25.8, -25.9, -31.6, -33.7, -27.9],
+    [-16.9, -16.9, -25.4, -22.8, -20.4, -25.8, -32.6, -33.8, -26.3],
+    [-20.1, -23.9, -22.3, -20.5, -21.4, -25.6, -32.5, -32.4, -26.9],
+    [-12.1, -8.6, 1.4, -2.2, -0.9, -6.7, -9.9, -13.4, -23.5],
+    [-12.4, 8.8, 11.0, 6.7, 0.6, -0.9, -4.7, -5.2, -10.9],
+    [-7.3, 10.1, 8.2, 4.5, -0.5, -0.7, 1.8, 4.2, -3.8],
+    [-1.8, 10.1, 5.0, 2.1, -2.6, -1.5, 0.4, 2.2, 0.0],
+    [-2.5, 10.2, 6.9, -0.7, 0.1, -3.0, 2.6, 4.1, 0.4],
+    [-4.4, 6.4, 12.3, 1.2, -6.2, -3.5, 1.3, 5.8, 2.0],
+    [-7.8, 10.5, 5.8, 0.1, -3.2, -2.7, 1.5, 3.6, 4.8],
+    [4.5, 11.2, 7.8, -0.2, 4.8, -1.0, 2.4, 5.7, 2.3],
+    [2.8, 9.6, 12.1, 3.9, -0.4, 2.2, 6.5, 5.4, 1.9],
+    [16.0, 16.0, 15.9, 4.6, 0.6, 1.1, 3.1, 3.2, 1.0],
+    [27.8, 31.1, 27.0, 16.6, 9.0, -1.3, 2.2, 2.6, -1.4],
+    [14.7, 22.8, 19.8, 11.1, 2.1, 2.9, 2.4, 2.4, 0.3],
+    [21.1, 23.7, 11.0, 6.9, 3.3, 4.3, 3.9, 1.7, -2.2],
+    [19.6, 18.3, 11.8, 3.5, -2.1, -2.4, -1.1, -3.0, -6.0]
+]
+
+
+class ExplosionDetector:
+    """Recognises the Cauldron explosion (a small pop, then a broadband whoosh that turns into a deep boom, ~0.4 s).
+    Looks at the last 20 frames of 9 loudness bands and checks (1) the sound got clearly louder, (2) the way every band
+    rises and falls over time matches the recording (each band is compared on its own scale, so the game's volume and
+    the sounds already playing don't matter) and (3) the loud part is bass-heavy like the recording (white noise, a plain
+    boom or a sweep don't match)."""
+    EDGES = DragonBloodDetector.EDGES
+    FRAMES, TAIL = 20, 8
+    MIN_RISE = 8.0                      # dB the last 6 frames must be louder than the first 6, on average
+    MATCH_TIME, MATCH_SHAPE = 0.80, 0.75
+    REFRACTORY = 3.0
+
+    def __init__(self, on_heard=None, clock=time.time):
+        self.on_heard, self.clock = on_heard, clock
+        self.buf = np.zeros(0)
+        self.count = 0
+        self.last_heard = float("-inf")
+        self.last_score = 0.0
+        self.hist = []
+        self._rate = None
+        t = np.asarray(EXPLODE_TEMPLATE, dtype=float)
+        self._t_time = self._z(t)
+        self._t_shape = t[-self.TAIL:].mean(axis=0)
+
+    @staticmethod
+    def _z(w):
+        sd = np.maximum(w.std(axis=0), 3.0)
+        return ((w - w.mean(axis=0)) / sd).ravel()
+
+    def _prep(self, rate):
+        self._rate = rate
+        self._block = int(round(2048 * rate / 48000.0))
+        self._hop = self._block // 2
+        fr = np.fft.rfftfreq(self._block, 1.0 / rate)
+        self._bands = np.array([(fr >= a) & (fr < b) for a, b in zip(self.EDGES[:-1], self.EDGES[1:])], dtype=float)
+        self._win = np.hanning(self._block)
+
+    def feed(self, samples, rate):
+        if rate != self._rate:
+            self._prep(rate)
+            self.buf, self.hist = np.zeros(0), []
+        self.buf = np.concatenate([self.buf, np.asarray(samples, dtype=float)])
+        while len(self.buf) >= self._block:
+            p = self._bands @ (np.abs(np.fft.rfft(self.buf[:self._block] * self._win)) ** 2)
+            self.buf = self.buf[self._hop:]
+            self.hist.append(10.0 * np.log10(p + 1e-12))
+            if len(self.hist) > self.FRAMES:
+                del self.hist[0]
+            self._check()
+
+    @staticmethod
+    def _corr(a, b):
+        a, b = a - a.mean(), b - b.mean()
+        d = float(np.linalg.norm(a) * np.linalg.norm(b))
+        return float(a @ b / d) if d > 1e-9 else 0.0
+
+    def _check(self):
+        if len(self.hist) < self.FRAMES:
+            return
+        w = np.array(self.hist)
+        if w[-6:].mean() - w[:6].mean() < self.MIN_RISE:
+            return
+        t = self._corr(self._z(w), self._t_time)
+        sh = self._corr(w[-self.TAIL:].mean(axis=0), self._t_shape)
+        self.last_score = min(t, sh)
+        now = self.clock()
+        if t >= self.MATCH_TIME and sh >= self.MATCH_SHAPE and now - self.last_heard >= self.REFRACTORY:
+            self.count += 1
+            self.last_heard = now
+            if self.on_heard:
+                self.on_heard(self.count)
+
+
+class SoundMux:
+    """Gives the same audio to several detectors."""
+
+    def __init__(self, *dets):
+        self.dets = dets
+
+    def feed(self, samples, rate):
+        for d in self.dets:
+            d.feed(samples, rate)
+
+
+class AudioListener:
+    """Feeds a DingDetector from the sound card's loopback (needs the PyAudioWPatch package, Windows only)."""
+
+    def __init__(self, detector):
+        self.det = detector
+        self.stream = self.pa = None
+        self.error = None
+
+    @staticmethod
+    def available():
+        return IS_WIN and pyaudio is not None
+
+    def start(self):
+        if self.stream is not None:
+            return True
+        if not self.available():
+            if not IS_WIN:
+                self.error = "Sound detection only works on Windows"
+            elif getattr(sys, "frozen", False):
+                self.error = "This .exe was built without sound detection - rebuild it with the newest build kit"
+            else:
+                self.error = f"PyAudioWPatch isn't installed for this Python ({pyaudio_error})"
+            return False
+        try:
+            self.pa = pyaudio.PyAudio()
+            api = self.pa.get_host_api_info_by_type(pyaudio.paWASAPI)
+            dev = self.pa.get_device_info_by_index(api["defaultOutputDevice"])
+            if not dev.get("isLoopbackDevice"):
+                for lb in self.pa.get_loopback_device_info_generator():
+                    if dev["name"] in lb["name"]:
+                        dev = lb
+                        break
+            ch, rate = max(1, int(dev["maxInputChannels"])), int(dev["defaultSampleRate"])
+
+            def cb(data, frames, info, status):
+                try:
+                    a = np.frombuffer(data, dtype=np.int16).astype(float) / 32768.0
+                    self.det.feed(a.reshape(-1, ch).mean(axis=1) if ch > 1 else a, rate)
+                except Exception:
+                    pass
+                return (None, pyaudio.paContinue)
+            self.stream = self.pa.open(format=pyaudio.paInt16, channels=ch, rate=rate, input=True,
+                                       input_device_index=dev["index"], frames_per_buffer=512,
+                                       stream_callback=cb)
+            self.error = None
+            return True
+        except Exception as ex:
+            self.error = f"Couldn't listen to the game sound: {ex}"
+            self.stop()
+            return False
+
+    def stop(self):
+        try:
+            if self.stream is not None:
+                self.stream.stop_stream()
+                self.stream.close()
+        except Exception:
+            pass
+        try:
+            if self.pa is not None:
+                self.pa.terminate()
+        except Exception:
+            pass
+        self.stream = self.pa = None
+
+
+def precise_sleep(sec):
+    """time.sleep is only accurate to ~15 ms on Windows: sleep most of it, spin the last 2 ms."""
+    if sec <= 0:
+        return
+    end = time.perf_counter() + sec
+    if sec > 0.004:
+        time.sleep(sec - 0.003)
+    while time.perf_counter() < end:
+        pass
+
+
+if IS_WIN:
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+    u32.SendInput.argtypes, u32.SendInput.restype = [wintypes.UINT, ctypes.POINTER(_INPUT), ctypes.c_int], wintypes.UINT
+    u32.MapVirtualKeyW.argtypes, u32.MapVirtualKeyW.restype = [wintypes.UINT, wintypes.UINT], wintypes.UINT
+
+    def _send_input(inp):
+        u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+    def send_key(name, up=False):
+        vk = SEND_VK[name]
+        inp = _INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(vk, u32.MapVirtualKeyW(vk, 0), 2 if up else 0, 0, TRAIN_TAG)))
+        _send_input(inp)
+
+    def send_click(up=False):
+        inp = _INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(0, 0, 0, 4 if up else 2, 0, TRAIN_TAG)))
+        _send_input(inp)
+
+    def _mouse_move_abs(x, y):
+        vx, vy, vw, vh = (u32.GetSystemMetrics(i) for i in (76, 77, 78, 79))         # the whole virtual desktop
+        vw, vh = max(2, vw), max(2, vh)
+        nx, ny = int((x - vx) * 65535 / (vw - 1)) + 1, int((y - vy) * 65535 / (vh - 1)) + 1
+        _send_input(_INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(nx, ny, 0, 0x0001 | 0x8000 | 0x4000, 0, TRAIN_TAG))))
+
+    def _mouse_move_rel(dx, dy):
+        _send_input(_INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(dx, dy, 0, 0x0001, 0, TRAIN_TAG))))
+
+    def move_cursor(x, y, nudge=True):
+        """Moves the cursor like a real mouse does (the game only learns where the cursor is from mouse-move events;
+        a plain SetCursorPos leaves it clicking at the OLD spot). nudge: a 1 px wiggle afterwards, to be sure."""
+        x, y = int(x), int(y)
+        u32.SetCursorPos(x, y)
+        _mouse_move_abs(x, y)
+        if nudge:
+            time.sleep(0.01)
+            _mouse_move_rel(1, 0)
+            time.sleep(0.01)
+            _mouse_move_rel(-1, 0)
+
+    def timer_resolution(on):
+        try:
+            (ctypes.windll.winmm.timeBeginPeriod if on else ctypes.windll.winmm.timeEndPeriod)(1)
+        except Exception:
+            pass
+else:
+    def move_cursor(x, y, nudge=True):
+        pass
+
+    def send_key(name, up=False):
+        pass
+
+    def send_click(up=False):
+        pass
+
+    def timer_resolution(on):
+        pass
+
+
+BREW_OUT = "ran out of ingredients"
+BREW_BOOM = "the cauldron exploded"
+
+
+def discord_ok(url):
+    """Only real Discord webhook links are ever posted to."""
+    return bool(re.match(r"^https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api(?:/v\d+)?/webhooks/\d+/[\w-]+/?(?:\?.*)?$", str(url).strip()))
+
+
+def discord_embed(title, text, color, footer="Assist Tool"):
+    return {"embeds": [{"title": title, "description": text, "color": color, "footer": {"text": footer},
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}]}
+
+
+def discord_send(url, payload, timeout=10):
+    """POST the payload to a Discord webhook. Returns (ok, message)."""
+    url = str(url).strip()
+    if not url:
+        return False, "No webhook link set"
+    if not discord_ok(url):
+        return False, "That isn't a Discord webhook link"
+    try:
+        req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"), method="POST",
+                                     headers={"Content-Type": "application/json", "User-Agent": "AssistTool (webhook, 1.0)"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (200 <= r.status < 300), f"Sent (HTTP {r.status})"
+    except urllib.error.HTTPError as e:
+        return False, f"Discord said HTTP {e.code}" + (" - the link was deleted or is wrong" if e.code in (401, 404) else "")
+    except Exception as e:
+        return False, f"Couldn't reach Discord: {type(e).__name__}"
+
+
+def discord_send_image(url, payload, png, name="screenshot.png", timeout=20):
+    """Like discord_send, but with a picture attached (the embed shows it). Returns (ok, message)."""
+    url = str(url).strip()
+    if not url:
+        return False, "No webhook link set"
+    if not discord_ok(url):
+        return False, "That isn't a Discord webhook link"
+    try:
+        emb = payload["embeds"][0]
+        emb["image"] = {"url": "attachment://" + name}
+        boundary = "----AssistTool" + hashlib.md5(png[:64] + str(time.time()).encode()).hexdigest()
+        parts = [("--%s\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n" % boundary).encode(),
+                 json.dumps(payload).encode("utf-8"),
+                 ("\r\n--%s\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"%s\"\r\nContent-Type: image/png\r\n\r\n" % (boundary, name)).encode(),
+                 png, ("\r\n--%s--\r\n" % boundary).encode()]
+        req = urllib.request.Request(url, data=b"".join(parts), method="POST",
+                                     headers={"Content-Type": "multipart/form-data; boundary=" + boundary,
+                                              "User-Agent": "AssistTool (webhook, 1.0)"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return (200 <= r.status < 300), f"Sent (HTTP {r.status})"
+    except urllib.error.HTTPError as e:
+        return False, f"Discord said HTTP {e.code}" + (" - the link was deleted or is wrong" if e.code in (401, 404) else "")
+    except Exception as e:
+        return False, f"Couldn't reach Discord: {type(e).__name__}"
+
+
+def game_window_rect(title="Roblox"):
+    """(left, top, width, height) of the game window's client area on the screen, or None when the Roblox game isn't the
+    window in front."""
+    if not IS_WIN:
+        return None
+    try:
+        h = u32.GetForegroundWindow()
+        if not h or not is_roblox_window(h):
+            return None                                      # (the Roblox game itself has to be the window in front: not a browser tab that says Roblox)
+        rc = wintypes.RECT()
+        u32.GetClientRect(h, ctypes.byref(rc))
+        pt = wintypes.POINT(0, 0)
+        u32.ClientToScreen(h, ctypes.byref(pt))
+        if rc.right - rc.left < 50 or rc.bottom - rc.top < 50:
+            return None
+        return int(pt.x), int(pt.y), int(rc.right - rc.left), int(rc.bottom - rc.top)
+    except Exception:
+        return None
+
+
+def screenshot_png(rect=None):
+    """PNG bytes of the screen rect (left, top, w, h), or of the whole main screen."""
+    with mss.mss() as sct:
+        box = ({"left": rect[0], "top": rect[1], "width": rect[2], "height": rect[3]} if rect else sct.monitors[1])
+        shot = sct.grab(box)
+        img = Image.frombytes("RGB", shot.size, shot.rgb)
+    out = io.BytesIO()
+    img.save(out, "PNG", optimize=False)
+    return out.getvalue()
+
+
+IMENU_BTN_PNG = "iVBORw0KGgoAAAANSUhEUgAAADMAAAAUCAYAAAAgCAWkAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAJuSURBVFhH7ZdbSBRhGIafWU3pQhQPRZDeZJFlCIqBbJqKpFGJYaBmEZ4IIopMYlf0ZlOXxAqSMPOAoEtKhhaltixF5CZKlF1UZGfFlDQ1LUzLmW5scpYgxwIb6bma+d53hv+BH+Yf4d3lY1Lf8ATGajtaxJyux9fbjX3FbQidZZmSsdqOOTfLsacJjEUVspAQHRogmXOz2LjWz7GnCR4/78VYVEHdiTh0ACu83B07mmHu2nWKROP8l/lXUS3jtyWN87XXFbPIFANHTeWK2WKgWsbH052rtk75/k3/ewaHxhSdxUK1jCiK+Hi68/LtAACNLe3E6IMUneKLV4hOzSUyxUBd820ATOcuYSiu4UDOWSJTDJwsrZf7m7Yf5lXvIABdj3qI2Z8nZ2pQLfNlapqkHeE03LgLgLX9IeGhgXJ+zdbJh9EJblmKsNUVUtlwk7HxzwD0DQxTdeoIrTUmyiwtTE5Ny8/9DVTLzMyIxEYEY7N30/O6H3+/Vbi6OMt56537dDx4SsLBAvYcMjP99RuDQ6MAbA5ah7OTE8tdXfDycGN4ZHzOm/8c1TIAri7L2ODvi6m0nqSd4YpMkiAzOZbm8jyay/O411jC+jWrFR0ABAFRFH9cIkmSY0M1C5IBSN61la7uZ4otBhAXEcwFSwsTnyZhdmv9jpXeHjx50ceMKNJk7XCM582CZfQhAVhrC9DpBMU8YVsYiXF6olKNRO01cqaqSZH/iuyM3WQXVhKWmENIoL9jPG+E6NAAqep0Dj6e2jyfDY18JON4yc+D5lJBx+yHUKvMXbvOnK4nPi1fUdAS8Wn5mNP1AAhL6bf5O2SRzgV0gRMyAAAAAElFTkSuQmCC"      # the game's Menu button (1080p: 51 x 20 px)
+IMENU_FALLBACK = (321, 78)                    # (1080p) the button's centre: this far from the window's right edge / top
+
+
+def find_menu_button(rect):
+    """Screen position (x, y) of the game's Menu button, or None when it can't be seen (the menu is open / loading). It LOOKS for the
+    button's picture (any window size / resolution: the picture is tried at many sizes, first in the top-right corner of the game window,
+    then in the whole window) - it doesn't click a fixed spot. Without opencv it can't look and uses the usual spot."""
+    L, T, W, H = rect
+    k = max(0.3, H / 1080.0)
+    cv2 = _bv_cv2()
+    if cv2 is None:
+        return (L + W - IMENU_FALLBACK[0] * k, T + IMENU_FALLBACK[1] * k)
+    tpl0 = np.asarray(Image.open(io.BytesIO(base64.b64decode(IMENU_BTN_PNG))).convert("L"))
+    scales = [k] + sorted((1.04 ** i * 0.35 for i in range(0, 72)), key=lambda v: abs(math.log(v / k)))      # (the likely size first)
+
+    def look(x0, y0, w, h, stop_at):
+        with mss.mss() as sct:
+            shot = sct.grab({"left": int(x0), "top": int(y0), "width": int(w), "height": int(h)})
+        hay = np.ascontiguousarray(cv2.cvtColor(np.asarray(shot)[:, :, :3], cv2.COLOR_BGR2GRAY))
+        best = (0.0, None)
+        for sc in scales:
+            tw, th = int(round(tpl0.shape[1] * sc)), int(round(tpl0.shape[0] * sc))
+            if tw < 12 or th < 6 or th > hay.shape[0] or tw > hay.shape[1]:
+                continue
+            tpl = cv2.resize(tpl0, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
+            _, score, _, loc = cv2.minMaxLoc(cv2.matchTemplate(hay, tpl, cv2.TM_CCOEFF_NORMED))
+            if score > best[0]:
+                best = (score, (x0 + loc[0] + tw / 2.0, y0 + loc[1] + th / 2.0))
+            if score >= stop_at:
+                break
+        return best
+
+    rw, rh = int(W * 0.45), int(H * 0.35)
+    score, pt = look(L + W - rw, T, rw, rh, 0.93)
+    if score < 0.75:
+        s2, p2 = look(L, T, W, H, 0.93)
+        if s2 > score:
+            score, pt = s2, p2
+    return pt if score >= 0.75 else None
+
+
+def instant_menu_run(rect, find_fn, locked_fn, key_fn, move_fn, click_fn, cursor_fn, allowed, sleep=time.sleep):
+    """Instant Menu: Shiftlock off if it is on, the mouse onto the Menu button (checked that it really got there), click. Returns a message."""
+    if locked_fn():
+        key_fn("shift", False)                                # Shiftlock holds the cursor in the middle of the window: let it go first
+        sleep(0.03)
+        key_fn("shift", True)
+        sleep(0.12)
+    if not allowed():
+        return "the game window isn't in front"
+    pt = find_fn(rect)
+    if pt is None:
+        return "couldn't see the Menu button (already in the menu?)"
+    for _ in range(4):                                        # (the mouse has to be on the button: look, and move again if it isn't)
+        move_fn(pt[0], pt[1])
+        sleep(0.12)
+        try:
+            cx, cy = cursor_fn()
+        except Exception:
+            break
+        if abs(cx - pt[0]) <= 3 and abs(cy - pt[1]) <= 3:
+            break
+    if not allowed():
+        return "the game window isn't in front"
+    click_fn(False)
+    sleep(0.06)
+    click_fn(True)
+    return ""
+
+
+GANK_COLOR = 0x010101                  # (black bar; a plain 0 would show Discord's default grey)
+
+WEBHOOK_MSGS = {"out": ("Ran out of Ingredient!", "go farm more bro im just a tool that makes stuff for you how r u running out on ingredients lol", 0xED4245),
+                "done": ("Made {n} Potion/Weapons!", "ye bro i did it for you can you advertise me now?", 0x57F287),
+                "boom": ("Yo mb gang I messed up ima go hide or smth", "ye mb og super gaian messes up sometimes sorry bro", 0xFAA61A),
+                "gank": ("yo {n} is using gank ping feature lol dude cant even gank alone", "go help them bro r u guys js watching for joy? hello? bad house bro", GANK_COLOR),
+                "test": ("Ye bro im working", "yea man i work ye thanks for installing me to your server i'll take it over now", 0x5865F2)}
+
+
+def webhook_payload(kind, n=0):
+    title, text, color = WEBHOOK_MSGS[kind]
+    return discord_embed(title.format(n=n), text, color)
+
+
+def gank_payload(name):
+    return webhook_payload("gank", str(name).strip() or "someone")
+
+
+class _BrewStop(Exception):
+    pass
+
+
+class Brewer:
+    """Potion Brewer / Weapon Crafter: for every round, each sequence picks its item (a hotbar key, or its inventory card) and
+    clicks the Cauldron / Anvil `clicks` times; then the Wooden Spoon / Hammer is clicked once. Everything is injectable so it
+    can be tested without Windows. allowed() is asked before every step: when it says False the run stops."""
+
+    def __init__(self, key_fn=send_key, click_fn=send_click, move_fn=move_cursor, sleep=None, allowed=lambda: True,
+                 find_card=None, on_count=None, on_stop=None, delays=None, inv_open=lambda: False):
+        self.inv_open = inv_open                                      # is the inventory open (a card that isn't there then = out of that item)
+        self.key_fn, self.click_fn, self.move_fn = key_fn, click_fn, move_fn
+        self.allowed, self.find_card, self.on_count, self.on_stop = allowed, find_card, on_count, on_stop
+        self.delays = delays or (lambda: (0.15, 0.25, 1.5))          # (between clicks, after choosing an item, before the spoon) in seconds
+        self._sleep = sleep
+        self._stop = threading.Event()
+        self.count, self.reason, self.running = 0, None, False
+        self._thread = None
+
+    def start(self, recipe):
+        if self.running:
+            return False
+        self.recipe = {"seq": [dict(q) for q in recipe["seq"]], "count": int(recipe["count"]), "pot": tuple(recipe["pot"]),
+                       "spoon": tuple(recipe["spoon"])}
+        self.count, self.reason, self.running = 0, None, True
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self, reason="stopped by you"):
+        if self.running and self.reason is None:
+            self.reason = reason
+        self._stop.set()
+
+    def join(self, timeout=3.0):
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def _ok(self):
+        if self._stop.is_set():
+            raise _BrewStop(self.reason or "stopped")
+        if not self.allowed():
+            raise _BrewStop("the game window isn't in front")
+
+    def _wait(self, sec):
+        if self._sleep is not None:
+            self._sleep(sec)
+        else:
+            self._stop.wait(max(0.0, sec))
+        self._ok()
+
+    def _click_at(self, pt):
+        self._ok()
+        d = tuple(self.delays())
+        self.move_fn(pt[0], pt[1])
+        self._wait(d[3] if len(d) > 3 else 0.12)          # (the game needs a moment to see the cursor arrive)
+        self.click_fn(False)
+        self._wait(d[4] if len(d) > 4 else 0.06)          # (how long the button is held)
+        self.click_fn(True)
+
+    def _select(self, q, pick):
+        """Picks the sequence's item (its learned inventory card, else its key). The same call again puts it away.
+        Returns True when there was something to pick."""
+        if self.find_card is not None and self.find_card(q["id"], probe=True):
+            pt = self.find_card(q["id"])
+            if pt is None:
+                if self.inv_open():
+                    raise _BrewStop(BREW_OUT)                 # the inventory is open and the card isn't in it any more
+                raise _BrewStop("couldn't find the inventory card - open the inventory (`)")
+            self._click_at(pt)
+        elif q.get("key"):
+            self._ok()
+            self.key_fn(q["key"], False)
+            self._wait(0.03)
+            self.key_fn(q["key"], True)
+        else:
+            return False
+        self._wait(pick)
+        return True
+
+    def _run(self):
+        why = "finished"
+        try:
+            for _ in range(self.recipe["count"]):
+                held = None                                  # the item in hand after the last sequence
+                for q in self.recipe["seq"]:
+                    gap, pick, spoon = tuple(self.delays())[:3]
+                    if self._select(q, pick):
+                        held = q
+                    for _i in range(max(1, int(q.get("clicks", 1)))):
+                        self._click_at(self.recipe["pot"])
+                        self._wait(gap)
+                gap, pick, spoon = tuple(self.delays())[:3]
+                if held is not None:
+                    self._select(held, pick)                 # an item in hand makes the Spoon / Hammer do nothing: put it away first
+                self._wait(spoon)                            # (give the game a moment before the Spoon / Hammer is clicked)
+                self._click_at(self.recipe["spoon"])
+                d = tuple(self.delays())
+                if len(d) > 5 and d[5] > 0:
+                    self._wait(d[5])                         # (optional pause after the Spoon / Hammer)
+                self.count += 1
+                if self.on_count:
+                    self.on_count(self.count)
+        except _BrewStop as e:
+            why = str(e)
+        except Exception as e:
+            why = f"error: {type(e).__name__}: {e}"
+        finally:
+            self.running = False
+            if self.on_stop:
+                self.on_stop(self.count, why)
+
+
+class SnapTrainer:
+    """One training run = one loop: if the mana is under the cast band, hold G until it reaches the top of the band (or the
+    mana ding is heard); then key > 5 ms > click > 5 ms > key > 100 ms repeated with G spammed the whole time; when the mana
+    drops under the band it stops, waits, and charges again. Everything is injectable so it can be tested without Windows.
+    allowed() is asked before every cast: when it says False the run stops (it never types into another window)."""
+
+    def __init__(self, key_fn=send_key, click_fn=send_click, sleep=precise_sleep, allowed=lambda: True,
+                 on_count=None, on_stop=None, heard_since=lambda t: True, gap=None, g_hold=None, mana_wait=None,
+                 below_lo=None, reached_hi=None, watch_low=None):
+        self.below_lo, self.reached_hi = below_lo, reached_hi      # mana readings: under / at the top of the cast band
+        self.watch_low = watch_low                        # False = don't stop / recharge when under the band
+        self._m_low = self._m_hi = False                  # latest mana readings (filled by the monitor thread)
+        self.mana_wait = mana_wait                        # seconds from 'under the band' to the G hold (number or function)
+        self.g_hold = g_hold                              # ms each G spam press is held down (None = default)
+        self.gap = gap                                    # ms between G taps while training (None / blank / 0 = no spam)
+        self.heard_since = heard_since                    # heard_since(t): the mana ding was heard after time t
+        self.key_fn, self.click_fn, self.sleep = key_fn, click_fn, sleep
+        self.allowed, self.on_count, self.on_stop = allowed, on_count, on_stop
+        self.count = 0
+        self._stop = threading.Event()
+        self._spam = threading.Event()                    # set = G is being spammed (during the training part only)
+        self._g_lock = threading.Lock()
+        self._threads = []
+        self.reason = None
+        self.running = False
+
+    def start(self, key):
+        if self.running:
+            return False
+        if key not in HOTBAR_KEYS:
+            raise ValueError("Snap Training only accepts the hotbar keys 1-0, - and =")
+        self.count, self.reason = 0, None
+        self._stop.clear()
+        self.running = True
+        self._spam.clear()
+        self._old_si = sys.getswitchinterval()
+        sys.setswitchinterval(0.0005)                     # threads swap fast: the 5 ms steps of a cast must not wait for other threads
+        self._threads = [threading.Thread(target=self._cast_loop, args=(key,), daemon=True),
+                         threading.Thread(target=self._spam_loop, daemon=True)]
+        if self.below_lo or self.reached_hi:
+            self._threads.append(threading.Thread(target=self._monitor_loop, daemon=True))
+        for t in self._threads:
+            t.start()
+        return True
+
+    def stop(self, reason="stopped"):
+        if self.running and self.reason is None:
+            self.reason = reason
+        self._stop.set()
+
+    def join(self, timeout=2.0):
+        for t in self._threads:
+            t.join(timeout)
+
+    def _nap(self, sec):
+        """Wait that a stop request cuts short (the long waits only; the 5 ms steps stay exact)."""
+        if self.sleep is precise_sleep:
+            self._stop.wait(sec)
+        else:
+            self.sleep(sec)
+
+    def _tap(self, name):
+        self.key_fn(name, False)
+        self.sleep(TRAIN_HOLD)
+        self.key_fn(name, True)
+
+    def _click(self):
+        self.click_fn(False)
+        self.sleep(TRAIN_HOLD)
+        self.click_fn(True)
+
+    def cast_once(self, key):
+        """equip > wait 5 ms > click > wait 5 ms > un-equip > wait 100 ms"""
+        self._tap(key)
+        self.sleep(TRAIN_STEP)
+        self._click()
+        self.sleep(TRAIN_STEP)
+        self._tap(key)
+        self._nap(TRAIN_REST)
+
+    def _gap(self):
+        """Seconds between two G taps while training, or None when spamming is turned off (blank / 0)."""
+        g = self.gap() if callable(self.gap) else self.gap
+        if g is None:
+            return TRAIN_G_GAP
+        if isinstance(g, str) and not g.strip():
+            return None
+        try:
+            g = float(g)
+        except (TypeError, ValueError):
+            return TRAIN_G_GAP
+        return None if g <= 0 else max(0.005, g / 1000.0)
+
+    def _mana_wait(self):
+        w = self.mana_wait() if callable(self.mana_wait) else self.mana_wait
+        try:
+            return max(0.0, float(TRAIN_MANA_WAIT if w is None else w))
+        except (TypeError, ValueError):
+            return TRAIN_MANA_WAIT
+
+    def _spam_hold(self):
+        """Seconds each G spam press stays down (customizable; blank = a quick 5 ms tap)."""
+        h = self.g_hold() if callable(self.g_hold) else self.g_hold
+        if h is None:
+            return TRAIN_G_HOLD
+        try:
+            return max(0.005, float(h) / 1000.0) if str(h).strip() else 0.005
+        except (TypeError, ValueError):
+            return TRAIN_G_HOLD
+
+    def _hold_g(self, done=None):
+        """Training pauses while G is held down until the mana ding is heard (never longer than TRAIN_G_MAX).
+        done(t0) can add another way to finish (the mana reached the top of the cast band)."""
+        self._spam.clear()                                    # no spamming while G is held
+        with self._g_lock:                                    # (waits for a tap that is just being sent)
+            pass
+        t0 = time.time()
+        self.key_fn("g", False)
+        try:
+            while not self._stop.is_set() and time.time() - t0 < TRAIN_G_MAX and not self.heard_since(t0):
+                if done is not None and done(t0):
+                    break
+                self._stop.wait(0.003 if done is not None else 0.01)       # (look at the bar ~300 times a second)
+        finally:
+            self.key_fn("g", True)
+            if not self._stop.is_set():
+                self._spam.set()                              # training starts: spam G the whole time
+
+    def _monitor_loop(self):
+        """The ONLY thread that looks at the screen. The cast and G threads just read its latest answer, so
+        grabbing the screen never delays a cast (that would make the spell finish instead of being snapped)."""
+        while not self._stop.is_set():
+            try:
+                self._m_low = bool(self.below_lo()) if self.below_lo else False
+                self._m_hi = bool(self.reached_hi()) if self.reached_hi else False
+            except Exception:
+                pass
+            self._stop.wait(TRAIN_MONITOR_EVERY)
+
+    def _at_top(self):
+        """True when the mana is already at / above the top of the cast band (G must not charge any more)."""
+        return bool(self.reached_hi is not None and self._m_hi)
+
+    def _spam_loop(self):
+        try:
+            while not self._stop.is_set():
+                gap = self._gap() if self._spam.is_set() else None
+                if gap is not None:
+                    pressed = False
+                    with self._g_lock:
+                        # a G press CHARGES mana, so no press while the mana is at the top of the mark
+                        if self._spam.is_set() and not self._stop.is_set() and not self._at_top():
+                            pressed = True
+                            self.key_fn("g", False)                # one spam press: held down for the "hold" time...
+                            try:
+                                end = time.time() + self._spam_hold()
+                                while time.time() < end and not self._stop.is_set():
+                                    if self._at_top():
+                                        break                      # ...but let go the moment the mana reaches the top
+                                    self._stop.wait(0.004)
+                            finally:
+                                self.key_fn("g", True)
+                    self._nap(gap if pressed else 0.005)
+                else:
+                    self._stop.wait(0.005)
+        except Exception:
+            self._stop.set()
+
+    def _cast_loop(self, key):
+        if IS_WIN:
+            try:                                              # the cast thread gets the CPU first
+                k32.GetCurrentThread.restype = wintypes.HANDLE
+                k32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+                k32.SetThreadPriority(k32.GetCurrentThread(), 2)
+            except Exception:
+                pass
+        try:
+            low_at = None
+            try:                                              # start training at once if the mana is already in the band
+                charge = bool(self.below_lo()) if self.below_lo else True
+            except Exception:
+                charge = True
+            if not charge:
+                self._spam.set()                              # (and spam G right away)
+            while not self._stop.is_set():
+                if not self.allowed():
+                    self.reason = self.reason or "the game window isn't active any more"
+                    break
+                now = time.time()
+                if charge:
+                    # hold G until the mana reaches the top of the band (or the ding: 100 % = full)
+                    self._hold_g(lambda t0: bool(self.reached_hi and self._m_hi))
+                    charge, low_at = False, None
+                    continue
+                if low_at is None:
+                    try:
+                        if (self.watch_low is None or self.watch_low()) and self.below_lo and self._m_low:
+                            low_at = now                      # under the band: training stops RIGHT NOW...
+                            self._spam.clear()
+                    except Exception:
+                        pass
+                if low_at is not None:
+                    if now - low_at >= self._mana_wait():     # ...and after the wait it charges up to the top of the band
+                        charge = True
+                    else:
+                        self._stop.wait(0.01)
+                    continue
+                self.cast_once(key)                           # (a cast is always finished, so the spell ends un-equipped)
+                self.count += 1
+                if self.on_count:
+                    self.on_count(self.count)
+        except Exception as ex:
+            self.reason = self.reason or f"error: {ex}"
+        finally:
+            self._stop.set()
+            self._spam.clear()
+            try:
+                sys.setswitchinterval(getattr(self, "_old_si", 0.005))
+            except Exception:
+                pass
+            self.running = False
+            if self.on_stop:
+                self.on_stop(self.count, self.reason or "stopped")
+
+
+# ----------------------------------------------------------------------------
+# Overlay: two plain Tk windows (no special Windows drawing calls)
+#   - red window: solid red boxes, made see-through with a global alpha
+#   - number window: opaque white numbers with a black outline on top
+# The colour #010101 is the "transparent" colour of both windows.
+# ----------------------------------------------------------------------------
+KEY = "#010101"
+RED = "#e83830"                      # normal moves (left click)
+BLUE = "#2f72ee"                     # snap spells (right click)
+
+
+class Overlay:
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.red = self._make()
+        self.num = self._make()
+        self.shown = False
+        self.alpha = None
+        self.geom = None
+
+    def _make(self):
+        w = tk.Toplevel(self.root)
+        w.overrideredirect(True)
+        w.configure(bg=KEY)
+        w.attributes("-topmost", True)
+        try:
+            w.attributes("-transparentcolor", KEY)
+        except tk.TclError:
+            pass
+        cv = tk.Canvas(w, bg=KEY, highlightthickness=0, bd=0)
+        cv.pack()
+        w.geometry("1x1+0+0")
+        w.update()                                   # the real Windows window exists once it was shown
+        self._click_through(w)                       # ...so set click-through / no-focus BEFORE hiding it
+        w.withdraw()
+        return w, cv
+
+    def _click_through(self, w):
+        if IS_WIN:
+            try:
+                make_click_through(hwnd_of(w))
+            except Exception as ex:
+                self.log(f"Couldn't make the overlay click-through: {ex}")
+
+    def _set_alpha(self, a):
+        a = min(1.0, max(0.1, float(a)))
+        if a != self.alpha:
+            self.alpha = a
+            try:
+                self.red[0].attributes("-alpha", a)
+            except tk.TclError:
+                pass
+
+    def show(self, rects, items, opacity, family):
+        """items[i] = None or (text, fill fraction 0..1, 'move' | 'snap')  -> red / blue box."""
+        self._set_alpha(opacity)
+        pad = 4
+        wx = int(math.floor(min(r[0] for r in rects))) - pad
+        wy = int(math.floor(min(r[1] for r in rects))) - pad
+        W = int(math.ceil(max(r[0] + r[2] for r in rects))) - wx + pad
+        H = int(math.ceil(max(r[1] + r[3] for r in rects))) - wy + pad
+        (wr, cr), (wn, cn) = self.red, self.num
+        for w, cv in ((wr, cr), (wn, cn)):
+            cv.delete("all")
+            cv.config(width=W, height=H)
+            w.geometry(f"{W}x{H}+{wx}+{wy}")
+        geo = (wx, wy, W, H)
+        for (x, y, rw, rh), it in zip(rects, items):
+            if it is None:
+                continue
+            x0, y0 = int(round(x - wx)), int(round(y - wy))
+            x1, y1 = x0 + int(round(rw)), y0 + int(round(rh))
+            cy = (y0 + y1) // 2
+            if isinstance(it[0], tuple):
+                # two cooldowns at once (left click / right click don't share): the slot is split in two halves,
+                # left half = the left-click one (red), right half = the right-click one (blue)
+                mid = (x0 + x1) // 2
+                parts = list(zip(it, ((x0, mid), (mid, x1))))
+            else:
+                parts = [(it, (x0, x1))]
+            if len(parts) == 2:                                                   # both halves use the SAME digit size
+                half = int(max(8, min(min(rh * 0.34, (b - a - 6) / (0.72 * max(1, len(t[0])))) for t, (a, b) in parts)))
+            for (text, frac, kind), (a, b) in parts:
+                col = BLUE if kind == "snap" else (SOUL_COL if kind == "soul" else RED)
+                top = y1 - int(round((y1 - y0) * min(1.0, max(0.0, frac))))        # drains from the top
+                if top < y1:
+                    cr.create_rectangle(a, top, b, y1, fill=col, outline=col, width=0)
+                size = max(10, int(rh * 0.5))
+                if len(parts) == 2:                                               # a half is narrow: smaller digits
+                    size = half
+                fnt = (family, -size, "bold")
+                cx, o = (a + b) // 2, (2 if size >= 16 else 1)
+                for dx, dy in ((-o, 0), (o, 0), (0, -o), (0, o), (-o, -o), (o, -o), (-o, o), (o, o)):
+                    cn.create_text(cx + dx, cy + dy, text=text, font=fnt, fill="#000000")
+                cn.create_text(cx, cy, text=text, font=fnt, fill="#ffffff")
+        self._visible()
+        for w, _ in (self.red, self.num):
+            flush_win(w, *geo)
+        self.shown = True
+
+    def _visible(self):
+        """Show both windows (without taking focus), red one underneath the numbers."""
+        for w, _ in (self.red, self.num):
+            try:
+                if w.state() != "normal":
+                    w.deiconify()
+                self._click_through(w)                      # (cheap) keep it click-through / never focused
+                if IS_WIN:
+                    h = hwnd_of(w)
+                    if not u32.IsWindowVisible(h):          # e.g. hidden because the main window was hidden
+                        u32.ShowWindow(h, 4)                # SW_SHOWNOACTIVATE
+                w.attributes("-topmost", True)
+                w.lift()
+            except Exception:
+                pass
+
+    def raise_top(self):
+        if self.shown:
+            self._visible()
+
+    def hide(self):
+        if self.shown:
+            for w, _ in (self.red, self.num):
+                try:
+                    w.withdraw()
+                except Exception:
+                    pass
+            self.shown = False
+
+
+class ManaOverlay(Overlay):
+    """The mana bar picture (tick marks, decorations) with the cast-mark boxes under it. Same two-window trick
+    as the cooldown boxes: the box window is see-through with a global strength, the picture window is
+    opaque with the key colour cut out."""
+
+    def __init__(self, root, log):
+        super().__init__(root, log)
+        self.sig = None
+        self._photo = None
+
+    def show_art(self, rect, art, boxes, opacity):
+        """rect = (x, y, w, h) on screen; art = keyed RGB image of that size; boxes in screen pixels."""
+        self._set_alpha(opacity)
+        x, y, w, h = (int(round(v)) for v in rect)
+        (wb, cb), (wa, ca) = self.red, self.num
+        for win, cv in ((wb, cb), (wa, ca)):
+            cv.delete("all")
+            cv.config(width=w, height=h)
+            win.geometry(f"{w}x{h}+{x}+{y}")
+        for bx0, by0, bx1, by1, col in boxes:
+            cb.create_rectangle(int(round(bx0 - x)), int(round(by0 - y)), int(round(bx1 - x)),
+                                int(round(by1 - y)), fill=col, outline=col, width=0)
+        self._photo = ImageTk.PhotoImage(art)
+        ca.create_image(0, 0, image=self._photo, anchor="nw")
+        self._visible()
+        self.shown = True
+
+
+class DecorOverlay(Overlay):
+    """Your own pictures on the screen: one see-through window per picture, each with its own strength."""
+
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.wins = {}                     # id -> {"win", "cv", "sig", "photo"}
+        self._photos = {}
+        self.pool = []                     # unused (hidden) windows: they are reused, never made / destroyed while you play
+        self.shown = False
+
+    def prefill(self, n):
+        """Make the windows now (at the start), so none has to be made later, in the middle of the game."""
+        while len(self.pool) < n:
+            self.pool.append(self._make())
+
+    def _release(self, ent):
+        try:
+            ent["cv"].delete("all")
+            ent["win"].withdraw()
+            self.pool.append((ent["win"], ent["cv"]))
+        except Exception:
+            pass
+
+    def _show_win(self, w):
+        try:
+            if w.state() != "normal":
+                w.deiconify()
+            self._click_through(w)
+            if IS_WIN:
+                h = hwnd_of(w)
+                if not u32.IsWindowVisible(h):
+                    u32.ShowWindow(h, 4)
+            w.attributes("-topmost", True)
+            w.lift()
+        except Exception:
+            pass
+
+    def sync(self, items, get_img):
+        """items = the decorations to show (dicts); get_img(item) -> (file key, RGBA picture or None)."""
+        keep = set()
+        for it in items:
+            key, img = get_img(it)
+            if img is None:
+                continue
+            keep.add(it["id"])
+            w, h = max(1, int(round(it["w"]))), max(1, int(round(it["h"])))
+            x, y = int(round(it["x"])), int(round(it["y"]))
+            op = min(1.0, max(0.1, float(it["opacity"])))
+            sig = (key, x, y, w, h, round(op, 2))
+            ent = self.wins.get(it["id"])
+            if ent is None:
+                win, cv = self.pool.pop() if self.pool else self._make()
+                ent = self.wins[it["id"]] = {"win": win, "cv": cv, "sig": None, "photo": None}
+            if ent["sig"] != sig:
+                ent["sig"] = sig
+                ent["cv"].delete("all")
+                ent["cv"].config(width=w, height=h)
+                ent["win"].geometry(f"{w}x{h}+{x}+{y}")
+                try:
+                    ent["win"].attributes("-alpha", op)
+                except tk.TclError:
+                    pass
+                pk = (key, w, h)
+                ent["photo"] = self._photos.get(pk)
+                if ent["photo"] is None:
+                    if len(self._photos) > 160:
+                        self._photos.clear()                   # (animated pictures: every frame is made once)
+                    ent["photo"] = self._photos[pk] = ImageTk.PhotoImage(keyed_image(img, w, h))
+                ent["cv"].create_image(0, 0, image=ent["photo"], anchor="nw")
+                self._show_win(ent["win"])
+                flush_win(ent["win"], x, y, w, h)
+        for iid in [i for i in self.wins if i not in keep]:
+            self._release(self.wins.pop(iid))
+        self.shown = bool(self.wins)
+
+    def raise_top(self):
+        for ent in self.wins.values():
+            self._show_win(ent["win"])
+
+    def hide(self):
+        for ent in self.wins.values():
+            self._release(ent)
+        self.wins = {}
+        self.shown = False
+
+
+KDA_ORDER = (("kill", "Grip"), ("death", "Death"), ("assist", "Assist"), ("knock", "Knocked"))
+KDA_GOLD = "#ffd23f"
+
+
+class KdaOverlay(Overlay):
+    """'Grip 10  Death 0  Assist 3  Knocked 9' under the Auto Bard badge. Click-through like the checklist: the mouse hook catches the
+    clicks on the numbers (hit boxes returned by show()). The selected counter is golden."""
+
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.win, self.cv = self._make()
+        self.red = self.num = (self.win, self.cv)
+        self.shown = False
+        self.alpha = None
+        self.geom = None
+
+    def hide(self):
+        if self.shown:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+        self.shown = False
+
+    def show(self, x, y, items, s, family):
+        """items: [(id, text, selected)]. Returns (hit boxes [(x0, y0, x1, y1, "kda", id)], window rects)."""
+        cv, win = self.cv, self.win
+        size = max(10, int(round(24 * s)))
+        try:
+            fnt = tkfont.Font(root=self.root, family=family, size=-size, weight="bold")
+        except Exception:
+            fnt = None
+        gap, pad = int(16 * s), 3
+        cx, boxes = pad, []
+        for iid, text, sel in items:
+            try:
+                w = fnt.measure(text) if fnt else None
+            except Exception:
+                w = None
+            if not isinstance(w, (int, float)):
+                w = len(text) * size * 0.56
+            boxes.append((iid, text, sel, cx, int(w)))
+            cx += int(w) + gap
+        W, H = max(10, cx - gap + pad), int(size * 1.5) + 2 * pad
+        cv.delete("all")
+        cv.config(width=W, height=H)
+        win.geometry(f"{W}x{H}+{int(x)}+{int(y)}")
+        hits = []
+        f = (family, -size, "bold")
+        for iid, text, sel, bx, w in boxes:
+            col = KDA_GOLD if sel else "#ffffff"
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+                cv.create_text(bx + dx, H // 2 + dy, text=text, font=f, fill="#000000", anchor="w")
+            cv.create_text(bx, H // 2, text=text, font=f, fill=col, anchor="w")
+            hits.append((int(x) + bx - 4, int(y), int(x) + bx + w + 4, int(y) + H, "kda", iid))
+        self._visible()
+        flush_win(win, int(x), int(y), W, H)
+        self.shown = True
+        return hits, ((int(x), int(y), int(x) + W, int(y) + H),)
+
+
+class ChecklistOverlay(Overlay):
+    """The checklist next to the mana bar: a framed panel with the items (scrollable) and a < / > box that hides it. It is
+    click-through; the clicks on it are caught by the mouse hook (InputWatcher) and handled by the App with the hit boxes
+    that show() returns."""
+    DONE_COL = "#8ee05a"
+
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.win, self.cv = self._make()
+        self.red = self.num = (self.win, self.cv)
+        self.shown = False
+        self.alpha = None
+        self.geom = None
+        self._fonts = {}
+
+    def hide(self):
+        if self.shown:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+        self.shown = False
+
+    def _fit(self, family, text, px, maxw):
+        """The biggest font (px down to 9) in which the text fits maxw."""
+        for size in range(int(px), 8, -1):
+            f = self._fonts.get((family, size))
+            if f is None:
+                try:
+                    f = self._fonts[(family, size)] = tkfont.Font(root=self.root, family=family, size=-size, weight="bold")
+                except Exception:
+                    f = self._fonts[(family, size)] = False
+            try:
+                w = f.measure(text) if f else None
+            except Exception:
+                w = None
+            if not isinstance(w, (int, float)):
+                w = len(text) * size * 0.56
+            if w <= maxw:
+                return (family, -size, "bold")
+        return (family, -9, "bold")
+
+    def _otext(self, x, y, text, fnt, fill, anchor="w"):
+        cv = self.cv
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+            cv.create_text(x + dx, y + dy, text=text, font=fnt, fill="#000000", anchor=anchor)
+        cv.create_text(x, y, text=text, font=fnt, fill=fill, anchor=anchor)
+
+    def show(self, x, y, pw, ph, items, collapsed, scroll, s, family):
+        """Draws it with the panel's top-left corner at screen (x, y). Returns the hit boxes
+        [(x0, y0, x1, y1, action, arg)] in screen pixels and the window boxes (what the hook must catch)."""
+        cv, win = self.cv, self.win
+        pw, ph = int(pw), int(ph)
+        bw, bh, gap = int(28 * s), int(32 * s), int(4 * s)
+        if collapsed:
+            W, H, wx, wy, bx, by = bw, bh, int(x - 2 * s), int(y + 10 * s), 0, 0
+        else:
+            W, H, wx, wy, bx, by = pw + gap + bw, ph, int(x), int(y), pw + gap, int(5 * s)
+        cv.delete("all")
+        cv.config(width=W, height=H)
+        win.geometry(f"{W}x{H}+{wx}+{wy}")
+        hits, rects = [], []
+        lw = max(2, int(3 * s))
+        if not collapsed:
+            rh, pad, bt = int(CL_ROW * s), int(CL_PAD * s), int(6 * s)
+            n = len(items)
+            scroll = max(0, min(int(scroll), cl_scroll_max(n, ph, s)))
+            px = int(17 * s)
+            for idx, it in enumerate(items):
+                y0 = pad + idx * rh - scroll
+                if y0 + rh < bt or y0 > ph - bt:
+                    continue
+                cy = y0 + rh // 2
+                done = cl_done(it)
+                col = self.DONE_COL if done else "#ffffff"
+                vy0, vy1 = max(bt, y0), min(ph - bt, y0 + rh)
+                if it["t"] == "check":
+                    sz = int(20 * s)
+                    bx0 = int(22 * s)
+                    cv.create_rectangle(bx0, cy - sz // 2, bx0 + sz, cy + sz // 2, fill="#ffffff" if it["done"] else TAN, outline=BROWN, width=2)
+                    tx = bx0 + sz + int(10 * s)
+                    fnt = self._fit(family, it["name"], 16 * s, pw - tx - int(22 * s))
+                    self._otext(tx, cy, it["name"], fnt, col)
+                    hits.append((wx + bx0 - 4, wy + vy0, wx + pw - int(16 * s), wy + vy1, "check", it["id"]))
+                else:
+                    tx = int(12 * s)
+                    text = cl_text(it)
+                    fnt = self._fit(family, text, 16 * s, pw - tx - int(84 * s))
+                    self._otext(tx, cy, text, fnt, col)
+                    for cx, act, up in ((pw - int(60 * s), "inc", True), (pw - int(34 * s), "dec", False)):
+                        d = int(5 * s)
+                        pts = [cx - d, cy + (d // 2 if up else -d // 2), cx, cy + (-d // 2 if up else d // 2), cx + d, cy + (d // 2 if up else -d // 2)]
+                        cv.create_line(*pts, fill="#000000", width=5)
+                        cv.create_line(*pts, fill="#ffffff", width=3)
+                        hits.append((wx + cx - int(12 * s), wy + vy0, wx + cx + int(12 * s), wy + vy1, act, it["id"]))
+            cv.create_rectangle(0, 0, pw, bt, fill=KEY, outline=KEY)                     # (rows that scrolled out of the frame)
+            cv.create_rectangle(0, ph - bt, pw, ph, fill=KEY, outline=KEY)
+            total = cl_content_h(n, s)
+            if total > ph:
+                th = max(int(22 * s), int((ph - 2 * bt) * ph / total))
+                ty = bt + int((ph - 2 * bt - th) * scroll / max(1, total - ph))
+                cv.create_rectangle(pw - int(12 * s), ty, pw - int(6 * s), ty + th, fill=BROWN, outline="")
+            cv.create_rectangle(1, 1, pw - 1, ph - 1, outline=BROWN, width=lw)
+            cv.create_rectangle(lw + 1, lw + 1, pw - lw - 1, ph - lw - 1, outline=TAN, width=1)
+            rects.append((wx, wy, wx + pw, wy + ph))
+        cv.create_rectangle(bx + 1, by + 1, bx + bw - 1, by + bh - 1, fill=TAN, outline=BROWN, width=lw)
+        mx, my, d = bx + bw // 2, by + bh // 2, max(3, int(5 * s))
+        pts = ([mx - d // 2 - 1, my - d, mx + d // 2 + 2, my, mx - d // 2 - 1, my + d] if collapsed
+               else [mx + d // 2 + 1, my - d, mx - d // 2 - 2, my, mx + d // 2 + 1, my + d])
+        cv.create_line(*pts, fill=BROWN, width=lw)
+        hits.append((wx + bx, wy + by, wx + bx + bw, wy + by + bh, "toggle", None))
+        rects.append((wx + bx, wy + by, wx + bx + bw, wy + by + bh))
+        self._visible()
+        flush_win(win, wx, wy, W, H)
+        self.shown = True
+        return hits, tuple(rects)
+
+
+MASCOT_PNG = "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"
+MASCOT_SCALE = 0.64                      # the idle Scroom is this much of the picture's size on screen
+
+
+def clean_mascot(d):
+    try:
+        return {"x": float(d["x"]), "y": float(d["y"])}
+    except Exception:
+        return None
+
+
+def mascot_default_pos(sw, sh, w, h):
+    """Bottom right corner of the screen, above the task bar."""
+    return (sw - w - 40.0, sh - h - 60.0)
+
+
+class Mascot:
+    """The little Scroom that sits on the screen while the macro window is hidden and the game isn't in front.
+    Drag it anywhere; a click (without dragging) makes it hop and calls on_click (the macro window comes back)."""
+
+    def __init__(self, root, on_click, on_moved):
+        self.root, self.on_click, self.on_moved = root, on_click, on_moved
+        self.win = self.cv = None
+        self.photo = None
+        self.shown = False
+        self.pos = (0.0, 0.0)
+        self._drag = None
+        self.size = (1, 1)
+
+    def _build(self):
+        sprite = Image.open(io.BytesIO(base64.b64decode(MASCOT_PNG))).convert("RGBA")
+        self.size = (max(8, int(round(sprite.width * MASCOT_SCALE))), max(8, int(round(sprite.height * MASCOT_SCALE))))
+        w = self.win = tk.Toplevel(self.root)
+        w.overrideredirect(True)
+        w.configure(bg=KEY)
+        w.attributes("-topmost", True)
+        try:
+            w.attributes("-transparentcolor", KEY)
+        except tk.TclError:
+            pass
+        cv = self.cv = tk.Canvas(w, bg=KEY, highlightthickness=0, bd=0, width=self.size[0], height=self.size[1], cursor="hand2")
+        cv.pack()
+        self.photo = ImageTk.PhotoImage(keyed_image(sprite, *self.size))
+        cv.create_image(0, 0, image=self.photo, anchor="nw")
+        cv.bind("<ButtonPress-1>", self._press)
+        cv.bind("<B1-Motion>", self._motion)
+        cv.bind("<ButtonRelease-1>", self._release)
+
+    def show(self, x, y):
+        if self.win is None:
+            self._build()
+        if not self.shown or (x, y) != self.pos and self._drag is None:
+            self.pos = (x, y)
+            self.win.geometry(f"{self.size[0]}x{self.size[1]}+{int(round(x))}+{int(round(y))}")
+        if not self.shown:
+            try:
+                self.win.deiconify()
+                self.win.attributes("-topmost", True)
+                self.win.lift()
+            except Exception:
+                pass
+        self.shown = True
+
+    def hide(self):
+        if self.shown and self.win is not None:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+        self.shown = False
+        self._drag = None
+
+    def _press(self, e):
+        self._drag = {"x0": e.x_root, "y0": e.y_root, "pos": self.pos, "moved": False}
+
+    def _motion(self, e):
+        d = self._drag
+        if not d:
+            return
+        dx, dy = e.x_root - d["x0"], e.y_root - d["y0"]
+        if abs(dx) + abs(dy) > 4:
+            d["moved"] = True
+        if d["moved"]:
+            self.pos = (d["pos"][0] + dx, d["pos"][1] + dy)
+            self.win.geometry(f"+{int(round(self.pos[0]))}+{int(round(self.pos[1]))}")
+
+    def _release(self, e):
+        d, self._drag = self._drag, None
+        if d is None:
+            return
+        if d["moved"]:
+            self.on_moved(self.pos)                      # (dragged: just stay where it was dropped)
+        else:
+            self.pop()
+
+    def pop(self):
+        """A little hop, then the macro window comes back."""
+        x, y = self.pos
+        steps = (-4, -9, -12, -9, -3)
+
+        def go(i):
+            if i >= len(steps) or self.win is None:
+                self.on_click()
+                return
+            try:
+                self.win.geometry(f"+{int(round(x))}+{int(round(y + steps[i]))}")
+            except Exception:
+                pass
+            self.root.after(22, lambda: go(i + 1))
+        go(0)
+
+
+class PctOverlay(Overlay):
+    """The mana % as a number (white with a dark outline) in one see-through, click-through window."""
+
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.win = self.cv = None
+        self.sig = None
+        self.shown = False
+
+    def show(self, rect, text, family):
+        x, y, w, h = (int(round(v)) for v in rect)
+        w, h = max(8, w), max(8, h)
+        sig = (x, y, w, h, text, family)
+        if self.win is None:
+            self.win, self.cv = self._make()
+        if sig != self.sig:
+            self.sig = sig
+            self.cv.delete("all")
+            self.cv.config(width=w, height=h)
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+            size = max(8, int(min(h * 0.8, w / (0.62 * max(1, len(text))))))
+            fnt = (family, -size, "bold")
+            o = 2 if size >= 16 else 1
+            for dx, dy in ((-o, 0), (o, 0), (0, -o), (0, o), (-o, -o), (o, -o), (-o, o), (o, o)):
+                self.cv.create_text(w // 2 + dx, h // 2 + dy, text=text, font=fnt, fill="#000000")
+            self.cv.create_text(w // 2, h // 2, text=text, font=fnt, fill="#ffffff")
+        if not self.shown or self.win.state() != "normal":
+            self._visible()
+        self.shown = True
+
+    def _visible(self):
+        w = self.win
+        try:
+            if w.state() != "normal":
+                w.deiconify()
+            self._click_through(w)
+            if IS_WIN:
+                h = hwnd_of(w)
+                if not u32.IsWindowVisible(h):
+                    u32.ShowWindow(h, 4)
+            w.attributes("-topmost", True)
+            w.lift()
+        except Exception:
+            pass
+
+    def raise_top(self):
+        if self.shown:
+            self._visible()
+
+    def hide(self):
+        if self.shown and self.win is not None:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+        self.shown = False
+
+
+# ----------------------------------------------------------------------------
+# Input: every key press and click, in order, from Windows low-level hooks
+# ----------------------------------------------------------------------------
+
+# ---- the inventory (the ` key): found on the screen by its orange border; item cards are recognised by their name text ----
+INV_REF_W = 961.0                        # width of the panel (border to border) at 1080p; everything else scales with it
+INV_CARD0, INV_PITCH, INV_CARD = (14.0, 15.0), 70.0, 60.0     # first card's corner, card pitch, card size (at INV_REF_W)
+INV_FRAC = (0.2495, 0.425, 0.7505, 0.926)   # where the panel sits on the screen (fractions) - used when it can't be measured
+INV_HIDE_COINS = ("dash", "pb", "fist", "mana", "jump")   # the coins that hide while the inventory is open
+INV_ITEMS = ("Fire Protection", "Feather Feet")   # the items the macro learns / knows (Settings > Inventory)
+INV_SIG_W, INV_SIG_H = 40, 16
+INV_BUILTIN = {"Fire Protection": "AAAAAAAAAAAAAAAIXZbGrHQ9QEA+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABVp2jlc7KExSZTlEJxEZNjwjBgAAAAAAAAAAAAAAAAAAAAAAAAAAAAJXZXEnGRVSWohXYCguRnN5TyMAAAAAAAAAAAAAAAAAAAAAAAAAAAACV2VxJBYSX2izdH0oSmKPeU8jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAldlcSQWDFldrllVAFVzhGRFNQAAAAAAAAAAAAAAAAAAAAAAAAAAAANKS0gBAAdOVJVRSwQ5VmRRNScAAAAAAAAAAAAAAAAAAAAAAAAAAAADLS4sAQAFMDVbNC4EHTlIUTUnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhARDwEABBIWIRYSBAEPHSscDgAAAAAAAAAAAAAqHA0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYGBgAAAAAAAAAAND8xGQAAAAAAAAAAAAMDAwAAAAAAAAAAAAABAQUYGBQAAAAAAAAAADZeTzkQHh4RChUjHBgqOC8QDhseEQMNGx8cJCUiJyMcDRsbDgMQHScXX19MIC4tEhslRjw6VFVLLC88Py48MT8rIzo0MjAtQC5GQzEeHy02WmtPNC89PBIqNFlOTX1wZUlokZRmdU1bKyRIQzwuKl1KZGFPPC89RFhNMRYvLywBMC9PSEuAWFVVfZmJYZpfXxIMNy4vLy+AXm5oX1MvLytPMhQLOjovAC9LcFxCcm9vVHuzvX5/WXZCJUA8RDg2Z119d1ZAODgtBQMAEkREMgAwaaJ+RmKGiFRimL1+ZFuTf0ROSVpCPE1gmY9SK0JCMA==", "Health Potion": "fW9iDQYZbnBXAgAAAAAAAAAAAAAAAAAAD15eTxAfHxAQZWVVAAAAAG1kWwYDDmNkVgEAABk2Uj8pDSE3VEIvEhJbW2dBbXRPLWZxgkhTQjFdZ3ErKy51Z1UAABxGcYN8dEVCPmRqcUspWVlrX6etbCdga4JIV2NuXWdxKysudWdVAAA5Yo2DfHRFX3CjqbeERllZbW3CxngnYGuCSFmAqF1ncSsrLnVnVQAAVXOCP1V8anJVcYjGqllZWVhYrapVBFlZVQAHXLFUTkgCAQhPT0cAADlWZDlDXE1saYWHqo5OTk5ISI+aVBVPUEkCCVCXNTEsAgEGMTErAAAdOUg5Q1xNUDdGSGVVMDAwKypVYTgTMjMtAggyXRYTEAIBBRMTDgAAAQ8dKysrHBsbJScnHRMTEg4OHCgcEhQVEQIGFSMXISsrKRsNAAAAAAAAAAAAAAAAAAAMGBgMAAAAAAAAAAAAAAAAAAAANj9HKz5JOxkAAAAAAAAAAAADAwMELFRQKAAAAAAAAAAAAAAAAAAAAFVcYytCals2AAAOHCkcDgsVNDgxGUF0bTYADRwpKhsOAxIcJiYpIRhdWVUAL3Z2Rx05SzxASTolGFNVTRtTl45HHS48QFBbOh4vOkMmMUVYXXWOU15wVS45coNZRWlbQxpvcGcYUZSORzlKWUVYgFs8TVdfJjJikl11jlNaTzUSVaqzXilvb1IHXFhVBFmuqlVVXl4pQI9vU1lZVQAKX7RqfZBWRSgNADx4mXljd1o3BFlvcCZitapVPF15Y2eAWkBgZVoFD2S5dmhaBQMAAAAiRYOYr4pSGgFWhotIbLuqVSJgmK+ri1IrZ3FfChtwxQ=="}   # from a 1080p screenshot; Learn replaces it
+INV_MATCH = 0.62
+
+
+def inv_card_find(arr, cx, cy):
+    """inv_card_find1 from the click point, and from a few points around it when that one sits on a letter."""
+    for dx, dy in ((0, 0), (-14, 0), (14, 0), (0, -14), (0, 14), (-14, -14), (14, 14), (-14, 14), (14, -14)):
+        bx = inv_card_find1(arr, cx + dx, cy + dy)
+        if bx:
+            return bx
+    return None
+
+
+def inv_card_find1(arr, cx, cy):
+    """The item card under (cx, cy) inside the RGB array (a screen grab around the click): the card's flat light-grey face is
+    followed outwards from the click. Returns (x0, y0, x1, y1) in array pixels, or None. Works at any screen size / panel
+    size, and for the highlighted (equipped, whiter) card too."""
+    full = np.asarray(arr)
+    if not (0 <= cx < full.shape[1] and 0 <= cy < full.shape[0]):
+        return None
+    wx, wy = max(0, cx - 100), max(0, cy - 100)                   # (only a window around the point is looked at: fast on a big grab)
+    if wx or wy or full.shape[1] > 201 or full.shape[0] > 201:
+        box = inv_card_find1(full[wy:cy + 101, wx:cx + 101], cx - wx, cy - wy) if (full.shape[1] > 201 or full.shape[0] > 201) else None
+        return None if box is None else (box[0] + wx, box[1] + wy, box[2] + wx, box[3] + wy)
+    a = full[..., :3].astype(int)
+    H, W = a.shape[:2]
+    lum, sat = a.mean(axis=2), a.max(axis=2) - a.min(axis=2)
+    r = 14
+    ys, xs = slice(max(0, cy - r), cy + r + 1), slice(max(0, cx - r), cx + r + 1)
+    cand = (lum[ys, xs] > 185) & (sat[ys, xs] < 45)
+    if cand.sum() < 40:
+        return None
+    face = np.median(a[ys, xs][cand], axis=0)
+    m = np.abs(a - face).max(axis=2) <= 10
+
+    def run(line, i, step):
+        gap, last = 0, i
+        j = i
+        while 0 <= j < len(line):
+            if line[j]:
+                gap, last = 0, j
+            else:
+                gap += 1
+                if gap > 9:
+                    break
+            j += step
+        return last
+    # start from a face pixel near the click (the click may be on a letter)
+    yy, xx = np.nonzero(m[ys, xs])
+    k = int(np.argmin((yy + ys.start - cy) ** 2 + (xx + xs.start - cx) ** 2))
+    py, px = int(yy[k] + ys.start), int(xx[k] + xs.start)
+    x0, x1 = run(m[py], px, -1), run(m[py], px, 1)
+    qx = int(x0 + (x1 - x0) * 0.12)                          # (follow the edges along the card's text-free sides, so the box doesn't
+    y0, y1 = run(m[:, qx], py, -1), run(m[:, qx], py, 1)     #  depend on where the click was: letters, the stack badge)
+    qy = int(y0 + (y1 - y0) * 0.1)
+    x0, x1 = run(m[qy], qx, -1), run(m[qy], qx, 1)
+    qx = int(x0 + (x1 - x0) * 0.12)
+    y0, y1 = run(m[:, qx], qy, -1), run(m[:, qx], qy, 1)
+    w, h = x1 - x0 + 1, y1 - y0 + 1
+    if not (24 <= w <= 160 and 24 <= h <= 160 and 0.7 <= w / h <= 1.45):
+        return None
+    return x0, y0, x1 + 1, y1 + 1
+
+
+def inv_lifted_card(arr, cx, cy, reach=45):
+    """The card the game just lifted / highlighted (bright, near the click) in the RGB grab, as a box - or None. Clicking a card
+    lifts it for a moment and the cards next to it slide over, so the card under the cursor can already be the wrong one."""
+    a = np.asarray(arr)[..., :3].astype(int)
+    lum, sat = a.mean(axis=2), a.max(axis=2) - a.min(axis=2)
+    ys, xs = np.nonzero((lum >= 238) & (sat < 32))
+    if len(ys) < 120:
+        return None
+    d = (ys - cy) ** 2 + (xs - cx) ** 2
+    k = int(np.argmin(d))
+    if d[k] > reach * reach:
+        return None
+    return inv_card_find(a, int(xs[k]), int(ys[k]))
+
+
+def inv_card_sig(rgb):
+    """A card's name text as a small 'ink' picture (flattened float array): the same for the same item on any card
+    position, and (roughly) at any screen size. rgb = the card's flat face (see inv_card_find); the stack badge is left out."""
+    a = np.asarray(rgb)[..., :3].astype(float).mean(axis=2)
+    h, w = a.shape
+    a = a[int(h * 0.06):int(h * 0.86), int(w * 0.03):int(w * 0.97)]
+    bg = float(np.percentile(a, 75))
+    ink = np.clip((bg - a) / max(40.0, bg - float(a.min())) * 1.6 - 0.25, 0.0, 1.0)     # (relative to the card's own contrast: the equipped card is brighter)
+    ys, xs = np.nonzero(ink > 0.3)
+    if len(ys) >= 4:                                         # cut to the text itself: its position / the card size don't matter
+        ink = ink[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+    img = Image.fromarray((ink * 255).astype(np.uint8)).resize((INV_SIG_W, INV_SIG_H), Image.BOX).filter(ImageFilter.BoxBlur(1))
+    return np.asarray(img, dtype=float).ravel() / 255.0
+
+
+HP_BAR_FRAC = (0.40, 0.86, 0.60, 0.93)       # where the HP bar (and the little bars under it) sit in the middle of the screen (fractions)
+HP_FRAME = (230, 171, 113)                   # the light frame lines of the HP bar
+HP_DARK = (66, 53, 41)                       # its dark outline
+
+
+BLOODLINE_PASSIVE_HP = 0.20                  # Bloodline's passive starts below this HP...
+BLOODLINE_PASSIVE_SECS = 40.0                # ...and lasts this long
+HP_LOW_FRAC = 0.05                           # Bloodline works only while the HP bar is filled less than this much
+HP_FILL_AREA = (0.20, 0.68, 0.80, 0.97)      # a wide look (fractions of the screen) that has the whole HP bar in it
+
+
+def hp_fill_fraction(rgb):
+    """rgb = a wide grab of the screen's lower middle (HP_FILL_AREA). How full the HP bar is (0.0 - 1.0): the red part of the bar
+    against the bar's empty (dark purple-grey) part, found by colour in the long horizontal strip they make together.
+    None when no bar is found (the grass, menus ...)."""
+    a = np.asarray(rgb)[..., :3].astype(np.int16)
+    H, W = a.shape[:2]
+    if H < 8 or W < 80:
+        return None
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    red = (r >= 140) & (g <= 95) & (b <= 85) & (r - g >= 90)
+    emp = (r >= 50) & (r <= 110) & (r - g >= 8) & (r - g <= 32) & (b - g >= 2) & (b - g <= 18)
+    m = red | emp
+    m = m | np.roll(m, 1, axis=1) | np.roll(m, -1, axis=1) | np.roll(m, 2, axis=1) | np.roll(m, -2, axis=1)   # (the thin edge between red and empty)
+    cand = []                                                   # (start, end, red share) of the long strips, row by row
+    for y in range(H):
+        row = m[y]
+        if row.sum() < 0.12 * W:
+            continue
+        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
+        st, en = np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]
+        i = int(np.argmax(en - st))
+        if en[i] - st[i] >= 0.12 * W:
+            seg = slice(int(st[i]), int(en[i]))
+            nr, ne = int(red[y, seg].sum()), int(emp[y, seg].sum())
+            if nr + ne >= 0.7 * (en[i] - st[i]):
+                cand.append((int(st[i]), int(en[i]), nr / float(max(1, nr + ne)), y))
+    best = []                                                   # the bar is a straight strip: many rows that start and end together
+    for c0 in cand:
+        grp = [c for c in cand if abs(c[0] - c0[0]) <= 3 and abs(c[1] - c0[1]) <= 3]
+        if len(grp) > len(best):
+            best = grp
+    if len(best) < 6:
+        return None
+    # only the bar counts: its light frame must run along the strip's top and bottom edge (the same colours on iron bars, lamps,
+    # scenery ... without that frame are NOT the HP bar; a hidden frame = no reading)
+    tan = (r >= 170) & (r <= 245) & (g >= 120) & (g <= 190) & (b >= 70) & (b <= 135) & (r - g >= 35) & (r - g <= 80) & (g - b >= 30)
+    lo, hi = int(np.median([c[0] for c in best])), int(np.median([c[1] for c in best]))
+    y0, y1 = min(c[3] for c in best), max(c[3] for c in best)
+    wid = max(1, hi - lo)
+
+    def edge(rows):
+        return any(0 <= yy < H and tan[yy, lo:hi].sum() >= 0.6 * wid for yy in rows)
+    if not (edge(range(y0 - 8, y0)) and edge(range(y1 + 1, y1 + 9))):
+        return None
+    fr = sorted(c[2] for c in best)
+    return fr[len(fr) // 2]
+
+
+ERROR_METER_AREA = (0.0, 0.03, 0.45, 0.18)   # where the Songs' Error Meter appears (top left; fractions of the screen) - looked at as a wide area
+SONG_FAIL_FRAC = 0.03                        # the meter counts as empty (Song Fail) at or below this
+
+
+def error_meter_read(rgb, sh=1080.0):
+    """rgb = the screen's top-left area (ERROR_METER_AREA), sh = the screen height in pixels. None when the Error Meter isn't there:
+    it must have its tan frame (long straight lines along the top and bottom edge, the same colour as the HP bar's frame) - scenery
+    never does. Otherwise how full the bar still is (0.0 - 1.0): only the light fill is counted (the empty part is see-through and
+    shows the game behind it)."""
+    a = np.asarray(rgb)[..., :3].astype(np.int16)
+    H, W = a.shape[:2]
+    s = max(0.4, sh / 1080.0)
+    if H < 20 or W < 100:
+        return None
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    tan = (r >= 180) & (r <= 240) & (g >= 135) & (g <= 195) & (b >= 90) & (b <= 160) & (r - g >= 12) & (r - g <= 70) & (g - b >= 12) & (g - b <= 65)
+    minrun = 0.15 * (W / 0.45)
+    lines = []                                                   # (y, start, end) of the long tan lines
+    for y in range(H):
+        row = tan[y]
+        if row.sum() < minrun:
+            continue
+        d = np.diff(np.concatenate(([0], row.astype(np.int8), [0])))
+        st, en = np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]
+        i = int(np.argmax(en - st))
+        if en[i] - st[i] >= minrun:
+            lines.append((y, int(st[i]), int(en[i])))
+    for i, (ya, sa, ea) in enumerate(lines):
+        for yb, sb, eb in lines[i + 1:]:
+            if not (30 * s <= yb - ya <= 60 * s) or abs(sa - sb) > 8 * s or abs(ea - eb) > 8 * s:
+                continue
+            il, ir = int(max(sa, sb) + 8 * s), int(min(ea, eb) - 6 * s)
+            y0, y1 = int(ya + 4 * s), int(yb - 4 * s)
+            if ir - il < 50 or y1 - y0 < 8:
+                continue
+            inner = a[y0:y1, il:ir]
+            ir_, ig_, ib_ = inner[..., 0], inner[..., 1], inner[..., 2]
+            fill = (np.minimum(np.minimum(ir_, ig_), ib_) >= 205) & ((np.maximum(np.maximum(ir_, ig_), ib_) - np.minimum(np.minimum(ir_, ig_), ib_)) <= 24)
+            col = fill.mean(axis=0) >= 0.35                      # (the title text covers some rows of its columns)
+            end, gap = -1, 0
+            for x in range(len(col)):                            # the fill runs from the left; small gaps don't end it
+                if col[x]:
+                    end, gap = x, 0
+                else:
+                    gap += 1
+                    if gap > 6 * s and end >= 0:
+                        break
+                    if end < 0 and gap > 6 * s:
+                        break
+            return max(0.0, min(1.0, (end + 1) / float(len(col)))) if end >= 0 else 0.0
+    return None
+
+
+def hp_bar_visible(rgb):
+    """rgb = the HP bar area of a screenshot (HP_BAR_FRAC). True when the bar's FRAME is there: two long, straight, light
+    frame lines about a bar apart (top and bottom edge) with the dark outline right inside them. Grass or other scenery
+    can be the same red as the bar, but it never has these exact straight lines. (The game hides the whole bar while the
+    inventory is open.) The red fill, the numbers and the small bars don't matter."""
+    a = rgb.astype(np.int16)
+    H, W = a.shape[:2]
+    if H < 8 or W < 40:
+        return False
+    sh = H / (HP_BAR_FRAC[3] - HP_BAR_FRAC[1])                      # (screen height)
+
+    def rows(col, tol):
+        return (np.abs(a - np.array(col, dtype=np.int16)).sum(axis=2) <= tol).mean(axis=1) >= 0.8
+    light, dark = rows(HP_FRAME, 40), rows(HP_DARK, 30)
+    lines = []                                                        # centres of the groups of frame-line rows
+    for y0, y1 in _runs(light, 1):
+        if y1 - y0 + 1 <= 0.012 * sh:
+            lines.append((y0 + y1) / 2.0)
+    for i, ya in enumerate(lines):
+        for yb in lines[i + 1:]:
+            if 0.018 * sh <= yb - ya <= 0.045 * sh:
+                lo, hi = int(ya), int(yb) + 1
+                if dark[lo:hi + 1].sum() >= 2:                        # the dark outline sits between / next to the two lines
+                    return True
+    return False
+
+
+def inv_scan_cards(arr, ox, oy, templates, cells_out=None):
+    """Look at an RGB grab of the open inventory (ox, oy = its corner on the screen). Returns (items, n): n = how many light-grey
+    cards were seen (0 = this is not an inventory), items = [(name, (x0, y0, x1, y1), bright)] in screen pixels for every card that
+    matches a learned / built-in item picture; bright = that card is highlighted (the item is equipped).
+    cells_out (a list) also gets EVERY card seen as (rect, name or None): the game's own cursor (it is on the screen grab) hides the
+    text of the card under it, so the caller remembers which card is which."""
+    a = np.asarray(arr)[..., :3]
+    H, W = a.shape[:2]
+    first = None
+    for d in range(4, min(110, H, W), 2):                   # walk inwards from the panel's corner to the first card
+        bx = inv_card_find(a, d, d)
+        if bx:
+            first = bx
+            break
+    if first is None:
+        return [], 0
+    x0, y0, x1, y1 = first
+    w, h = x1 - x0, y1 - y0
+    ai = a.astype(int)
+    face = np.median(ai[y0 + h // 4:y1 - h // 4, x0 + 3:x0 + 9].reshape(-1, 3), axis=0)
+    row = np.abs(ai[y0 + h // 2] - face).max(axis=1) <= 10
+    nxt = [i for i in range(x1 + 3, min(W, x1 + w)) if row[i] and not row[i - 1]]      # where the next card's face starts
+    px = (nxt[0] - x0) if nxt else int(round(w * 70 / 54))
+    px = max(w + 3, px)
+    out, n, found = [], 0, []
+    y = y0
+    while y + h <= H:
+        x = x0
+        while x + w <= W:
+            q = a[y + 4:y + h - 4:3, x + 4:x + w - 4:3].astype(int)       # (a quick look first: is this cell a light grey card at all?)
+            fb = (inv_card_find(a, x + w // 2, y + h // 2) if (np.percentile(q.mean(axis=2), 70) > 185 and float((q.max(axis=2) - q.min(axis=2)).mean()) < 45)
+                  else None)                                          # (the equipped card is a bit bigger and brighter: measure each one)
+            if fb:
+                n += 1
+                cell = a[fb[1]:fb[3], fb[0]:fb[2]]
+                nm, sc = inv_match2(inv_card_sig(cell), templates)
+                found.append([(ox + fb[0], oy + fb[1], ox + fb[2], oy + fb[3]), nm, sc, bool(np.median(cell.astype(float).mean(axis=2)) >= 232)])
+            x += px
+        y += px
+    # one item = one card: when two cards look alike (Celeritas / Galvanize) and both match the same learned picture, only the
+    # better match is that item (the other one is something else)
+    best_for = {}
+    for i, f in enumerate(found):
+        if f[1] and (f[1] not in best_for or f[2] > found[best_for[f[1]]][2]):
+            best_for[f[1]] = i
+    for i, f in enumerate(found):
+        if f[1] and best_for[f[1]] != i:
+            f[1] = None
+    for rect, nm, _sc, bright in found:
+        if cells_out is not None:
+            cells_out.append((rect, nm))
+        if nm:
+            out.append((nm, rect, bright))
+    return out, n
+
+
+def inv_scan_items(arr, ox, oy, templates):
+    """[(name, rect)] of the known items on the open inventory's cards (see inv_scan_cards)."""
+    return [(nm, rc) for nm, rc, _b in inv_scan_cards(arr, ox, oy, templates)[0]]
+
+
+def thumb_pack(rgb, max_px=64):
+    """A small PNG (base64) of a screen crop (numpy RGB)."""
+    im = Image.fromarray(np.ascontiguousarray(rgb[..., :3]).astype(np.uint8), "RGB")
+    sc = max_px / float(max(im.size))
+    if sc < 1:
+        im = im.resize((max(1, int(im.size[0] * sc)), max(1, int(im.size[1] * sc))), Image.LANCZOS)
+    b = io.BytesIO()
+    im.save(b, "PNG", optimize=True)
+    return base64.b64encode(b.getvalue()).decode("ascii")
+
+
+def inv_sig_pack(sig):
+    return base64.b64encode(bytes(np.clip(np.asarray(sig) * 255, 0, 255).astype(np.uint8))).decode("ascii")
+
+
+def inv_sig_unpack(txt):
+    try:
+        v = np.frombuffer(base64.b64decode(txt), dtype=np.uint8).astype(float) / 255.0
+        return v if v.size == INV_SIG_W * INV_SIG_H else None
+    except Exception:
+        return None
+
+
+def inv_match(sig, templates):
+    """The name of the best matching learned picture (correlation >= INV_MATCH) or None."""
+    return inv_match2(sig, templates)[0]
+
+
+def inv_match2(sig, templates):
+    """(name, correlation) of the best matching learned picture (correlation >= INV_MATCH), else (None, 0)."""
+    if sig is None or sig.sum() < 2.0:
+        return None, 0.0
+    best, name = INV_MATCH, None
+    sa = sig - sig.mean()
+    for nm, t in templates.items():
+        if t is None or t.size != sig.size:
+            continue
+        ta = t - t.mean()
+        d = float(np.sqrt((sa * sa).sum() * (ta * ta).sum()))
+        c = float((sa * ta).sum() / d) if d > 1e-9 else 0.0
+        if c >= best:
+            best, name = c, nm.split("\0")[0]
+    return name, (best if name else 0.0)
+
+
+class InvBoxOverlay:
+    """Thin green outlines around the inventory items the macro recognised (click-through; a click inside one = equipping it)."""
+
+    def __init__(self, root, log):
+        self.root, self.log, self.shown, self._sig = root, log, False, None
+        w = tk.Toplevel(root)
+        w.overrideredirect(True)
+        w.configure(bg=KEY)
+        w.attributes("-topmost", True)
+        try:
+            w.attributes("-transparentcolor", KEY)
+        except tk.TclError:
+            pass
+        cv = tk.Canvas(w, bg=KEY, highlightthickness=0, bd=0)
+        cv.pack()
+        w.geometry("1x1+0+0")
+        w.update()
+        if IS_WIN:
+            try:
+                make_click_through(hwnd_of(w))
+            except Exception as ex:
+                log(f"Couldn't make the item boxes click-through: {ex}")
+        w.withdraw()
+        self.w, self.cv = w, cv
+
+    def sync(self, boxes, color="#46e060", width=2, opacity=1.0):
+        """boxes = [(name, (x0, y0, x1, y1)[, text, colour])] (screen pixels); [] hides it."""
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(color).strip()):
+            color = "#46e060"
+        color = str(color).strip()
+        try:
+            width = int(min(12, max(1, int(float(width)))))
+        except (TypeError, ValueError):
+            width = 2
+        try:
+            opacity = min(1.0, max(0.1, float(opacity)))
+        except (TypeError, ValueError):
+            opacity = 1.0
+        boxes = [(b[0], b[1], b[2] if len(b) > 2 else "", b[3] if len(b) > 3 else "") for b in boxes]
+        sig = (tuple(boxes), color, width, opacity)
+        if sig == self._sig:
+            return
+        self._sig = sig
+        if not boxes:
+            if self.shown:
+                self.w.withdraw()
+                self.shown = False
+            return
+        pad = 10 + width
+        wx, wy = min(b[1][0] for b in boxes) - pad, min(b[1][1] for b in boxes) - pad
+        W, H = max(b[1][2] for b in boxes) + pad - wx, max(b[1][3] for b in boxes) + pad - wy
+        self.cv.delete("all")
+        self.cv.config(width=W, height=H)
+        self.w.geometry(f"{W}x{H}+{wx}+{wy}")
+        for nm, (x0, y0, x1, y1), _txt, col in boxes:
+            o = 4 + width // 2 + (width % 2)                   # (drawn OUTSIDE the card: the screen grabs of the scan see this window too)
+            self.cv.create_rectangle(x0 - wx - o, y0 - wy - o, x1 - wx + o, y1 - wy + o,
+                                     outline=col if re.fullmatch(r"#[0-9a-fA-F]{6}", str(col)) else color, width=width)
+        try:
+            self.w.attributes("-alpha", opacity)
+        except tk.TclError:
+            pass
+        if not self.shown:
+            self.w.deiconify()
+            self.shown = True
+        try:
+            self.w.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+
+class InputWatcher(threading.Thread):
+    """The hooks only drop (kind, name, time, point) into a queue (so they return instantly and Windows
+    never drops them); this thread then handles the events one by one, in the order they happened.
+    A low-level hook sees EVERY event, including the instant down+up taps another program (your
+    AutoHotkey script) sends, which polling the keyboard every few milliseconds can miss."""
+
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.quit = threading.Event()
+        self.capture_cb = None                  # set while the user is picking a move's key
+        self.events = queue.SimpleQueue()
+        self.mode = "starting"
+        self.hook_tid = None
+        self._down = {}
+        self._title, self._title_t = "", 0.0
+        self._next = lambda n, w, l: 0          # replaced by CallNextHookEx on Windows
+        self._procs = ()
+        self._imenu_held = False
+        self._cl_swallow = set()                 # mouse-up messages still to be swallowed (the click started on the checklist)
+
+    # ----- hook side (must be fast) -----
+    def _kb(self, n_code, w_param, l_param):
+        try:
+            if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
+                info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                is_down = w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                if info.dwExtraInfo != TRAIN_TAG:
+                    if is_down and (info.vkCode in (0xBF, 0x6F) or info.scanCode == 0x35) and getattr(self.app, "chat_open", False) is not True:
+                        self.app.chat_open = True                       # "/" = the Roblox chat opens: no keybind works until Enter / Esc / a click
+                    elif is_down and info.vkCode in (0x0D, 0x1B):
+                        self.app.chat_open = False
+                    if info.scanCode in getattr(self.app, "imenu_scans", ()):
+                        if is_down and not self._imenu_held and getattr(self.app, "chat_open", False) is not True:
+                            self._imenu_held = True
+                            self.app.q.put(("imenu",))                  # (a key press = one Instant Menu, whatever other keys are held)
+                        elif not is_down:
+                            self._imenu_held = False
+                    if getattr(self.app, "chat_open", False) is True:
+                        return self._next(n_code, w_param, l_param)    # (chat: nothing else is looked at)
+                if (w_param in (WM_KEYDOWN, WM_SYSKEYDOWN) and info.dwExtraInfo != TRAIN_TAG
+                        and info.scanCode in getattr(self.app, "train_scans", ())):
+                    self.app.on_train_key()          # start / stop key: acted on IMMEDIATELY, before anything else
+                name = VK_NAME.get(info.vkCode) or LETTER_VK.get(info.vkCode) or ("inv" if info.vkCode == 0xC0 else None)
+                if name is not None and info.dwExtraInfo != TRAIN_TAG:         # (Snap Training's own keys are ignored)
+                    kind = "down" if w_param in (WM_KEYDOWN, WM_SYSKEYDOWN) else "up"
+                    self.events.put((kind, name, time.time(), None))
+        except Exception:
+            pass
+        return self._next(n_code, w_param, l_param)
+
+    def _ms(self, n_code, w_param, l_param):
+        try:
+            if n_code >= 0 and w_param in (WM_LBUTTONUP, WM_RBUTTONUP) and w_param in self._cl_swallow:
+                self._cl_swallow.discard(w_param)                # (the button that went down on the checklist doesn't come up in the game)
+                return 1
+            rects = tuple(getattr(self.app, "cl_rects", ())) + tuple(getattr(self.app, "kda_rects", ()))
+            if n_code >= 0 and rects and w_param in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MOUSEWHEEL):
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                x, y = info.pt.x, info.pt.y
+                if any(a <= x < c and b <= y < d for a, b, c, d in rects):        # on the on-screen checklist: it takes the click / wheel, the game doesn't
+                    if w_param == WM_MOUSEWHEEL:
+                        self.app.q.put(("cl_wheel", ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value))
+                    else:
+                        self._cl_swallow.add(WM_LBUTTONUP if w_param == WM_LBUTTONDOWN else WM_RBUTTONUP)
+                        self.app.q.put(("cl_click" if w_param == WM_LBUTTONDOWN else "cl_rclick", x, y))
+                    return 1
+            if n_code >= 0 and w_param in (WM_LBUTTONDOWN, WM_RBUTTONDOWN):
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if getattr(self.app, "chat_open", False) is True and info.dwExtraInfo != TRAIN_TAG:
+                    self.app.chat_open = False                                # a click closes the chat box
+                button = "left" if w_param == WM_LBUTTONDOWN else "right"
+                if info.dwExtraInfo != TRAIN_TAG:                              # (Snap Training's own click is ignored)
+                    self.events.put(("click", button, time.time(), (info.pt.x, info.pt.y)))
+        except Exception:
+            pass
+        return self._next(n_code, w_param, l_param)
+
+    def _hook_thread(self):
+        self._next = lambda n, w, l: u32.CallNextHookEx(None, n, w, l)
+        kb, ms = HOOKPROC(self._kb), HOOKPROC(self._ms)
+        self._procs = (kb, ms)                                  # keep them alive
+        hmod = k32.GetModuleHandleW(None)
+        h_kb = u32.SetWindowsHookExW(WH_KEYBOARD_LL, kb, hmod, 0)
+        h_ms = u32.SetWindowsHookExW(WH_MOUSE_LL, ms, hmod, 0)
+        if not h_kb or not h_ms:
+            for h in (h_kb, h_ms):
+                if h:
+                    u32.UnhookWindowsHookEx(h)
+            self.app.q.put(("msg", "Couldn't install the input hooks - using the slower fallback. "
+                                   "Run as administrator."))
+            self.app.q.put(("hooks_failed",))
+            self._poll_fallback()
+            return
+        self.hook_tid = k32.GetCurrentThreadId()
+        self.mode = "hook"
+        self.app.q.put(("msg", "Input hooks active: every key press and click is caught, even very fast ones."))
+        msg = wintypes.MSG()
+        while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:      # the hooks run inside this call
+            pass
+        u32.UnhookWindowsHookEx(h_kb)
+        u32.UnhookWindowsHookEx(h_ms)
+
+    def _poll_fallback(self):
+        """Only used if the hooks can't be installed: poll every 2 ms, also catching taps shorter than that."""
+        self.mode = "poll"
+        watch = [(vk, n) for vk, n in list(VK_NAME.items()) + list(LETTER_VK.items()) + [(0xC0, "inv")]] + [(VK_LBUTTON, "left"), (VK_RBUTTON, "right")]
+        prev = {}
+        while not self.quit.is_set():
+            for vk, name in watch:
+                s = u32.GetAsyncKeyState(vk)
+                d, tapped = bool(s & 0x8000), bool(s & 1)
+                was = prev.get(vk, False)
+                prev[vk] = d
+                if (d and not was) or (tapped and not was):
+                    t = time.time()
+                    if name in ("left", "right"):
+                        self.events.put(("click", name, t, cursor_pos()))
+                    else:
+                        self.events.put(("down", name, t, None))
+                if name not in ("left", "right") and was and not d:
+                    self.events.put(("up", name, time.time(), None))
+            time.sleep(0.002)
+
+    def stop(self):
+        self.quit.set()
+        if IS_WIN and self.hook_tid:
+            u32.PostThreadMessageW(self.hook_tid, WM_QUIT, 0, 0)
+
+    # ----- worker side -----
+    def game_active(self):
+        S = self.app.cfg["settings"]
+        if not S["only_in_game"]:
+            return True
+        want = str(S["game_title"]).strip().lower()
+        if not want:
+            return True
+        now = time.time()
+        if now - self._title_t > 0.1:                         # asking Windows 100x a second is pointless
+            self._title, self._title_t = foreground_title().lower(), now
+        return want in self._title
+
+    def slot_at(self, pt):
+        """The hotbar key of the slot under the click (None = not on the hotbar)."""
+        x, y = pt if pt else cursor_pos()
+        for key, (rx, ry, rw, rh) in zip(HOTBAR_KEYS, slot_rects(self.app.cfg["bar"])):
+            if rx <= x < rx + rw and ry <= y < ry + rh:
+                return key
+        return None
+
+    def over_window(self, pt):
+        r = self.app.win_rect
+        if not r:
+            return False
+        x, y = pt if pt else cursor_pos()
+        return r[0] <= x < r[0] + r[2] and r[1] <= y < r[1] + r[3]
+
+    def process(self, kind, name, t, pt):
+        T = self.app.tracker
+        if kind == "up":
+            self._down.pop(name, None)
+            if name == "g":
+                self.app.g_t = t                                    # (a G tap or hold just ended: the mana dash failsafe)
+            return
+        if name == "inv":                                   # the ` key: opens / closes the inventory
+            if kind == "down" and not (name in self._down and t - self._down[name] < 2.0):
+                getattr(self.app, "inv_key", lambda _t: None)(t)
+            self._down[name] = t
+            return
+        if name in LETTER_VK.values():                      # letters: only the Dash / PB keys matter (never the hotbar logic)
+            repeat = name in self._down and t - self._down[name] < 2.0 if kind == "down" else True
+            if kind == "down":
+                self._down[name] = t
+            cb = self.capture_cb
+            if cb is not None and name != "space":          # (the key picker is offered every key, as before - Space was never one)
+                if not repeat and cb(name):
+                    self.capture_cb = None
+                return
+            if not repeat and self.game_active():
+                self.app.dash_press(name, t)
+            return
+        if kind == "down":
+            # key still held = auto-repeat, not a new press. (_down remembers the latest down event, so a
+            # long hold stays "held"; the 2 s limit only protects against a lost key-up.)
+            repeat = name in self._down and t - self._down[name] < 2.0
+            self._down[name] = t
+            cb = self.capture_cb
+            if cb is not None:                                              # the key picker comes first
+                if not repeat and cb(name):
+                    self.capture_cb = None
+                return
+            if repeat or name == "esc" or not T.on or not self.game_active():
+                return
+            T.press(name, t)
+        elif kind == "click":
+            if getattr(self.app, "brew_pick_click", None) and self.app.brew_pick_click(name, t, pt, self.over_window(pt)):
+                return                                      # picking the Cauldron / Spoon spot for the Potion Brewer
+            if not T.on or not self.game_active() or self.over_window(pt):
+                return
+            if getattr(self.app, "inv_click", None) and self.app.inv_click(name, t, pt):         # a click inside the open inventory (item equip / learn): not a move click
+                return
+            if name == "left" and self.app.cfg["settings"].get("click_equip", True):
+                key = self.slot_at(pt)
+                if key:                                 # a click on a hotbar slot = equipping that move (like its key); not a move click
+                    T.press(key, t)
+                    return
+            if name == "right" and T.armed_key(t) is None:
+                self.app.fist_press(t, pt)            # a right click with nothing armed = Fist M2
+            runes = None
+            if name == "right":
+                ak = T.armed_key(t)
+                mv_ = T.move_for(ak) if ak else None
+                if mv_ and mv_.get("soul"):         # Soul Berserk needs a rune: look at the counter BEFORE the game updates it
+                    runes = self.app.read_runes()
+            msg = T.click(t, name, runes)           # name is 'left' or 'right'
+            if msg:
+                self.app.q.put(("msg", msg))
+
+    def run(self):
+        if not IS_WIN:
+            self.app.q.put(("msg", "Key / click watching needs Windows."))
+            return
+        threading.Thread(target=self._hook_thread, daemon=True).start()
+        while not self.quit.is_set():
+            try:
+                ev = self.events.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self.process(*ev)
+            except Exception:
+                self.app.q.put(("msg", "Input error: " + traceback.format_exc().splitlines()[-1]))
+
+
+# ----------------------------------------------------------------------------
+# GUI (Scroom skin)
+# ----------------------------------------------------------------------------
+UI_FONT_PX = 12          # text size in pixels - try 11-13 once Manufaktur is installed
+UI_FONT_FAMILY = None    # None = use Manufaktur if it can be found, else Segoe UI
+
+# palette sampled straight from the mockup
+PARCH, GREYT, BROWN = "#d7cbbf", "#b1a79d", "#423529"
+TAN, TAN_HI, TAN_DN = "#d8bca1", "#e8d2bb", "#c4a688"
+ORANGE, CREAM = "#e8ad72", "#ffdda2"
+OKGREEN, DIM = "#4f8a2b", "#8d8379"
+GREEN_BOX = "#a3d484"                      # M2 box: M1 and M2 DON'T share; name box: the move unequips after use
+
+WIN_W, WIN_H = ART.BG_SIZE                 # 387 x 1034
+PAGE_X, PAGE_Y, PAGE_W, PAGE_H = 37, 247, 313, 565      # page area inside the frame
+BODY_RECT = (10, 56, 377, 906)             # solid part of the window (x, y, w, h): clicks here are not game clicks
+# (key, label, x0, x1) - the four tabs on the dark strip, y 213..236
+TABS_X0, TABS_X1, TABS_GAP = 38, 348, 4
+TABS = (("main", "Main"), ("mana", "Mana Overlay"), ("extras", "Extras"), ("settings", "Settings"),
+        ("cred", "Credit"))
+
+
+def tab_layout(widths, grow=None):
+    """Text widths -> (x0, x1) of each tab so all of them fit on the strip (shrunk evenly if they don't).
+    When there is room left over it goes to tab number `grow`, so the tabs always reach the end of the strip."""
+    pads = [w + 8 for w in widths]
+    room = TABS_X1 - TABS_X0 - TABS_GAP * (len(pads) - 1)
+    k = min(1.0, room / float(sum(pads)))
+    if grow is not None and k >= 1.0:
+        pads[grow] += room - sum(pads)
+    out, x = [], float(TABS_X0)
+    for w in pads:
+        out.append((int(round(x)), int(round(x + w * k))))
+        x += w * k + TABS_GAP
+    return out
+
+SETTINGS_TIPS = (
+    "Only count keys / clicks in the game window: the cooldown only starts while the active window's "
+    "title contains the text below (Roblox). Turn it off if the game window has another name.\n\n"
+    "Armed timeout: if you press a move key and don't click within this many seconds (30 by default), it forgets "
+    "the key (0 = never).\n\n"
+    "Pressing the armed key again un-arms it (on by default): press 1 = armed, press 1 again = not "
+    "armed. Turn it off if pressing a selected move again does NOT un-select it in the game.\n\n"
+    "Updates: type the web folder the new versions are published in (an https link). 'Check for "
+    "updates' compares your version with its version.txt; 'Update now' downloads the new file, checks "
+    "it, keeps the old script as CooldownIndicator.py.bak and tells you to restart. Nothing is "
+    "installed without your click. Your settings, profiles and pictures are not touched.\n\n"
+    "Click grace: a click this many seconds before the timer ends already counts as ready (covers "
+    "small timing differences).\n\n"
+    "Box padding: the red box covers the light part of the slot exactly. The default 1 makes it "
+    "reach the slot's border; type 2 for more, 0 for the exact size, or -1 to make it smaller."
+)
+
+CREDITS_TEXT = (
+    "Cooldown Indicator\n\n"
+    "Ideas from yo1 (Hate Ebk goat abyss) on YouTube, rebuilt from scratch.\n\n"
+    "Rogue Lineage Icons/art from the Rogue Discord, CD Coins Icons are from Deepwoken, Buffs Icon are from Maple Story, Potions Duration are from Minecrafts the Manufaktur font belong to their original creators.\n\n"
+    "Made by Kiwi (.pvibe_ on discord) haseldansmile gorpigsmile gorpig gorpigsmile steamhappy"
+    "Grimmkind please update rogue"
+)
+
+
+def _img(b64):
+    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+
+
+def tint_green(im):
+    """Red mushroom -> pale green mushroom (same art, hue swapped). Outline and white spots stay."""
+    im = im.convert("RGBA")
+    a = im.split()[3]
+    hsv = np.array(im.convert("RGB").convert("HSV")).astype(np.float32)
+    m = hsv[..., 1] > 90
+    hsv[..., 0][m] = 80
+    hsv[..., 1][m] *= 0.6
+    hsv[..., 2][m] = np.minimum(255, hsv[..., 2][m] * 1.15)
+    rgb = Image.fromarray(hsv.astype(np.uint8), "HSV").convert("RGB")
+    out = rgb.convert("RGBA")
+    out.putalpha(a)
+    return out
+
+
+def load_private_fonts():
+    """Register Manufaktur.ttf / .otf found next to the script / exe (Windows, this process only)."""
+    try:
+        gdi = ctypes.windll.gdi32
+    except Exception:
+        return
+    done = set()
+    for base in (APP_DIR, RES_DIR):
+        for pat in ("*anufaktur*.ttf", "*anufaktur*.otf"):
+            for p in glob.glob(os.path.join(base, pat)):
+                if p in done:
+                    continue
+                done.add(p)
+                try:
+                    gdi.AddFontResourceExW(ctypes.c_wchar_p(p), 0x10, 0)   # 0x10 = FR_PRIVATE
+                except Exception:
+                    pass
+
+
+def pick_family(root):
+    fams = {f.lower(): f for f in tkfont.families(root)}
+    if UI_FONT_FAMILY and UI_FONT_FAMILY.lower() in fams:
+        return fams[UI_FONT_FAMILY.lower()], True
+    for low, f in fams.items():
+        if "manufaktur" in low:
+            return f, True
+    for name in ("segoe ui", "tahoma", "arial"):
+        if name in fams:
+            return fams[name], False
+    return "TkDefaultFont", False
+
+
+# ----------------------------------------------------------------------------
+# Auto Bard: plays the Songs' rhythm minigame (the numbered circles with a shrinking ring) while a Song is being played, i.e. while
+# the Error Meter is on the screen. It only looks at the screen and clicks - and while it runs "Auto Bard is Active." is shown
+# under the mana bar, always on top and never hidden by any setting. Needs opencv-python (the rest of the tool doesn't).
+# ----------------------------------------------------------------------------
+BARD_ICON_PNG = "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"
+BV_GAP_PX = 1.5           # "closed" = ring centre this many px outside the border
+BV_IGNORE_TOP, BV_IGNORE_BOTTOM = 0.12, 0.17      # fractions of the screen height not looked at (top bar / hotbar)
+_bv_cv = [None, False]
+
+
+def _bv_cv2():
+    """The opencv module (imported the first time it is needed); None when it isn't installed."""
+    if not _bv_cv[1]:
+        _bv_cv[1] = True
+        try:
+            import cv2
+            _bv_cv[0] = cv2
+        except Exception:
+            _bv_cv[0] = None
+    return _bv_cv[0]
+
+
+BARD_LOG = [None]
+
+
+def bard_log(msg, quiet=False):
+    if not quiet and BARD_LOG[0]:
+        try:
+            BARD_LOG[0](msg)
+        except Exception:
+            pass
+
+
+BV_RAYS = 64
+BV_ANGLES = np.linspace(0, 2 * math.pi, BV_RAYS, endpoint=False)
+BV_COS, BV_SIN = np.cos(BV_ANGLES).astype(np.float32), np.sin(BV_ANGLES).astype(np.float32)
+BV_STEP = 0.5          # sample every half pixel along each ray
+BV_DARK = 70           # border pixels are darker than this (brightest channel)
+BV_DARK_FIND = 105     # looser version, for borders lit by the coloured lights
+BV_FILL_SPREAD = 60    # how coloured (tinted by lighting) the circle's light fill may be
+BV_BRIGHT = 200        # ring pixels are brighter than this (darkest channel)
+BV_MAX_RING = 3.4      # biggest ring we look for, as a multiple of the circle size
+BV_BORDER_RATIO = 1.20 # outer edge of the dark border / inner edge (measured from the game)
+
+
+def bv_prep(img):
+    """BGR image -> (brightest channel, darkest channel)."""
+    cv2 = _bv_cv2()
+    b, g, r = cv2.split(img)
+    mx = cv2.max(cv2.max(b, g), r)
+    mn = cv2.min(cv2.min(b, g), r)
+    return mx, mn
+
+
+def bv_discover(img, known=(), min_r=15, max_r=120):
+    """Fast search for NEW circles: works on a half-size copy, skips spots in `known`
+    (list of (x, y, radius) already being tracked), then measures candidates at full size."""
+    cv2 = _bv_cv2()
+    small = cv2.resize(img, (img.shape[1] // 2, img.shape[0] // 2), interpolation=cv2.INTER_AREA)
+    mx, mn = bv_prep(small)
+    spread = cv2.subtract(mx, mn)
+    # circle fill is light grey; the white rings are brighter, so leave them out (they'd glue
+    # neighbouring circles together), and cut away any thin lines still touching the fill
+    # (the challenge has coloured lighting, so the fill can be tinted and quite bright; the thin
+    # white rings are removed by the "open" step below instead of by brightness)
+    fill = cv2.bitwise_and(cv2.inRange(spread, 0, BV_FILL_SPREAD), cv2.inRange(mx, 126, 255))
+    fill = cv2.morphologyEx(fill, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    fill = cv2.morphologyEx(fill, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    n, _, stats, _ = cv2.connectedComponentsWithStats(fill, 8)
+    H, W = img.shape[:2]
+    out = []
+    for i in range(1, n):
+        bx, by, bw, bh, area = stats[i]
+        if bw < min_r or bh < min_r or bw > max_r or bh > max_r:
+            continue
+        if not 0.75 < bw / bh < 1.33:
+            continue
+        r = (bw + bh) / 2.0                      # full-size radius
+        if area * 4 < 0.5 * math.pi * r * r:
+            continue
+        cx, cy = (bx + bw / 2.0) * 2, (by + bh / 2.0) * 2
+        if any((cx - kx) ** 2 + (cy - ky) ** 2 < (kr * 0.6) ** 2 for kx, ky, kr in known):
+            continue
+        # quick check for the dark border before the full measurement
+        darkn = 0
+        for a in range(0, 360, 45):
+            px = int(cx + math.cos(math.radians(a)) * r * 1.12)
+            py = int(cy + math.sin(math.radians(a)) * r * 1.12)
+            if 0 <= px < W and 0 <= py < H and img[py, px].max() < BV_DARK_FIND:
+                darkn += 1
+        if darkn < 6:
+            continue
+        res = bv_measure_bgr(img, cx, cy, r)
+        if res:
+            out.append(res)
+    return out
+
+
+def bv_measure_bgr(img, cx, cy, r):
+    """Measure one circle straight from the BGR frame (only processes a small crop around it).
+    The centre is corrected automatically, so a rough starting position is fine.
+    Returned x, y are in the coordinates of `img`."""
+    cv2 = _bv_cv2()
+    res = None
+    for _ in range(3):
+        res = bv_measure_at(img, cx, cy, r)
+        if res is None or res["off"] is None:
+            return res
+        dx, dy = res["off"]
+        if dx * dx + dy * dy > (r * 0.5) ** 2:
+            return res            # fit is nonsense (something covering the circle) - keep as is
+        if dx * dx + dy * dy < 0.25:
+            return res            # centred to within half a pixel
+        cx, cy = cx + dx, cy + dy
+    return res
+
+
+def bv_measure_at(img, cx, cy, r):
+    cv2 = _bv_cv2()
+    H, W = img.shape[:2]
+    R = int(r * BV_MAX_RING) + 3
+    x0, y0 = max(0, int(cx) - R), max(0, int(cy) - R)
+    x1, y1 = min(W, int(cx) + R + 1), min(H, int(cy) + R + 1)
+    mx, mn = bv_prep(img[y0:y1, x0:x1])
+    res = bv_measure(mx, mn, cx - x0, cy - y0, r)
+    if res:
+        res["x"], res["y"] = float(cx), float(cy)
+    return res
+
+
+def bv_find_circles(img, min_r=15, max_r=120):
+    """Full-screen search. Returns list of dicts:
+    x, y, r_fill, r_border (outer edge of dark border), ring (ring centre-line radius or None), merged."""
+    cv2 = _bv_cv2()
+    mx, mn = bv_prep(img)
+    spread = cv2.subtract(mx, mn)
+    fill = cv2.bitwise_and(cv2.inRange(spread, 0, BV_FILL_SPREAD), cv2.inRange(mx, 126, 255))
+    fill = cv2.morphologyEx(fill, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))  # close digit holes
+    n, _, stats, _ = cv2.connectedComponentsWithStats(fill, 8)
+
+    out = []
+    for i in range(1, n):
+        bx, by, bw, bh, area = stats[i]
+        if bw < 2 * min_r or bh < 2 * min_r or bw > 2 * max_r or bh > 2 * max_r:
+            continue
+        if not 0.8 < bw / bh < 1.25:
+            continue
+        r = (bw + bh) / 4.0
+        if area < 0.55 * math.pi * r * r:
+            continue
+        res = bv_measure(mx, mn, bx + bw / 2.0, by + bh / 2.0, r)
+        if res:
+            out.append(res)
+    return out
+
+
+def bv_measure(mx, mn, cx, cy, r):
+    """Measure one circle whose centre/size is already roughly known."""
+    cv2 = _bv_cv2()
+    cx, cy, r = float(cx), float(cy), float(r)
+    radii = np.arange(r * 0.7, r * BV_MAX_RING, BV_STEP, dtype=np.float32)
+    # crop around the circle and convert to float so interpolation keeps sub-pixel detail
+    H, W = mx.shape
+    R = int(radii[-1]) + 2
+    x0, y0 = max(0, int(cx) - R), max(0, int(cy) - R)
+    x1, y1 = min(W, int(cx) + R + 1), min(H, int(cy) + R + 1)
+    cmx = mx[y0:y1, x0:x1].astype(np.float32)
+    cmn = mn[y0:y1, x0:x1].astype(np.float32)
+    mapx = (cx - x0 + np.outer(BV_COS, radii)).astype(np.float32)
+    mapy = (cy - y0 + np.outer(BV_SIN, radii)).astype(np.float32)
+    pmx = cv2.remap(cmx, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=128)
+    pmn = cv2.remap(cmn, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=128)
+
+    limit_dark = int((r * 1.35 - radii[0]) / BV_STEP)
+    merge_lo, merge_hi = int((r * 0.95 - radii[0]) / BV_STEP), int((r * 1.4 - radii[0]) / BV_STEP)
+    # 1) the inner edge of the dark border (light fill -> dark) is always crisp, whatever the
+    #    background, so measure that; the border's OUTER edge can't be seen on dark backgrounds,
+    #    so it is worked out from the inner edge using the circle's fixed proportions
+    edges, edge_ang, merged, hits = [], [], 0, 0
+    for a in range(BV_RAYS):
+        row_mx, row_mn = pmx[a], pmn[a]
+        d = np.flatnonzero(row_mx[:limit_dark] < BV_DARK_FIND)
+        if d.size == 0 or d[0] == 0:
+            if (row_mn[merge_lo:merge_hi] > BV_BRIGHT).any():
+                merged += 1      # white ring is sitting right on the border
+            continue
+        hits += 1
+        # sub-pixel position where brightness crosses BV_DARK (or BV_DARK_FIND if the border is lit up)
+        i = d[0]
+        thr = BV_DARK_FIND
+        dd = np.flatnonzero(row_mx[i:i + 8] < BV_DARK)
+        if dd.size:
+            i, thr = i + dd[0], BV_DARK
+        lo, hi = row_mx[i - 1], row_mx[i]
+        frac = (lo - thr) / (lo - hi) if lo != hi else 0.0
+        edges.append(radii[i - 1] + min(1.0, max(0.0, frac)) * BV_STEP)
+        edge_ang.append(a)
+    if hits + merged < BV_RAYS * 0.55 or not edges:
+        return None
+    r_edge = float(np.median(edges))
+    # where the true centre is, from a circle fitted to the fill's edge (outliers removed)
+    off = None
+    if len(edges) >= BV_RAYS * 0.5:
+        e = np.array(edges)
+        ca, sa = BV_COS[edge_ang], BV_SIN[edge_ang]
+        keep = np.ones(len(e), bool)
+        for _ in range(3):
+            if keep.sum() < BV_RAYS * 0.4:
+                break
+            px, py = (e * ca)[keep], (e * sa)[keep]
+            A = np.column_stack([2 * px, 2 * py, np.ones_like(px)])
+            sol, *_ = np.linalg.lstsq(A, px * px + py * py, rcond=None)
+            fr = np.sqrt(max(1e-6, sol[2] + sol[0] ** 2 + sol[1] ** 2))
+            res = np.abs(np.hypot(e * ca - sol[0], e * sa - sol[1]) - fr)
+            keep = res < max(1.5, 2.5 * float(np.median(res)))
+            off = (float(sol[0]), float(sol[1]))
+    r_border = r_edge * BV_BORDER_RATIO
+
+    # 2) the ring: first bright band from just inside the border's outer edge outwards
+    start = max(0, int((r_border - 2.5 - radii[0]) / BV_STEP))
+    rings = []
+    nr = len(radii)
+    for a in range(BV_RAYS):
+        row_mn = pmn[a]
+        b = np.flatnonzero(row_mn[start:] > BV_BRIGHT)
+        if b.size == 0:
+            continue
+        b = start + b[0]
+        s, t = max(start, b - 6), min(nr, b + 10)
+        w = np.clip(row_mn[s:t] - 150.0, 0, None)
+        # only the first bright band (stop where it drops back down)
+        drop = np.flatnonzero(row_mn[b:t] < 150)
+        if drop.size:
+            w[b - s + drop[0]:] = 0
+        if w.sum() > 0:
+            rings.append(float((w * radii[s:t]).sum() / w.sum()))
+
+    ring = None
+    if len(rings) >= BV_RAYS * 0.3:
+        rs = np.array(rings)
+        med = np.median(rs)
+        good = rs[np.abs(rs - med) < 3]          # drop rays that hit something else
+        if good.size >= BV_RAYS * 0.25:
+            ring = float(good.mean())
+    return dict(x=float(cx), y=float(cy), r_fill=float(r), r_edge=r_edge, r_border=r_border, ring=ring,
+                merged=merged >= BV_RAYS * 0.4, off=off)
+
+
+class BardTrack:
+    def __init__(self, tid, d, t):
+        self.id = tid
+        self.x, self.y, self.r_fill = d["x"], d["y"], d["r_fill"]
+        self.samples = []          # (time, ring radius) - only frames where the ring moved
+        self.borders = []
+        self.done = None           # None, "clicked" or "skipped"
+        self.done_t = None
+        self.seen_ring = False
+        self.born = t
+        self.last = t              # last time the circle itself was seen
+        self.last_ring = None      # last time its ring was seen
+        self.ring_now = False
+        self.merged = False
+        self.add(d, t)
+
+    @property
+    def border(self):
+        return float(np.median(self.borders[-30:]))
+
+    def add(self, d, t):
+        self.last = t
+        self.x, self.y = d["x"], d["y"]
+        self.borders.append(d["r_border"])
+        self.borders = self.borders[-40:]
+        self.ring_now = d["ring"] is not None
+        self.merged = d["merged"]
+        if self.ring_now:
+            self.seen_ring = True
+            self.last_ring = t
+            # the game only redraws ~60 times a second: keep only frames where the ring actually moved
+            if self.samples and abs(self.samples[-1][1] - d["ring"]) < 0.08:
+                return
+            self.samples.append((t, d["ring"]))
+            self.samples = self.samples[-60:]
+
+    def gap(self):
+        return self.samples[-1][1] - self.border - BV_GAP_PX if self.samples else None
+
+    def confirmed(self):
+        """True once the ring has actually been seen shrinking. Anything round and white on screen
+        that doesn't shrink (UI, lights, decorations) never qualifies, so it can't be clicked."""
+        if len(self.samples) < 3:
+            return False
+        shrink = self.samples[0][1] - self.samples[-1][1]
+        span = self.samples[-1][0] - self.samples[0][0]
+        return shrink >= 2.0 and span > 0 and 3.0 <= shrink / span <= 600.0
+
+    def gap_at(self, t):
+        """Ring-to-border gap now, moving the last measurement forward by the ring's speed
+        (circles that aren't being watched closely are only measured every ~40 ms)."""
+        g = self.gap()
+        if g is None:
+            return None
+        if len(self.samples) >= 3:
+            s = self.samples[-6:]
+            ts = np.array([a for a, _ in s])
+            if ts[-1] - ts[0] > 0.02:
+                slope = np.polyfit(ts - ts[-1], np.array([b for _, b in s]), 1)[0]
+                if slope < 0:
+                    g += slope * min(0.1, t - ts[-1])
+        return g
+
+    def finish(self, how, t):
+        self.done, self.done_t = how, t
+
+    def predict(self):
+        """Time at which the ring reaches the border (None if it can't tell yet)."""
+        if len(self.samples) < 2:
+            return None
+        t_last = self.samples[-1][0]
+        recent = [s for s in self.samples if t_last - s[0] <= 0.15]
+        if len(recent) < 4:
+            recent = [s for s in self.samples if t_last - s[0] <= 0.35][-12:]
+        if len(recent) < 2:
+            return None
+        ts = np.array([s[0] for s in recent]) - t_last
+        rs = np.array([s[1] for s in recent])
+        if ts[-1] - ts[0] < 0.012:
+            return None
+        slope, icept = np.polyfit(ts, rs, 1)
+        if slope > -1.0:      # px/s - not shrinking
+            return None
+        target = self.border + BV_GAP_PX
+        dt = (target - icept) / slope
+        # lots of fresh samples: also allow for the ring speeding up / slowing down
+        q = [s for s in self.samples if t_last - s[0] <= 0.25]
+        if len(q) >= 6 and q[-1][0] - q[0][0] > 0.06:
+            qt = np.array([s[0] for s in q]) - t_last
+            qr = np.array([s[1] for s in q])
+            a, b, c = np.polyfit(qt, qr, 2)
+            disc = b * b - 4 * a * (c - target)
+            if abs(a) > 1e-6 and disc >= 0:
+                roots = [(-b - disc ** 0.5) / (2 * a), (-b + disc ** 0.5) / (2 * a)]
+                roots = [x for x in roots if x > -0.05 and abs(x - dt) < 0.15]
+                if roots:
+                    dt = min(roots)
+        return t_last + dt
+
+
+class BardBot:
+    """Auto Bard: tracks every circle on screen, but clicks strictly in the order they appeared - it never
+    switches away from the current circle until that one is clicked or gone."""
+
+    def __init__(self):
+        self.tracks = []
+        self.next_id = 1
+        self.frame_no = 0
+
+    def _new(self, d, t):
+        tr = BardTrack(self.next_id, d, t)
+        self.next_id += 1
+        self.tracks.append(tr)
+        ring = f"ring gap {d['ring'] - d['r_border']:.1f}px" if d["ring"] is not None else "no ring"
+        bard_log(f"  found #{tr.id} at ({int(d['x'])},{int(d['y'])} in capture area) size {d['r_fill']:.0f} {ring}",
+            quiet=True)
+        return tr
+
+    def process(self, frame, t):
+        """Feed one full-screen frame: update every circle and look for new ones."""
+        self.frame_no += 1
+        for tr in list(self.tracks):
+            if tr.done and t - tr.done_t > 0.6:
+                self.tracks.remove(tr)       # finished circle long gone - forget it
+        # update every circle we know about (the measurement also re-centres it, so a circle first
+        # spotted while half-hidden behind another one ends up at its true centre)
+        for tr in self.tracks:
+            if not tr.done:
+                m = bv_measure_bgr(frame, tr.x, tr.y, tr.r_fill)
+                if m is not None:
+                    tr.add(m, t)
+        # two tracks that ended up on the same circle -> keep the older one
+        live = sorted((tr for tr in self.tracks if not tr.done), key=lambda k: k.id)
+        for i, a in enumerate(live):
+            for b in live[i + 1:]:
+                if b in self.tracks and (a.x - b.x) ** 2 + (a.y - b.y) ** 2 < (a.r_fill * 0.5) ** 2:
+                    self.tracks.remove(b)
+        # look for circles we aren't tracking yet
+        known = [(tr.x, tr.y, tr.r_fill) for tr in self.tracks if not tr.done]
+        for d in bv_discover(frame, known):
+            near_done = [tr for tr in self.tracks if tr.done and
+                         (tr.x - d["x"]) ** 2 + (tr.y - d["y"]) ** 2 < (tr.r_fill * 1.2) ** 2]
+            if near_done:
+                # same spot as a circle we just finished: only count it if it has a fresh, big ring
+                # (otherwise it's the old circle still fading out - clicking it again would be wrong)
+                if d["ring"] is None or d["ring"] - d["r_border"] < 12:
+                    continue
+                for tr in near_done:
+                    self.tracks.remove(tr)
+            self._new(d, t)
+        # drop circles that have vanished
+        for tr in list(self.tracks):
+            if not tr.done and t - tr.last > 0.3:
+                if tr.seen_ring:
+                    bard_log(f"  missed #{tr.id}: it disappeared before it could be clicked")
+                self.tracks.remove(tr)
+            elif not tr.done and not tr.seen_ring and t - tr.born > 1.5:
+                self.tracks.remove(tr)   # a circle that never showed a ring (already finished / decoration)
+
+    def current(self, t):
+        """The circle to work on now. Normally the oldest one; but a circle that was spotted late
+        (hidden under another one) can be older than its number says, so if another circle's ring
+        is clearly closer to closing, that one goes first. Once a circle is close to closing it is
+        locked in - the bot will not move away from it until it's clicked."""
+        cands = []
+        for tr in sorted(self.tracks, key=lambda k: k.id):
+            if tr.done or not tr.seen_ring:
+                continue
+            if not tr.confirmed():
+                if t - tr.born > 0.6 and not getattr(tr, "ignored", False):
+                    tr.ignored = True
+                    bard_log(f"  ignoring #{tr.id}: round thing whose ring isn't shrinking (not a challenge circle)",
+                        quiet=True)
+                continue
+            if t - tr.last_ring > 0.25 and not tr.merged:
+                g = tr.gap()
+                if g is not None and g < 6:
+                    cands.append(tr)     # ring vanished into the border: click it straight away
+                    continue
+                tr.finish("skipped", t)   # ring lost while still far out - don't let it block the rest
+                bard_log(f"  skipped #{tr.id}: lost sight of its ring (gap was {g + BV_GAP_PX:.0f}px)")
+                continue
+            cands.append(tr)
+        if not cands:
+            self.locked = None
+            return None
+        if getattr(self, "locked", None) in cands:
+            return self.locked
+        best = cands[0]
+        bg = best.gap_at(t)
+        for tr in cands[1:]:
+            g = tr.gap_at(t)
+            if g is not None and bg is not None and g < bg - 8:
+                best, bg = tr, g
+        if bg is not None and bg < 15:
+            self.locked = best
+        return best
+
+    @staticmethod
+    def when(tr, t, offset_s):
+        """'now', a time to click at, or None if not predictable yet."""
+        g = tr.gap()
+        if tr.merged or (tr.ring_now and g is not None and g <= 0) or \
+                (not tr.ring_now and g is not None and g < 6):
+            return "now" if offset_s <= 0 else (tr.last_ring or t) + offset_s
+        due = tr.predict()
+        return None if due is None else due + offset_s
+
+
+class AutoBard(threading.Thread):
+    """Runs while a Song is played (the Error Meter is up), the game is in front and 'Auto Bard' is on. One background thread that
+    sleeps when nothing is going on."""
+
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.quit = False
+        self._warned = False
+        self._parked = None
+
+    def stop(self):
+        self.quit = True
+
+    def want(self):
+        a = self.app
+        try:
+            return bool(a.cfg["settings"].get("auto_bard", True)) and a.tracker.song_active() and a.game_focused()
+        except Exception:
+            return False
+
+    def _park(self, x, y):
+        """Put the mouse on the circle ahead of time so the click itself is instant."""
+        p = (int(round(x)), int(round(y)))
+        if self._parked == p or not IS_WIN:
+            return
+        _mouse_move_abs(p[0], p[1])
+        _mouse_move_rel(1, 0)
+        _mouse_move_rel(-1, 0)
+        self._parked = p
+
+    def _click(self, x, y):
+        self._park(x, y)
+        send_click(False)
+        time.sleep(0.006)
+        send_click(True)
+
+    def run(self):
+        bot, sct, mon, last_full, st = None, None, None, 0.0, {}
+        while not self.quit:
+            try:
+                if not self.want():
+                    self.app.bard_on = False
+                    bot, self._parked = None, None
+                    time.sleep(0.05)
+                    continue
+                if _bv_cv2() is None:
+                    self.app.bard_on = False
+                    if not self._warned:
+                        self._warned = True
+                        self.app.q.put(("msg", "Auto Bard needs the opencv-python package (pip install opencv-python) - it stays off."))
+                    time.sleep(0.5)
+                    continue
+                if sct is None:
+                    sct = mss.mss()
+                    m0 = sct.monitors[1]
+                    top = int(m0["height"] * BV_IGNORE_TOP)
+                    bottom = int(m0["height"] * (1 - BV_IGNORE_BOTTOM))
+                    mon = dict(left=m0["left"], top=m0["top"] + top, width=m0["width"], height=bottom - top)
+                    ox, oy = mon["left"], mon["top"]
+                    st = dict(ox=ox, oy=oy, W=mon["width"], H=mon["height"])
+                if bot is None:
+                    bot = BardBot()
+                    st["focus"], last_full = None, 0.0
+                self.app.bard_on = True
+                self._step(bot, sct, mon, st, last_full)
+                last_full = st.get("last_full", last_full)
+            except Exception as ex:
+                self.app.bard_on = bool(self.want())
+                if not self._warned:
+                    self._warned = True
+                    self.app.q.put(("msg", f"Auto Bard error: {type(ex).__name__}: {ex}"))
+                time.sleep(0.2)
+
+    def _grab(self, sct, box):
+        t0 = time.perf_counter()
+        img = np.asarray(sct.grab(box))[:, :, :3]
+        return img, (t0 + time.perf_counter()) / 2
+
+    def _step(self, bot, sct, mon, st, last_full):
+        W, H, ox, oy = st["W"], st["H"], st["ox"], st["oy"]
+        offset = float(self.app.cfg["settings"].get("bard_offset_ms", -12.0)) / 1000.0
+        now = time.perf_counter()
+        tr = bot.current(now)
+        due = bot.when(tr, now, offset) if tr else None
+        closing_soon = due == "now" or (due is not None and due - now < 0.07)
+        if tr is None or (now - last_full > 0.04 and not closing_soon):
+            frame, t = self._grab(sct, mon)                      # a full look every ~40 ms: finds new circles
+            bot.process(frame, t)
+            st["last_full"] = t
+        else:                                                    # a close-up of the current circle only (~1 ms)
+            R = int(tr.r_fill * BV_MAX_RING) + 4
+            x0, y0 = max(0, int(tr.x) - R), max(0, int(tr.y) - R)
+            x1, y1 = min(W, int(tr.x) + R + 1), min(H, int(tr.y) + R + 1)
+            img, t = self._grab(sct, dict(left=ox + x0, top=oy + y0, width=x1 - x0, height=y1 - y0))
+            m = bv_measure_bgr(img, tr.x - x0, tr.y - y0, tr.r_fill)
+            if m is not None:
+                m["x"] += x0
+                m["y"] += y0
+                tr.add(m, t)
+        now = time.perf_counter()
+        tr = bot.current(now)
+        st["focus"] = tr
+        if tr is None:
+            return
+        self._park(ox + tr.x, oy + tr.y)                         # sit on the current circle until it is done
+        due = bot.when(tr, now, offset)
+        if due == "now":
+            self._click(ox + tr.x, oy + tr.y)
+            tr.finish("clicked", time.perf_counter())
+        elif due is not None and due - now < 0.003:
+            while time.perf_counter() < due:                     # closes before the next look: hit it exactly
+                if due - time.perf_counter() > 0.003:
+                    time.sleep(0.001)
+            self._click(ox + tr.x, oy + tr.y)
+            tr.finish("clicked", time.perf_counter())
+
+
+class BardBadge(Overlay):
+    """'Auto Bard is Active.' with a guitar under the mana bar. Its own always-on-top, click-through window: no setting, focus state,
+    menu or other overlay hides it - it is there for exactly as long as Auto Bard is running."""
+
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.win, self.cv = self._make()
+        self.red = self.num = (self.win, self.cv)
+        self.shown, self.alpha, self.geom = False, None, None
+        self._photo = None
+        self._key = None
+
+    def hide(self):
+        if self.shown:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+        self.shown = False
+        self._key = None
+
+    def show(self, x, y, s, family):
+        s = max(0.6, float(s))
+        key = (int(x), int(y), round(s, 2), family)
+        if key != self._key:
+            self._key = key
+            icon = _img(BARD_ICON_PNG).convert("RGBA")
+            ih = int(round(42 * s))
+            iw = max(1, int(round(icon.width * ih / float(icon.height))))
+            self._photo = ImageTk.PhotoImage(keyed_image(icon, iw, ih))
+            fnt = (family, -max(9, int(round(13 * s))), "bold")
+            tw = max(60, int(round(len(BARD_TEXT) * 8.2 * s)))
+            W, H = iw + int(8 * s) + tw + 4, ih + 4
+            cv = self.cv
+            cv.delete("all")
+            cv.config(width=W, height=H)
+            self.win.geometry(f"{W}x{H}+{int(x)}+{int(y)}")
+            cv.create_image(0, 2, image=self._photo, anchor="nw")
+            tx, ty = iw + int(8 * s), 2 + ih // 2
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+                cv.create_text(tx + dx, ty + dy, text=BARD_TEXT, font=fnt, fill="#000000", anchor="w")
+            cv.create_text(tx, ty, text=BARD_TEXT, font=fnt, fill="#ffffff", anchor="w")
+        try:
+            self.win.attributes("-alpha", 1.0)
+            if self.win.state() != "normal":
+                self.win.deiconify()
+            self._click_through(self.win)
+            self.win.attributes("-topmost", True)
+            self.win.lift()
+        except Exception:
+            pass
+        self.shown = True
+
+    def raise_top(self):
+        if self.shown:
+            try:
+                self.win.attributes("-topmost", True)
+                self.win.lift()
+            except Exception:
+                pass
+
+
+BARD_TEXT = "Auto Bard is Active."
+
+
+def merge_covered_slots(old, new, tol):
+    """old / new: {key: screen x of the slot centre}. A slot that one of our own boxes / icons covers can't be seen, but the
+    slots that ARE seen stay exactly where they were; when the game re-centres what is left (a slot really went), they move.
+    So: the same positions with some keys missing = those are only covered -> keep them. Returns the slots to use."""
+    if not old or not new or len(new) >= len(old):
+        return new
+    if any(k not in old for k in new):
+        return new
+    if any(abs(new[k] - old[k]) > tol for k in new):
+        return new                                           # (everything shifted: the bar really changed)
+    out = dict(old)
+    out.update(new)
+    return out
+
+
+def same_slots(a, b, tol):
+    """The same keys at the same places (within tol)?"""
+    return set(a) == set(b) and all(abs(a[k] - b[k]) <= tol for k in a)
+
+
+class HotbarWatcher(threading.Thread):
+    """Looks at the hotbar ~7x a second (only the strip of number tabs above the slots, so it is cheap and
+    the red boxes can't hide anything). Tells the Tracker which keys are on the bar: the Weapon missing
+    from it = disarmed."""
+
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.quit = threading.Event()
+        self.templates = dict(DEFAULT_GLYPHS)
+        self.err_logged = False
+
+    def stop(self):
+        self.quit.set()
+
+    def run(self):
+        try:
+            mss.mss().close()
+        except Exception:
+            self.app.q.put(("msg", "Disarm detection: screen capture isn't available."))
+            return
+        while not self.quit.is_set():
+            try:
+                with mss.mss() as sct:                           # (a fresh grabber every look: an old one can keep handing back an old picture)
+                    self.scan(sct)
+                self.app.slot_scans += 1
+            except Exception:
+                if not self.err_logged:
+                    self.err_logged = True
+                    self.app.q.put(("msg", "Disarm detection error:\n" + traceback.format_exc()))
+            self.quit.wait(0.06)
+
+    def scan(self, sct):
+        app = self.app
+        if app.selecting or not app.cfg["settings"].get("detect_disarm", True):
+            return
+        bar = dict(app.cfg["bar"])
+        scale = max(0.5, bar["w"] / 54.0)
+        mon0 = sct.monitors[0]
+        top = int(bar["y"] - 26 * scale)
+        shot = sct.grab({"left": mon0["left"], "top": top, "width": mon0["width"], "height": int(28 * scale)})
+        rgb = np.asarray(Image.frombytes("RGB", shot.size, shot.rgb))
+        if not scan_tabs(rgb, scale):                          # nothing on the saved line: look in a taller band (the window may have moved)
+            top2 = int(bar["y"] - 110 * scale)
+            shot2 = sct.grab({"left": mon0["left"], "top": top2, "width": mon0["width"], "height": int(150 * scale)})
+            rgb2 = np.asarray(Image.frombytes("RGB", shot2.size, shot2.rgb))
+            if scan_tabs(rgb2, scale):
+                rgb = rgb2
+        self.feed(rgb, scale, mon0["left"])
+
+    def feed(self, rgb, scale=1.0, left=0):
+        """One picture of the tab strip -> tracker. (Separate from the screen grab so it can be tested.)"""
+        app = self.app
+        app.slot_t = time.time()
+        tabs = scan_tabs(rgb, scale)
+        now_ = time.time()
+        if not tabs and now_ - getattr(app, "boxes_t", -9.0) < 1.0:
+            return                                             # every slot is under one of our own boxes (all Songs / all cooldowns): that is not "no hotbar"
+        if tabs:
+            app.hb_gone_t, app.hb_gone_done = None, False
+        else:
+            # the hotbar is gone (rejoined / the Menu button / loading): after 2 s of that, with the game in front, Flood is reset
+            if getattr(app, "hb_gone_t", None) is None:
+                app.hb_gone_t, app.hb_gone_done = now_, False
+            elif now_ - app.hb_gone_t >= 2.0 and not app.hb_gone_done and app.game_focused():
+                app.hb_gone_done = True
+                if app.tracker.reset_flood():
+                    app.q.put(("msg", "Flood: the hotbar went away - its cooldown is reset."))
+        if not tabs:
+            if time.time() - getattr(app, "slot_good_t", 0.0) > 0.5:      # (one empty look doesn't throw the positions away)
+                app.slot_cx = {}
+            msg = app.tracker.update_hotbar(None)
+        else:
+            keys, unknown = identify_tabs(tabs, self.templates)
+            readable = sum(1 for _, g in tabs if min(_gdist(g, tg) for tg in self.templates.values()) <= 2)
+            if len(tabs) == len(HOTBAR_KEYS) and all(g for _, g in tabs) and readable < 9:
+                # a full bar that doesn't match the built-in digits (other screen size / UI scale): learn them
+                self.templates = {HOTBAR_KEYS[i]: g for i, (_, g) in enumerate(tabs)}
+                keys, unknown = identify_tabs(tabs, self.templates)
+            new_cx = {k: c + left for k, (c, _) in zip(keys, tabs) if k}
+            tol = 0.1 * float(app.cfg["bar"]["pitch"])
+            cand = merge_covered_slots(app.slot_cx, new_cx, tol)
+            if (app.slot_cx and now_ - getattr(app, "boxes_t", -9.0) < 1.0 and len(cand) < len(app.slot_cx)
+                    and not same_slots(cand, app.slot_cx, tol)):
+                # our own boxes are on the hotbar (they hide tabs and a half-hidden / highlighted tab reads wrong, e.g. while a Song is
+                # played): a different layout only counts once it has been seen the same way a few times in a row
+                c0, n0 = getattr(self, "_lay", (None, 0))
+                n0 = n0 + 1 if (c0 is not None and same_slots(cand, c0, tol)) else 1
+                self._lay = (cand, n0)
+                if not new_cx or len(new_cx) < 2 or n0 < 4:
+                    return
+            self._lay = (None, 0)
+            app.slot_cx = cand
+            app.slot_good_t = time.time()
+            msg = app.tracker.update_hotbar({k for k in keys if k}, unknown)
+        if msg:
+            app.q.put(("msg", msg))
+
+
+TRAIN_DESC = ("How to set this up\n\n1. Add the Spell to \"Main\" Tab first.\n2. Add Mana Marks in Mana Overlay. (The box that shows cast%)\n"
+              "3. Click on Spell Key to Train box and press what Key the spell you wanted to train is on.\n4. Press Start/Stop")
+EXTRA_ICONS = {'auto': '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', 'brew': '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', 'inv': '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', 'snap': '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X99k/eYd7NrTTFtnkt2NLezY3VTUjq9LEYp0QjT06UN9n3oGjTiSd995h9GjR/Pt686huqqKmpoaaqqrqa6pobq6iiGDh7DioxXMvmM2yz/84IDwHcdly5YtzJz5JebNf5PLLzyLc848EQFEqysZNWIIAAWtR3zaRu8YY7UQYpDrOPTrU4vFkkyluWLWXYSjcY6aMAEhBMNGH8X0mRezZMliBg0cyI033kh9XR39B/SnsrISRzkgBGeffTael+d/3XPPQfXX3NLCxk2b2L59O4MHDy4lv8YYwuEwruOwceNGNm7cyNcunM7D992GMYZsziMSCTN0cH9bzPD1QA4SspW+HDBgQAxY36eu2jaueEGnN823tulde/VXzrF9+jTYj1assOXt2WeftSdMmWL3bb7vW2OMvfnmmy1gt23bZn3ft4VCwQZBYIMgsL7vW621Xb16tXVd186bN88GQWALhUKpnz/98Y+2tq7OAvbG73zFejsW2vTm+Ta5/g3bte51axuX2Fcf/5UPWCHEX/bdC+W+KIMgWQVUNdTXEo9FhLGWbCbHL392PQMbqph0zGQeeugPpedPP/101q5bx8svv4wxhiAISuYqhGDq1KkALFiwAMdxkFKilEIpVeJpGhoaMMbQ2NiIUgrXdVm1aiWXXPJlvnn11RTyWR657zbuu3MWXr6A1kWSqkg5WqorY70aq913q5D7atDznDhQ1aeuhkgkCtYSBAEVsShz/3If006YyHe+cy1nzZjB/HnzqK2tZfbs2dx///1IKXvohGKapLXmuOOOw3VdnnrqKYwxPeyb7mHSJFJK+vbty4wZM0gkEixY8DaXXXYZEycezbPPPseZJx/H0lce4urLzyfZlQIssiyottZQURFDKYm1Nr4vJyP3J2KDKiAej0Ws40hhrUVKST7vUV9TxdwnfsVPfvgN5r3xBtPPOoujj56El8/T0tzsz58/v6Qd13VRSjFgwACuvPJK3n77bbq7u0vfSynJZrNs3rSJOXOexhjD7T/5Kaeddjpz5szhuIljePLBO3n18Xs5cuQQujq6UErtTTwJgdaWcCgkotEwQGTy5MluucKcfTUYBKIaIBYNWyWl6GW1lJJ4XgEpJXfffh1XXHw2Dz3xIn9+9lVuu/12ADXz3POYPPkYxowezeDBg6mtraG2ppYhQwajdcBtt91G//792bVrF1u2bGHrtu3s2L6tJMCwwf2ZfuEZXDLzdE4+/igisUiRdLYWx1EHKbpaIuEQ0XCYdDoXbW9vVz31iv28jQJ0ZTR6bncu99IVF88wjz0wW3YlkjhK7ZWwamOIR6O4kTDtbZ2899Ea5i9axocr17Fy9QbSucJnKkyOGDqAcaNHcvyksZx07AQmHDmSPn3qQBcpSW00SqlDFHgsjuOQ6k6b4875tty1p2VLQ0PD0W1tbele/Pvlg8baKEA8Hi0WAuz+RRZHKXJ5j0wuRzwWZuaZJzHz7JPxcx5dyW5a2hO0dqZIJJKkM1l8P0ApSXVVBdXVldRVV9Kntora6koqKuKgJDYIyOU8uhJdCHrpevWpE2WtQTpKhEIOQLhaa9l2qITXFqu4xCJhe6hKsZQCiSox3b3cS0U8Sm11JeOOUAgl96a3rcXqoqMJtO55t7vIcMtiDdH5DKDK7cBaUMrBdRyAUNb33UNn9MWqDI7jfOaymSorswWBxvd1saZoy2uLZbX/Evkk9iKk/q4TBtaipOhdo66OGUX3oQAKYXqigr9vzFLlSfCPbr1ZgpQSVdxTHa2jCjIcfJuAHEB3OidKden/D5r9xPGIA9EUZb5UtQO0J7qwWiO+wAhtbxVKG3w/AMiHQl7hYABtD/O7G8g3NrXLfN77z62RfzhCi5KSXDZLqjsDkDImnjskwFAo1ATsXrdpOy2tncZ1nc9Uvv5vwofrKto6ukxreydAa0tLS648o98XoOro6OhWSn2YSmfs4mWrbDgSRhvzBQVoUK7L2k07rB9oq5Ra1xOHyoOvQSCk1DOAeOSJl4UONPKLa6EgBAveXS4AEXbkOwfjQvei7nOFwqtSyjUL3/tIPD93gamqr6Hg+184gCHXoaM9wWtvv6+AjEYuOFS61PuDBHKOEP8ihBA33PFrs2XzTupqqns91Rei+X5ArKqCl+a9o3c2tiClXOB53tZywmk/Frh8LWpr1yohBqXSmWPnL1rmTztxkho6fBD5bK6Uy/13tUIQUBmPkuhK8Y0f3m26kt0yFJKztLZbys7eHRRgSbsWXpdSjmvtSIyb89Jbum99NcdOHCOi0QieV8ysy2t+/8jWe0xFCkF1bTXJVIavf3+2v+xv61wpxfNBYO7ZV3ufBhAgsNY+p5SKZbK5qS++tlgs/mCVrqurYcSwgaKqphJHyp6aebE8VnYGpxh9is/rOOxeaVlvwh2PRYhWxvH8gJfmLtBXzrrLvLdijSulXGmMvZSeCOxQB2IPeZBXKXWOtfYuY8xkgGPGH2G/fN7p+ox/mizHHD5UVFVVCKQErQn8AK01gTY9ZWuzF3C73+DFiRBSoqQoMgKOgwy5YAzdqYxdu2mbnbfoQ/PMK2+pVWs3i56g5K/GmGt7jl0e8NDxZ5lfUVYaDodd92u+1t82xpzYA5xRwwcx+ajRZuKRh5vRI4eIwYP6UV9TLSoroiIcDhFyXaRS4pOTTGIvZ2eMxWht/YJPNu+RTGXsntY2u3rdNj78eD1LP/xYrd+8s0QnSimXKMVvfN/MKT+t/PdocF9z7k0xZCQSOVFrf6bv69OAcUBFufuORSPU1lTRp7aa6uoK4rGojYRD1nUUjpI9PKYRfvFAgshmcyKR7Ka1PUFXspvuTK48gsoAq11XzXec0Cu5XO69A87UfxLgvtostaqq8Ejft+Ot5ihf+6O0tsOB/kDlPme6D7nee9ZRuqfuuN113TVKsdx1xfLu7sLGQ0w4/1UAy9/rBRscKCccOHBg1OvsrPYcp0JrHZHSxK21EWuVK611KZ6ALwihAylFTmmZ1Urlolp3DxozJrFi+XL/AGpxPu/B9P8q/y73qVTZz1Iv/xx9mr+3v/8HJJCuHRQHrQUAAAAASUVORK5CYII=', 'dash': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAATkElEQVR42sWbeZQfVZXHP/e9+m3dv17S6aSXJE1IQsi+ILKLDI47gkFccRkPIiqOynHjjI4LCgw6446ADqKijCLu6ygKKgiEBEJYQ0InIelOd3rv/u1V9e78UfVrft12kgbUeefU+VV1Le99737vu22Z3TCAxufzgJOAtYAAgzXPSM1zRxoC2PiQ+H0TX/9DR3XCLuArwF4j4qyICowDvwVeOsPzRwI227nl2SxeZjFBCJwM3CLQyTQWWRGcKgo3Ax8G9tRwXKfNZeLvASSBE4Hjib5bB+SA3cAW4P6aZ734XP+WnDPx71KgT6KPVwC3vrFBz2xt1dZkwgEB4IyIAgeAt8zwDVPzt0XApcA2AWdFtPYwkWT4wGbgklglZisdT4uzBqgH7orBBc2JhH5j4zp98kVnau+LX6D3nn6qvvPoLs1Yq4AfL06Ba2OOVKlPfH0l0G9iIDFH/JhIQc252qe+tQd4V8zxpy22h3rQiye6QeBfRCSw4H37Oet58fz5jFQqJIwhaQwJEbaMjvGZXd38fmBQibhiQ9XNwJuBHbEU3CRwgkQiHQLSkU7Jc5ubZUW2npQ1jFR8to6O88D4uBbCUGOgNlQFuBv4d+DWaerztAFWX3w/8J9WJAhVvY8du4xLli6h5BwV5+grlxGF+akkrakkuSDkG08+yWd37mbE9wMBTyPqvxm4RmC1Rhzy1jc2yvkLO3lJ2zzaUymsCAI4oOwcT+QL3NzTy437exjzAweoEbEuAvp14BNA72ystsygdw44B/iRFdFQ1by6s0Ou37CWId/nRwf6+N7+XrrzBUSEZfV1nNvZzrkd7XRm0twzPMondzzOHweHHWAUSgJpBZcyxnx8xTGcv3ABWWvJhyG+c1MtkQhpY0hbw2MTOb66ey837e9FI8kQpyoK+4FPAf89gzE7JMCq5esCNhuR+U7VbWxqNL85+QSeLBS55KFHuGN4ZMYPrWts4LKVy3lFWxu/GxjkZXdtxoEKiIioAbl2/Rpes6CDwYpPqDrJuenDqeKAOmtJG8MfBof49I5dPDA+TixdVWPzHuDLhxNXOw2sAl82cIqDsC2Vsj878Xj2FAq8est9PDyRwxPBARlrSFmD7yLi9Zcr/LTvIF11GazA93oOUAXnVOVDxyzh7YuPor9cxohMglNAY0BVVghgRAico+gcx2br2dTRRtoYHs3lTCl0vkSP5YBbpgUiMwK0sWgeB3xORAxgrtuwVlpTSc66ewv95QqeCIEq5y/q5ItrV/GmRQtpSSZ5ZCJHyTkCVX7TP8CI7+uufEFigyJrGrN8fu0qiqHDVPUt8p0kjaHOs2SsJR0fSWOQmJAKlFz03svb27hneJTH83msiFX4CXBbjZ+c0VrW+u5/NZB0qm5tY4NZ1ZDlvHvvY7BSwUokTJ9bvZK3dC2k7BwO+MjyZbyyo433PvgIW0fHqKjyq/6BKfJ/4VFdZK3HiO9jRQhVyXoeRoTeYpHHcnkGK5VoQSI0JxIsyqRZlMnQmPDIBSGBc+zOF3hofAJAYoPTy1P+uepr3Uw6WJXhj8bKG9RZ47UkEuwvlWOxVL64djVvWbSA/nIlCjxjjjZ6Hrkg4I1bH+DukRESxhDExmNeKsmtp5xISyJBRRUDZD3LXcMj3LivlzuGhjlQLv8V5ZsTCZbWZzi3o4NXdrSxpL6O3x4c4NzN9+FUEUFVGVW4A7ga+N9phnIKwOpvCvgO8Kr4IZMQwVflo8uX8f5lSxisRKJaO0JV0taQ8wNev3Ub94+NkzSGinOc3d7G1zasIReEWBGSRrhqZzdX795L7N+QmFgAqqDT1GlJXYb3L1vCw7FVrUpBNVSMz38AvC/m6iRImcHIJGLFPdsTcYGq2dTRztc2rGHcD5BDWL5QlXrPsr9Y4uV338vBciRyF3Qt4j9WH8twxaclmeDyHbv4QveeKHWI9YzYyABkLLook5EDpQoTQXhIk7+usYHeUlkHKhUXGxyjsAvYBDxUBWlmMDoGaDRAoMrS+jouX3ksxdDBIcBVKZkLQroyGa5Zv4a2VAqAO4eHGar4zEkmuWd4lC/FHHDx910NOE8EX5FFmQzXrFvLB5YeTdbaGJxM8lWBK1at4LennCCv6eywGoHzgWUxc9qqNLEzRDAfAN4mIqFnxF63fi0rGxvIh+GkoaFmIo2tIbHpL4QhG5uaGPN97hweYSwIeMG8uSyrr+Mr3XvYMjqGEcGIUG8t7ek0Wc9jIggiq6nQXSiyfXyCS49ZynuXLWbE99mVzyEIIfBPrXO5aHEX9Z7HuZ1tzE0kuX1wyCISAPPj48eAsdOc/BLgRiuSdKrmgq4uuXBxFyO+P0XvnCqIkDRmilkPnMMaw7gf8KnHdzJQqQDCrlyer+3dx5+Ghgnj98/r7OD649bx9sVdvKqznZe1zQeUhyZyGGDI9/l530HWNjbw64ODHKyUcUp4Xme7+dK61RgRKs5RCB1ntM4lIcJtg0NiwGmUjP8W2G+n6d+VBk5TcAvTaXP1ulWTyi81utYQm/ieYpE9hSK95RK+c7Qkk8xNJrh1YJDr9u6bpFpPqczBcgVfFQQ8K+zKF+gvlzmhuZnF9Rnmp1Js6mjn6LoMfxgcIlAlH4b8ou+g7iuWKoHDw4jpK5VZXp9ldUOWsnN4IuTDkBPnNHP74LD0lstqRDyFAvAbr8birADeiIhTVfO+pUfTnkkzXHmKe6FCUyLB7YNDXN29lwcnxidFq9HzOL6piUuXL+XHB/oisYjdyBSxVghCJSDkh7193Dk0wpfWrub5rS30lcu8bmEnWc/jgvu3E6gSoJy0qmn84Jg/t7unYAYrPu9+8GEWZNKsa2ygEIY4IG0Nr1/YwX1jY1VenAakbI14fsKInOpU3aqGrPn0ymMpOzdpNZ0qzYkEN+zdxzu3P8TuQoFi6Ag1koli6HiiUOD7PQfYmS9EBiSe6fkbW/j0O5bz1rMWsen57WTrLA93T+Ac5FzIz/v6WdWQZUNTI32lMsc3N+FU+dPQMIA01Cfqr710jdz5wAgjEz6+Kk8U8py3oBOHTroZTwzf6zlAoCoSeYPvVtF2AA8akRanyn+tWSlvWbSQ0ZrIo9Hz+EFvHxdvfygy76oYgSUL6jAi7NyfRxXERJxTp5y0dg4fftNSVi6up7UpSdlXjIGEZ7jjgWHe9/lH6O4pYIyQEcN3n7OBE1vmUAhDUOXMO+9hb7EIwB+uPpHQKWd/YCvlSohTuGHjOs5qn8+oH5AyhjE/4CV33UNPqYxAWeH5VTexycBcp6oL0ml56fz55MMwWiiQtpYni0U++ugORCJuLlmQ4UdXPYdfff4Efvn553LLlcexYXkj6iAMFadw0aYu/vm5rVgjDI/7FEoBE4WAobEKJ6+Zww+vfA7rljXgXKRvF29/mOFyhYwx9JfLNHixixDYua/A6RtbeOEJrcTxPf+zv5fQRdFRqEqdZ6nzvGralQSaq7HoK0VEUdXzF3bSlkoyFGftoSoZY/jGk/sZ8X2MCO1zk9x02UaWd2UZy/mIwPM2zOWHVzbxzV/u49Z7BzlpdTNnHDeXA0NR9mCmedzRnE97a5JvfXw9r/63++jeX6CnVOJt2x7EM/DA+AS5MCDhCX4Q5xkKSxdGlRBj4M/DIzySy7Eim424PrX4I4BXBZjROOAeqFRAIONZikFI2lr2Fovc3HNgknvvee1iVizO0j9UJpkwqMJYzscY4eJXL+Ydm7pIeIZ8KcSaQ9RErDBRCOlqy3D5Rcfyho9tI2GFu0am5pvOKZ4Vju6soxIoUSUDPDEUw5DbBodY09hIWpW0sZipoYhWp/+5UzUC7oYn9/O2+7fTXyrTnEzQlEjw075+BisVVGFRW5pzTm9ndCIg4ZlJy5j0hKZ6DyMQOhjLB0csCCWsMDoR8LyNLRy/somoOhGN1uYkp62bw4XnLOLbH1/PiqOyFMshB4amBuZ/GR4hZYTHc3k+9tjj7CsVAUKn6qoiKsA1wLkKJxqR4McH+u2fh4blXUcfxVntbdy0r3fSUb7hRZ3Mb0kyOuFjTaSj1gp+4PjMjU8wOObzjnO7WDAvTaniMEeof4lEXPrMu1fwnd/0UJe2nLa+hSUL6mhrSZFJGYJQGc8H1KXtpERUCx2PTuS44P7t/Kp/gEIYVlPIqn93VRGdAM4GrneqZ1kRBit+cNmOXfaL3Xtk3A+it4xw6roWgkCpBjbqlEzGctWNT/DVW/YCsKe3wLc/sT6OHuWIACu+Y/lRWTpb09y2dYgF89KccVwL4/mAUiWM3UBcLU48JTUAvaUyt/T2OUCsiIkziz7gJuAnXozYAAdjkO8NVS8VaBMRxvwgjGNpQqeM5CoR5+K1iwhBoNyxbRjPCiKw5dFRBkYqtDYn8WuIMdMIQ6WpweN7vzvAJ6/fCcCftg2zZEEdp61vIV8MMEYIXRQFJRNTar9OaipuoeqfgW8BPwMGmJYFV5fxBeB4hauc6rDE4FQhlTC0zUkThG5y0U4jI3DO6W0EoeIHyktOmc+8OSn8wB0WXDVgt8YwNBqlV6mYQ7t7CyQ8YVogRCSFTxXKFGyoerdGzDkDuD4GZ2pLFrVlC0tUlrsU+JrCRRIlksmmhgSd81L4oVJNnKwRCuWQC8/p4tiuevxQOX1DC87prArQ1gi5QsB5Z3bwp23D/HnbMBuXN3Lm8a3kSyFmmhLHBKh+/Ia4IHwjUKzZ2HHVhNebSWriBxNAN/BNQS5RVI9qS9OU9SScJnaqkaN90UnzEIkWHIR6RO5VdTAIlaasx/UfWceu/QW62tJk6zzKlRoJUDACC9syVYmzwF1xIdjUpHvhTBssM0lOGN8/VYQE4LraM1KX9ibLBdPHeD5gLOej8WKc6qw3ECq+I5U0rF3aQCpppoKbwvEpl6tqkvTwcDtIhxoOWF69aGtJHZYr1ggJa/CsECpkUpYgPDxIF4dayYThsT05Jgo+KIecJ5jqXpuOtK1mZkHfRdWTozszh9UqVUh4wmXX72TTB7ewY2+eeXOSuDhFcqpRUUkjYEGopJOW+ozlM9/p5mWX3MtP/3iQhjovspoziJU/1cikp9mPWQOUGl1cFL8tDfUeR5I6h7J1xxjbn5jgtR+5j6//5EmSntDSmCCTtCQ8IZkwZOs85jYl6BkoccHlD/Llm/dQqrhI/OXQilP2w6ezgTujkZlitIAmjVHVp21sHQ8BTpWkZ7n4VYt52xXbOThS4YNffowf/P4Ar3thJ+uOaaSlMUHFd+zrL/G7zQPc8oc+hsd9AFYeneXcM9qZKAR/ZT2rUHKFKQDzRwJ6JIAJgWSVa5mU5XAEtkaYyIecffp8Pjuxko9eu4Oy79j8yBibHxmjLm1pqPPwAzcJqjoWzk9zzYfWkM1YCjO4h6oKjOamvDc2223qIzYMiEQx55HsojEwUQh461kL+f7lGzlxdfPkvUIppH+4/FfgXnxSKz+44jhWHJWd0fc9BVAZmfpu7tmK6OTemyq4UGe1d2xEGJ3wOXnNHG6+4jhu2zrErZsHebh7gsGxCkaE1uYk649p5KWnzOPUdXNQB7ligD0EOGOEUsUxFAOMCT34rAEqhNVQLVcMETO7VgdrhYl4wS87ZR6vOG0+E4WAXCFEBLIZj2xd5EbyxXAymD/UIqwVcsWQ/ihdqsZwe58twDJQlHino3AY8TmUTlYDgOp1Y72Hxv5vZDyqBhgjR+5nEcgXA8ZyQTUG1ThBeEYAq7GeDwxUM6PRnP+MunJqOVN1/FWdns1QVaxn6R+ukCsGCogq4zUAn5Gjr97rrf5hd0/hWXfiiDCrGHU6tRNW6B0o4QeqsRSNAkPPBmB19FRPDgyVcY7/lyHCZLkipk//bKzobADuqPrBPb1F8oVDW7q/51CFXfvztdx6tCYheEYcrL60S1EHmJ7BEkPjFTwrqP7jwBkRyr5jd2+xtlqxdzbh2mwAdqsyJIKMTgS6u7cYlwr1H8Y5a4WB0TKP78tFFjSa+4Gn03B3uEhmEHgiLtfr9l3jeFYInP7duRg6xQ8czVmP+3eMc3CookbEqJIHth3JwMyGgybuWdsS+x3367sGCJ3SVJ+Y1EWn0WLCUKNfpzg3NT2aDadqvyMCjXUerU1JHt49wWe/040y2Vnyl7jaYKZ3VRyuEehwnb6iyvkiuN6BstnXX6KjNUU6bUgmLOmkoT7tUZexpJKWVMKQSBisjUv2NX5hOtjqLWujNKoubalLRwH37fcN8cWb9/DJr+9k38GSi+MNG/fR7TiSgZlNPlW9n4i7/J4nUFHwrBHpnJeSOQ0JOlpTdM5NM6cxQWtzkva5KeY2JchmPBrqPbIZSzplsGIwlqi8Hod/qhHHihXH4GiZvQdK3P3wCLduHuKxvblqVUFFsDFxrgPeMRvuMcu+y+qHlgA/AtYbI9W80M1AwcnWlGTCkM1Yshkr6ZQlkzKkk5ZkQqJOJqeUK458KSRXDBkarWi+FE4284hgq1t1qhyM+2E+XTOn/i0bZAHmxK2MjwqUjKDGiBojao2otdF5XNGffriaqtf0Y7JVTQS1ZrJhNgD+SNQQu/Dv0bM9EycBMjFHV8Qtx23AUfF5CzAXaBIhHXf6JiUWy0OZs7hXo6jKKPA4cDvwi7h/m6fTBPtMAc7UWH4oQtQD2Rjc/Bh4c0wYO+1fEMK412wkbl/ujfcWps/pnolI/h/+3iZffGrSmAAAAABJRU5ErkJggg==', 'rc': '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', 'class': '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', 'race': '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'}
+
+
+CHECK_ICONS = {   # Other Stuff / Checklist pictures (56 px; 'item' = the locked custom-checklist icon, 44 px)
+    'gank': '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',
+    'kda': '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',
+    'imenu': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAEXUlEQVR4Xu1aPWsUQRie26+LIiimCSqIBA5BEK0EC9MELQQLm/yHK1IJFtYWgpVF/kMaC8FCSRMLwUpLCdip2AQULJK7/ZB3Zp/Nu3vvzqy3l2iy9zST3N7N1/O8z8y8s0rNcbzRm1X3FxcvZLOqi7C7+30mfWtVCR/UxsaLqce3unpH/3Zr613x92Bwo6ivzWC9qXt1TPDXDLpY29x83Wroa2v3S78ndtuweeIZDJpON5irxlqVse3tN02rbAy0mbOpzaxpXDoHKA2MD6o6oMHFsyrwjTA8z5R1cQDbTdNUfy9OUucE7ex80t8dDJoNtNsSJfYkSXLWrl46p2c0Co0YwiBQ/pQMJkmqrl8JdT2jcazLOslzJm1y7SaDtrijGV1eOqNnd6EfqYUoKjEYBL7y89hD6UKSxyCVcQwlGAavXT6v9vZHtWwSk7Z4dJoMDAVSocGdXugXA+xHRlJRYKoKfL8wF88z9tKrsZkst5k0NXZDZhP7if77QOY95fVMPctL9ZKtQ7ckWrfWcWhZ9o0sT/UjFYWGwTDwdUlLA2a8l8+8C5mXM5h5EwaFujTDmbyfty0dVomSPCFNuCXFXCHLMNSuaaSZr3k1g7r74GFpnG9fvSz+x2/83oEc+eqJgZGU0Y+mG4ruSFRa8ziwzlEJQyFZVpl7/PT5hCI/fnivbt66PfG59NmzJ49KilDKV2lqVJKEqRrnLitBWhu7wyAHXxpob2lMJI81zdqBoVRjjhhAvPE4q4Ke4bn0fdRLpoX2qG30A/1yxaJzHYQEsS7R4o1NNHc4DkhPkiAgPZMmhNpAe9Q2+oF+cSAzwNFNiZZmIN928VksdigN1zkCGY3EsgvUBtorqSfvFwfldKqYM4jDKj+01u0tDwu8Pak/NjhNpg2qsuTgz2xm1BZzibYBZ2Zak2mLE8/goQ6QWHPFoe35LOA0GZzA+EkMJ3EXIFFps123AZfA25P6Y8OhMvg/wMkgkrIoKTGEHAqdxKXdDGRn25PaDIgjy7KiPdO2SRKjdGHOIKXTCZSU1SWfRcqhCPtRnAr46cCWsrCB0hVcPegH+uWCKFF+hYXzFjLOlLfkqb2mCabqbsV2ViSQNCHFODGpxDhO1Dg2+dKdb790ubJyb+LKjaM7EqX8/nC4rqdNuo7GXUEYxJXUntn+2rJqUp6GPkP+pWoqmq08JMZxokY5a9QH9EPCcLiuP+Z3Fd1hUIIUi3RXgANoOWVRn/iVmJJY44ZCzBFG47HaH43133ujkfr89WcRe4TqlXcVJZMBtTap0kWIlG1Gaq/13URuKJAlDQ6XLyirkKQJdFuikgTM9ZmZHyMpY+eUlCW0vz6DNM1yQLIEc19+/NbLQhNpAtbXSP7FDS/WObglYo4grXkkz07f8FoZJBz1WxbYoQCQZFWWNmPhOPEm42QQOKoXgThjkpk0Za6RyUg46nfVCBgUwWYoEuYStcHFZhu0YW1uMtPgf32leY7jjj93K0fvU/K3jwAAAABJRU5ErkJggg==',
+    'seer': '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',
+    'healer': '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',
+    'blademaster': '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',
+    'jester': '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',
+    'other': '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',
+    'check': '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',
+    'item': 'iVBORw0KGgoAAAANSUhEUgAAACwAAAAsCAYAAAAehFoBAAAPCUlEQVR42r2Ze5DdZXnHP+/l9/ud216z2SQmJjFZIPcQkkBQCNmQqoBKC5TC0JFWZzJ1BOyM06qtTkKd1taOI1IYKSkSW3XUKaOOoDgNLgQQKEnMRRNIdpdsNpvdbPZydvfcfpf3ffvHORs2V0Cpv5l3zsw573mf5/e8z+X7fR54Z4+E6zSghRBIKRDirZeUAqUkUgqklEgpAXTtLPlOFBDvYJ8A7OQXSmXvd46V4OxbCXXO4lyEECnrnJGQ7BPCbHFuqiFwtXXRR79NhR3ggiCYL2X6pnK5nLS3b9jc0tI8M0kM4gKvLQRYC76vmT17Fr29J2hsbCAMK1c9/vi3TkiZ1tYmT0F49O1a+O0oLFtaZi8Mw5AZM1pvzWSyXymVStx880doa1toRkbyKKXO/0cJSWLJ5TJcffUadu58maVLF5HPj8zs6Hj+kZkzZ1AojNcdPtz1xPTp9fT19XVNvcV36hJqy5YtbuvWrTQ3v+fYxEThPe3t15r77ruHQqFIKuWpvXtfE7t2HyAVBDjnLiyh9lMYRqxes5yVKy5zcWzMzTd/iE996q/Zvv07qrGx8cTo6MDcrVu3cv/99wvAvBOFPSFE7Jzflk5n//tzn/vs4sbGBr+uLkddXR0dHa+gPZ/XDh5g36/3EFxM4dPuIQjDkJWrrmDRkmUkSczHPno9/f0DpNMBLS1N0Q033HooSQq3SSk6rXUeEJ9jxfNZFkiA9ksvXfI3t9xy86arr75KhWFCf/8QPT29dDzzDN2HjzAaFVCtObymLF5TDq85V/08ezVmUQ1pdFOWwvgEPa93cvz4MYT0KBZDmpqaaGt7n7rssraZ/f3Drf39fSNC0FXTxb2VD1vwVrW1XXrv2rVr/uSWW26Ojh497j/33K/o7u5Ba8lQeZQkjpk2Zy7vXbwAHEilEfL8ycJZizUJCDh1qJtTR46hE4+XXn4VExsOHZpNpVLhE3/58ejEiYE7wAZ79+7KO+f2irMi+mwLy+uuuzsYHHxjx623/vE1d9zxp/Gx3uN+xy9fZtfu/+VYzxFKcZH5G65kxvJLqJs5Ha09/FQKL/DxAh/t+2jfm7I02tMo7SGQZKc303LpPHKzWnhj3376j/dQLJeJY8HIyJC6557NsRBi6Y4dOzd0dUX/sW/fc3aqlcWUPEhLy+yFztmOe+/9dMuKFcv84eG86Oh4hRee20EwdxrZOa1YKUnVZ5FBgBcEKK1BK5SS1bRQizJ72qcdWIsxFpcYbJLgkgRtLJWxIiaOGO8ZIOod5pr2P2LDdVexbt0qd/Lkyei22/58KJvNtvf1dXdN3v5Ul7BDQ/lxzxOzm5oaGRwc4dlnX2TPnt2k5rbgz2hiUVsb1y5diQ58stkcqVQKz/fQnodSCiFltboB2SCFEALnHM5aEmNI4pgwDHn9eA9P7n4Z5fvEpQrWWArAq6++RFgpkU6nhJQuyOfzs/P5wngt1U2Wx6pJfL/ukvnz53103ry5SV1dTvf2nqK7q4eTJ/u49IprsZmAmdOms+nyNaQzGTLZDJl0mnQqDVqfk29e7T5MlCQIBFYKhBJEJmbxvPfR0tDITw7sIvA8sI5sSxNSSToPvUhvQwuHD7/B/PmzuPvuu5Jf/3rfXfv3H/gpRJ2A0DU/NkrJj6RS6a/dd989Sblcplg8ivYU6YZ6lO8jUwFBNoOfTpNPItK6noqz5AtjeNo7rbBAUIoitr2wg0JYQUuJcw4pJfniBJ98/yYua53FzJZWyqVS9QYEKM+vyvIkxWKRWbNm8sgjD9LefuPXpPSctdEDgJp0CVcuV/KlUskUCkWe2/kqv3p+J0PlEeZvXEsqlyX2JLm6OqTv8Q8/+h7/+mef5PDAAN/s+DlN2RzGWgSQWEt9Os2/3bmZwNMXzBoP3LWZz/9gO2EY4qcstiHL/I1rOfr8HiZ+MUapHDI2NsHAwEljbTk/GXjaOWe0zv3jBz+46fabbvqwCAJPetrHxAlJFONl0qggwHqSIJ0ilU4xVCrhRNWaYZIQJQmJtciaz46Vy/zz00+ghITaPuccUghKccglrbO4a+16VOChUj5KQBzHeA6SKMbqBK08tFbqBz/Y7h577D//7tFHH21zLvmillI6pTJrGhrq2xYsWGheeWWPfO3QAZKUYNrsuUil8IIApwXS09TlcvxV+w1My9Xz2sAJdC3QlJTESYKrlkn29b4BQGIsiTUE2kMKQTEKq/u1QmqF9DyEBc8LsFHCtEvmkgyXeO3Qb2huzollyxZbKVWbEGqNUsppAGtdMUkSm8+PsXv3b9i/dw/ZthnMWbIAqSTa0xglEFKTDlJce+lSskGKxJrTuTExhlmNTWip6MuPkPFTGGeY2ZCjMZ3l2MgpZK0IpDy/hpNVFThph/Y8YiWZvmQBx3cdYP/ePQSpHCtWLCGfz1shZNE5dxrHSiGElFISBD6+HyCFqlYwrRFagZIEvkeUxGz+r4fpGx0m5flY55BCUgwr3Hnlej7dfgOlKERJQaFS4Zq2xXzpo7eTWIN1DovD2WqOFlIgVdXSQiuk1lWZQuH7Ab7vs379OubMmS2tjaSU4lzg7ZzDOYcQEqk0UskaW5DVPIsgpT3EeUCwdZbIJKS0x1dvu5tls+dRCCtYZy8MFUWVhSgtkaoqUwh5Gky99NIu+vr6kdLHWncRPCxEVUFZrWBCVBEXQlyQFkxSBiklM+obyfg1FOcuIqMmByHflDfFGIVCiTiOT5Ma+fbZ0VsTKiUEUggSY3DOEZtqEOoLAPwzzxTnFSBrQT2VS70rjxCCShwTm4RckMLhSPs+SggKYeXdEvPuKGycpSGd5es7fspT+/fw+CfuRQrJF264lXnTWvmLbz2IN1mj3O8nS78rby0k45USd121ngUtM/jKz54g7fmUopDlc+az5WN38PX/+QmiWkX+vxWewr7dhffEJmGsXOL1gT52HNxHLpViolIhTBKuaVtMJY5Jae/8x58t53dSuAYLnbVgLU5Qi3h3nnTmWNg6i909XTjnWD1vYS0/C0aLBX6460XmNU9ntFSgGIZnyqjJwdk35V2EH+rzBU8Vx1ZpjTUexlisrIIWh0NNoUKTR3/xptuYXtdwUet86cff5eT42OmodzWlrbWYxGJNVaZz9rQeF1LYOuestZYwjIiiEM8ZENQYgsEpgTGGOE4YLRZOo7PJI7/6ix/jK01sEkpReJp5+FqT9qr5eGB8FF9pXO01nXVYYyAxp9kIAqwzRFFIGEZYa3HO2cl+ha7mOpHVWsvGxgazevUywsoEx06d4NTBblqXXkISJ1gniKMQXyru2/gRWurqOdh//LQVjg4NUokjFkyfyYeWrsJYi5KS1wf6ePb135DyfQKlEVK8WVGtwRiDSBKSOMYay6mD3XhlwYrLr2D16mU0NjagtZZSiqwxoK21QuvcrrGx8QXd3V0LVq5c5EZGCuJEbx+njhyjZdEC4jDEWEkcRZgk4bIZs/CVxkwpuVVcYZleV8/qeQtJjEErRZQk/KrrNTJ+gLXV/dZajDGYJMHGMcQRcRxijWH4yDGmZ6axaPFyVq5c5Lq7u8TY2Hinc+yy1gothFDA3//85093HjnSue3LX95q4yTSytNo3yMulZFSklhJEsb0Dw9xz/f/nW9+/NMESiGqyAljLRk/4Lcnern3e9tOd3y0UmSDFLaGlyXgjKVSrmDCGFOJcGGIqYTEpTLa91CeJk4iwjA2DzzwkOjs7PwnCB8XQuhJHxbpdKoxk8moXC6bbGy/ivq6DC+88BLdv3yV+RvWYnIBcSXEhBFxJaZULjNRKpIvTSClxNSsN0lCXc2LY2sohZUqbnCOQrlEvjBOoVggqlSIwhBXiaiMFTm2czcL5rRxzTVXs2bNctLpNJlMRqXTqcZyORSTPmwAjLFPVipl8eCDD/3LnXfeTjabJYkN5bFxkjDES3ns7zrMd3BsXtdOkxdw+cy5bL3xdtJBCikkQp4b2VVfdRhrMSahXCmTUR6lQoG4XCYqlhBxgomjqqwZhmw2S6EwwbZtj1GplD9rjH1ysqhOohJpTDQ8PFzs7u099rcbNqynoaGBsfFxJiYKVKIyytMUbUJ/fpTL58zj+Ogw+cIEgdJV36zlUGcs1pg3Vy36kzgmCSOSMCY/PsaBNzo58EYXlWKJ8vAoE72D5FSGJUsXs2zZZZRKRR599DF56tTo3cYUjk32kPWZbdXGeuds3+hovmXFijn+9ddfK6T0efG5HYwjaFSKUhjzwJNPoFPVRopQVfB9ZiPlrFI2pZFikoQkDCGOoRRh4piJ46eIeof5wHWbaG+/imnTGt3+/Sei+vq6ISFk/dBQ8dTZrSoHuFJpIn/llbc+/MMfbr+jvr6+Zd26tXHztHplrM+Jrh6O7TtAeWCYlvmzCXwPDWgHvhB4gOdAW9DWnbGUsShjkbFBWYt2QCWm59lXGfjtEXIqy7r3X8vG69cxb+6c+KmnnlYPP/xI16pVNy45dOj5oVoOdufrrbmenn0mScyL+fx469DQyNIN110bNTU1qEolRqk00xpbOHrwIIOHurAmIdVcTxLFmMRikmp358xVZd9xGGKtYfBgJ8de2sf48ZO87z0LaW6eydIli9m48QPMn/fe6Nvf/q6/c+cLPxoc7L+vp2dP39kAQ1yg3Wqq7dblm6+/vv2OTZs2Mjg4wuDgMMVigad/9jQmNiQpQZQCJSVCnMkUzsElzmKsxa+ArjiUp/jwjR8mm83R2jqN1tZmduz4Jc880/H9w4cPPAp0TNHlouDH1BraHYcPH+7t7e1bPGPGjMWNjQ3+nDnTqatbwMRE+XduaLetuoJFS5aTxBFr1qxgYmKCiYkCBw70R9u3f+dQuVz8khCi07nzN7QvhNZi55zasuXz3Vu3br3i7JHB+vVrSaU81dyUE34qd/GRwVRGEoasWb2cyy9f5CqV2KTTabZte4yOjudVXV3uVKk0fEVtZKDOp+zbHXuddyjzmc/c85ZDmXOuzhiamxvp7OxS3/jGQ2QyGUql4hdOnhx8IggChoZ+v6HMOc/UsdemTZu2vtXY6zyujNaKoaGRgR07dmxNp9Pa2vJTYfj2x15/kMHimeMIIYVgnzHFLWdxy7dHOf4Qo9uzx7i18v07jW7/DxGqmXT4s1f3AAAAAElFTkSuQmCC',
+}
+
+
+class PixBtn(tk.Frame):
+    """Tan button with the mockup's dark pixel border."""
+
+    def __init__(self, parent, text, command, font, w, h, bd=3):
+        super().__init__(parent, bg=BROWN, width=w, height=h)
+        self.command = command
+        self.lbl = tk.Label(self, text=text, font=font, bg=TAN, fg=BROWN, cursor="hand2", bd=0)
+        self.lbl.place(x=bd, y=bd, width=w - 2 * bd, height=h - 2 * bd)
+        self.on = False                                   # (white = switched on, see set_on)
+        self.lbl.bind("<Enter>", lambda e: self.lbl.config(bg="#ffffff" if self.on else TAN_HI))
+        self.lbl.bind("<Leave>", lambda e: self.lbl.config(bg="#ffffff" if self.on else TAN))
+        self.lbl.bind("<ButtonPress-1>", lambda e: self.lbl.config(bg=TAN_DN))
+        self.lbl.bind("<ButtonRelease-1>", self._up)
+
+    def set_on(self, on):
+        self.on = bool(on)
+        self.lbl.config(bg="#ffffff" if self.on else TAN)
+
+    def _up(self, e):
+        self.lbl.config(bg="#ffffff" if self.on else TAN_HI)
+        if 0 <= e.x < self.lbl.winfo_width() and 0 <= e.y < self.lbl.winfo_height():
+            self.command()
+
+
+class App:
+    PROFILE_W = 190
+
+    def __init__(self):
+        self.cfg = load_cfg()
+        self.q = queue.Queue()
+        self.selecting = False
+        self.tracker = Tracker(self.cfg)
+        self.inputs = InputWatcher(self)
+        self.win_rect = None                      # screen rect of this window (for ignoring clicks on it)
+        self.demo_until, self.demo_t0 = 0.0, 0.0
+        self._sig, self._top_t = None, 0.0
+        self._drag = None
+        self._last_cap = None
+        self.cap_text, self.cap_until = "", 0.0
+        self.entry_vars = {}
+        self.profile_menu = None
+        self.capturing = None                     # ("hotkey", action, token) / ("move", move, token)
+        self.hk_handle = {}
+        self.imenu_scans = frozenset()           # scan codes of the Instant Menu key (read by the hook)
+        self.chat_open = False                   # Roblox chat is being typed in ("/" pressed, no Enter / click / Esc since): every keybind is off
+        self.train_scans = frozenset()           # scan codes of the Snap Training start/stop key (read by the hook)
+        self._train_key_t = 0.0
+        self.key_btns = {}
+        self.move_key_btns = {}
+        self.confirm_delete_until = 0.0
+        self.scroll_cvs = {}
+        self.cur_tab = "main"
+        self.slot_cx = {}                          # key -> screen x of its tab centre (from the hotbar watcher)
+        self.slot_t, self.slot_scans, self._slot_rate = 0.0, 0, (0.0, 0, 0.0)
+        self._wd = (0, time.time())
+        self.hotbar = HotbarWatcher(self)
+        self.cl_rects, self.cl_hits, self.cl_scroll = (), [], {}          # the on-screen checklist: boxes the mouse hook catches / its click boxes / scroll per list
+        self._cl_sig, self._cl_top = None, 0.0
+        self.explode = ExplosionDetector(on_heard=lambda n: self.q.put(("explode_heard", n)))
+        self.explode_listener = AudioListener(self.explode)           # (only listens while Alchemy/Smith runs)
+        self._exp_failed = False
+        self._mana_img = None                      # (file key, picture, inner x range) of the overlay picture
+        self._mana_top, self._mana_busy = 0.0, False
+        self.mana_edit, self.mana_edit_btn, self.sel_mark = None, None, None
+        self._edit_item = None                     # the decoration being moved / resized on screen (None = the mana picture)
+        self._decor_imgs, self._decor_top = {}, 0.0
+        self.decor_vars, self.decor_btns, self.decor_onbtns = {}, {}, {}
+        self.dashcd, self.dash_lock = DashCD(), threading.Lock()       # Dash / PB CD state (worked on by the key hook thread)
+        self.dash_btns, self.dash_vars, self._dash_top, self._dash_cache = {}, {}, 0.0, {}
+        self.g_dn = self.q_t = -1e9; self.last_q = None
+        self.g_t = -1e9                                                # when G was last pressed / let go
+        self.inv_key_open, self.inv_key_t = False, -1e9                # the ` key's idea of "inventory open" / when it was pressed
+        self.inv_learn_pending = None
+        self.inv_mem = {}                                             # grid cell -> (item name, card rect, when): see inv_remember
+        self.inv_learn, self.inv_status = None, {}                    # item name being learned (next card click) / Settings labels
+        self._inv_sigs = None
+        self.inv_err_t = 0.0
+        self.mana_keep_until, self._mana_listen_off, self._mana_listen_next = 0.0, False, 0.0
+        self.mana_absent, self._mana_gone, self._mana_seen_now = False, 0, True      # the game's mana bar isn't on screen
+        self.hp_absent, self._hp_seen, self._hp_gone = False, 0, 0          # the HP bar is not on screen (inventory / menu): coins hide
+        self.inv_boxes, self.inv_boxes_t, self.inv_miss_t = [], 0.0, 0.0     # recognised items on the screen [(name, rect)] / when / log throttle
+        self.mana_pct, self._boxes_now, self._pct_top = None, [], 0.0     # (time, mana %) / cast-mark boxes on the bar / raise timer
+        self.pct_btn, self.pct_vars = None, {}
+        self.kda_btn, self.kda_vars = None, {}
+        self._probe = collections.deque(maxlen=60)                     # (time, mana is charged) samples for the mana dashes
+        self.mark_key_btns, self.mark_vars = {}, {}
+
+        r = self.root = tk.Tk()
+        r.title("Cooldown Indicator")
+        r.configure(bg=ART.KEY_COLOR)
+        r.overrideredirect(True)                    # no Windows title bar: the art is the window
+        try:
+            r.attributes("-transparentcolor", ART.KEY_COLOR)
+        except tk.TclError:
+            pass
+        r.geometry(f"{WIN_W}x{WIN_H}+20+0")
+        r.attributes("-topmost", bool(self.cfg["settings"]["topmost"]))
+
+        # ---- fonts ----
+        load_private_fonts()
+        self.family, self.has_font = pick_family(r)
+        px = UI_FONT_PX
+        self.f = (self.family, -px)
+        self.fs = (self.family, -(px - 1))
+        self.fm = tkfont.Font(root=r, family=self.family, size=-(px - 1))
+        self.num_family = self.family if (self.has_font or not IS_WIN) else "Segoe UI"       # the numbers on the screen: Manufaktur too (a clear bold system font only when it isn't found)
+
+        # ---- pictures ----
+        red = _img(ART.RED_PNG)
+        self.img_bg = ImageTk.PhotoImage(_img(ART.BG_PNG).convert("RGB"))
+        self.img_green = ImageTk.PhotoImage(tint_green(red).resize((84, 74), Image.LANCZOS))
+        self.img_train_off = ImageTk.PhotoImage(red.resize((34, 30), Image.LANCZOS))                 # Snap Training: red = off
+        self.img_train_on = ImageTk.PhotoImage(tint_green(red).resize((34, 30), Image.LANCZOS))      # green = on
+
+        # ---- canvas: frame art, banner, tabs ----
+        cv = self.cv = tk.Canvas(r, width=WIN_W, height=WIN_H, bg=ART.KEY_COLOR,
+                                 highlightthickness=0, bd=0)
+        cv.pack()
+        cv.create_image(0, 0, image=self.img_bg, anchor="nw", tags=("bg",))
+        cv.bind("<ButtonPress-1>", self.drag_start)
+        cv.bind("<B1-Motion>", self.drag_move)
+
+        # banner: green mushroom = tracking (always)
+        cv.create_rectangle(147, 14, 240, 195, fill=CREAM, outline="", tags=("banner",))
+        cv.create_image(193, 94, image=self.img_green, tags=("banner",))
+        self.caption = cv.create_text(193, 166, text="Tracking", width=86, justify="center",
+                                      font=self.fs, fill=BROWN, tags=("banner",))
+
+        # hide / close buttons on the orange rail to the right of the banner
+        self.corner_button(281, 95, "-", lambda: self.q.put(("hide",)))
+        self.corner_button(301, 95, "x", self.on_close)
+
+        # tabs
+        self.tab_rect = {}
+        tab_font = self.fs                       # smaller text until all five tab names fit on the strip
+        for drop in range(1, 6):
+            fnt = tkfont.Font(root=r, family=self.family, size=-max(7, px - drop))
+            widths = [fnt.measure(t) for _, t in TABS]
+            tab_font = (self.family, -max(7, px - drop))
+            if sum(w + 8 for w in widths) + TABS_GAP * (len(widths) - 1) <= TABS_X1 - TABS_X0:
+                break
+        for (key, text), (x0, x1) in zip(TABS, tab_layout(widths, [k for k, _ in TABS].index("extras"))):
+            rect = cv.create_rectangle(x0, 213, x1, 236, fill=TAN, outline="", tags=("tab",))
+            txt = cv.create_text((x0 + x1) // 2, 225, text=text, font=tab_font, fill=BROWN, tags=("tab",))
+            self.tab_rect[key] = rect
+            for it in (rect, txt):
+                cv.tag_bind(it, "<Button-1>", lambda e, k=key: self.select_tab(k))
+                cv.tag_bind(it, "<Enter>", lambda e: cv.config(cursor="hand2"))
+                cv.tag_bind(it, "<Leave>", lambda e: cv.config(cursor=""))
+
+        # ---- pages ----
+        holder = tk.Frame(cv, bg=PARCH)
+        cv.create_window(PAGE_X, PAGE_Y, window=holder, anchor="nw", width=PAGE_W, height=PAGE_H)
+        self.pages = {}
+        for key, *_ in TABS:
+            pg = tk.Frame(holder, bg=PARCH)
+            pg.place(x=0, y=0, relwidth=1, relheight=1)
+            self.pages[key] = pg
+        self.build_main(self.pages["main"])
+        self.build_mana(self.pages["mana"])
+        self.build_extras(self.pages["extras"])
+        self.build_settings(self.pages["settings"])
+        self.build_cred(self.pages["cred"])
+        self.select_tab("main")
+
+        for action, _ in HOTKEY_ACTIONS:
+            self.hk_register(action)
+        r.bind_all("<Button-1>", self._maybe_close_menu, add="+")      # click outside closes the dropdown
+        r.bind_all("<Button-1>", self._defocus, add="+")               # a click anywhere but in a text box stops the typing
+
+        self.ov = Overlay(r, self.append_log)
+        self.mana_ov = ManaOverlay(r, self.append_log)
+        self.decor_ov = DecorOverlay(r, self.append_log)
+        self.dash_ov = DecorOverlay(r, self.append_log)
+        self.buff_ov = DecorOverlay(r, self.append_log)               # the potion effect icons left of the 1st hotbar slot (and the buff move icons right of the last one)
+        self.dash_ov.prefill(8)
+        self.buff_ov.prefill(10)
+        self.inv_ov = InvBoxOverlay(r, self.append_log)
+        self.inv_cd_ov = Overlay(r, self.append_log)                  # the cooldown boxes ON the inventory cards: the very same look as the hotbar's
+        self.pct_ov = PctOverlay(r, self.append_log)
+        self.bard_on = False
+        self.bard_badge = BardBadge(r, self.append_log)                # "Auto Bard is Active." under the mana bar (never hidden)
+        BARD_LOG[0] = self.append_log
+        self.autobard = AutoBard(self)
+        self.autobard.start()
+        self.kda_ov = KdaOverlay(r, self.append_log)                  # the KDA counters under the Auto Bard badge
+        self.kda_hits, self.kda_rects, self._kda_sig, self._kda_top = [], (), None, 0.0
+        self.check_ov = ChecklistOverlay(r, self.append_log)          # the checklist right of the mana bar
+        self.mascot = Mascot(r, self.mascot_pop, self.mascot_moved)
+        if self.cfg.pop("_dash_fresh", None):                          # first start: put the coins where the game has them
+            self.cfg["dashpos"] = default_dashpos(*screen_size(r))
+            save_cfg(self.cfg)
+        added_ = self.cfg.pop("_pack_added", None)
+        if added_:
+            self.append_log(f"Version {DEFAULT_PACK_VERSION}: added {len(added_)} new default profile(s): " + ", ".join(added_) + " (yours are untouched).")
+        new_ = self.cfg.pop("_dash_new", None)
+        if new_:                                                       # coins that came with an update: on the game's own spots
+            dflt_ = default_dashpos(*screen_size(r))
+            A_ = ref_anchor(*screen_size(r))
+            for k_ in new_:
+                self.cfg["dashpos"][k_] = dict(dflt_[k_])
+                if valid_anchor(self.cfg.get("dash_anchor")):          # (the other coins already follow the hotbar: so does the new one)
+                    move_item(self.cfg["dashpos"][k_], A_, self.cfg["dash_anchor"], left=(k_ == "rune"))
+            save_cfg(self.cfg)
+        if IS_WIN:
+            threading.Thread(target=self._probe_loop, daemon=True).start()
+            threading.Thread(target=self._pct_loop, daemon=True).start()
+            threading.Thread(target=self.awk_loop, daemon=True).start()
+        r.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.inputs.start()
+        if IS_WIN:
+            threading.Thread(target=self._inv_loop, daemon=True).start()
+            threading.Thread(target=self._hp_loop, daemon=True).start()
+        self.hotbar.start()
+        self.say(f"Ready - tracking is always on. Profile: {self.cfg['active']}. "
+                 f"{self.key_name('area')} = find the hotbar, {self.key_name('test')} = test overlay.")
+        if not self.has_font:
+            self.append_log("Manufaktur font not found - using " + self.family + ". Put "
+                            "Manufaktur.ttf next to this program (or install it) and restart.")
+        r.after(60, self.poll)
+        cleanup_old_exe()
+        self.upd_info, self._upd_busy, self._upd_installed = None, False, False
+        r.after(5000, lambda: self.start_update_check(False) if self.cfg["settings"].get("update_check") else None)
+        r.after(33, self.overlay_tick)
+
+    # ---------- small helpers ----------
+    def corner_button(self, x, y, text, cmd):
+        cv = self.cv
+        rect = cv.create_rectangle(x, y, x + 16, y + 16, fill=TAN, outline=BROWN, width=2, tags=("cbtn",))
+        txt = cv.create_text(x + 8, y + 8, text=text, font=self.f, fill=BROWN, tags=("cbtn",))
+        for it in (rect, txt):
+            cv.tag_bind(it, "<Button-1>", lambda e: cmd())
+            cv.tag_bind(it, "<Enter>", lambda e, r=rect: (cv.itemconfigure(r, fill=TAN_HI),
+                                                          cv.config(cursor="hand2")))
+            cv.tag_bind(it, "<Leave>", lambda e, r=rect: (cv.itemconfigure(r, fill=TAN),
+                                                          cv.config(cursor="")))
+
+    def drag_start(self, e):
+        if "bg" in self.cv.gettags("current"):
+            self._drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+        else:
+            self._drag = None
+
+    def drag_move(self, e):
+        if self._drag:
+            self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
+
+    def select_tab(self, key):
+        for k, rect in self.tab_rect.items():
+            self.cv.itemconfigure(rect, fill=TAN_DN if k == key else TAN)
+        self.pages[key].lift()
+        self.cur_tab = key
+        self.root.bind_all("<MouseWheel>", self._wheel)    # (_wheel scrolls whichever page is showing, if it scrolls)
+
+    def _defocus(self, e):
+        try:
+            if not isinstance(e.widget, tk.Entry):
+                self.root.focus_set()
+        except Exception:
+            pass
+
+    def _wheel(self, e):
+        key = (self.extra_page if (self.cur_tab == "extras" and getattr(self, "extra_page", "") in ("dash", "class", "inv", "race", "brew", "gank", "check", "cview"))
+               else self.cur_tab)
+        cv = self.scroll_cvs.get(key)
+        if cv is not None:
+            cv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+
+    def say(self, msg, cap=None):
+        """Show a message on the Main tab; optionally flash a short caption under the banner mushroom."""
+        self.append_log(msg)
+        if cap:
+            self.cap_text, self.cap_until = cap, time.time() + 2.5
+
+    def append_log(self, msg):
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        try:
+            self.msg_lbl.config(text=msg)
+        except Exception:
+            pass
+
+    def label(self, parent, text, **kw):
+        kw.setdefault("font", self.f)
+        kw.setdefault("bg", PARCH)
+        kw.setdefault("fg", BROWN)
+        kw.setdefault("anchor", "w")
+        return tk.Label(parent, text=text, **kw)
+
+    def bound_entry(self, parent, initial, on_change, w, h, justify="center"):
+        """Brown-bordered text box that calls on_change(text) on every edit."""
+        box = tk.Frame(parent, bg=BROWN, width=w, height=h)
+        var = tk.StringVar(value=initial)
+        ent = tk.Entry(box, textvariable=var, font=self.f, justify=justify, bg=TAN, fg=BROWN,
+                       relief="flat", bd=0, highlightthickness=0, insertbackground=BROWN,
+                       selectbackground=BROWN, selectforeground=TAN)
+        ent.place(x=3, y=3, width=w - 6, height=h - 6)
+        ent.bind("<Button-1>", lambda e: e.widget.focus_force())
+        var.trace_add("write", lambda *_: on_change(var.get()))
+        box.entry = ent                                  # (so callers can recolour it / bind more events)
+        return box, var
+
+    def make_entry(self, parent, key, cast=float, w=78, h=26):
+        def changed(text):
+            try:
+                self.cfg["settings"][key] = cast(text.replace(",", ".") if cast is not str else text)
+            except ValueError:
+                return
+            self._sig = None                         # redraw the overlay with the new value
+            save_cfg(self.cfg)
+        box, var = self.bound_entry(parent, str(self.cfg["settings"][key]), changed, w, h)
+        self.entry_vars[key] = var
+        return box
+
+    def entry_row(self, parent, text, key, cast=float, pad=8, w=78, h=26, wrap=0):
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=pad, pady=1)
+        lab = self.label(row, text, justify="left")
+        if wrap:
+            lab.config(wraplength=wrap)
+        lab.pack(side="left")
+        self.make_entry(row, key, cast, w, h).pack(side="right")
+        return row
+
+    def check_row(self, parent, text, key, extra=None, wrap=250, pad=8, getter=None, setter=None):
+        """A tick box for a setting (key), or for anything else through getter() / setter(value)."""
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=pad, pady=2)
+        state = {"v": bool(getter() if getter else self.cfg["settings"][key])}
+        box = tk.Frame(row, bg=BROWN, width=17, height=17)
+        box.pack(side="left", padx=(0, 8))
+        inner = tk.Label(box, bd=0)
+        inner.place(x=3, y=3, width=11, height=11)
+        lab = self.label(row, text, justify="left", wraplength=wrap)
+        lab.pack(side="left")
+
+        def paint():
+            inner.config(bg="#ffffff" if state["v"] else TAN)      # white = on
+
+        def toggle(_e=None):
+            state["v"] = not state["v"]
+            if setter:
+                setter(state["v"])
+            else:
+                self.cfg["settings"][key] = state["v"]
+            save_cfg(self.cfg)
+            paint()
+            if extra:
+                extra(state["v"])
+        for w_ in (box, inner, lab):
+            w_.bind("<Button-1>", toggle)
+            w_.config(cursor="hand2")
+        paint()
+
+        def repaint():                                    # (the value can change behind the box's back: another profile)
+            if getter:
+                state["v"] = bool(getter())
+            paint()
+        row.repaint = repaint
+        return row
+
+    def panel(self, parent, title):
+        outer = tk.Frame(parent, bg=GREYT)
+        inner = tk.Frame(outer, bg=PARCH)
+        inner.pack(fill="both", expand=True, pady=4)
+        title_lbl = self.label(inner, title)
+        title_lbl.pack(fill="x", padx=8, pady=(3, 3))
+        outer.title_lbl = title_lbl
+        return outer, inner
+
+    def rail(self, parent):
+        r = tk.Frame(parent, bg=BROWN, height=9)
+        tk.Frame(r, bg=ORANGE).place(x=0, y=3, relwidth=1, height=3)
+        return r
+
+    @staticmethod
+    def fmt_bar(b):
+        return f"first slot {b['w']}x{b['h']} at ({b['x']}, {b['y']}), step {b['pitch']:g}px"
+
+    # ---------- pages ----------
+    def scroll_page(self, page, key, inner_w):
+        """A page that scrolls with the mouse wheel and shows a thin brown scroll thumb."""
+        cv = tk.Canvas(page, bg=PARCH, highlightthickness=0, bd=0, yscrollincrement=26)
+        cv.pack(fill="both", expand=True)
+        self.scroll_cvs[key] = cv
+        f = tk.Frame(cv, bg=PARCH)
+        cv.create_window(0, 0, window=f, anchor="nw", width=inner_w)
+        def region(_e=None):                         # (never smaller than the view: a short page can't be scrolled away)
+            cv.configure(scrollregion=(0, 0, inner_w, max(f.winfo_reqheight() + 8, cv.winfo_height())))
+        f.bind("<Configure>", region)
+        cv.bind("<Configure>", region, add="+")
+        thumb = tk.Frame(page, bg=BROWN, width=5)
+
+        def on_scroll(a, b):
+            a, b = float(a), float(b)
+            if b - a >= 0.999:
+                thumb.place_forget()
+            else:
+                thumb.place(x=PAGE_W - 7, rely=a, relheight=b - a, width=5)
+        cv.configure(yscrollcommand=on_scroll)
+        return f
+
+    def build_main(self, page):
+        f = self.main_inner = self.scroll_page(page, "main", PAGE_W - 8)
+
+        # --- 1. hotbar ---
+        outer, p = self.panel(f, "1.Hotbar (the 12 slots)")
+        outer.pack(fill="x")
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        self.btn_area = PixBtn(row, f"Find hotbar ({self.key_name('area')})", lambda: self.q.put(("area",)),
+                               self.f, 124, 26)
+        self.btn_area.pack(side="left")
+        self.btn_test = PixBtn(row, f"Test ({self.key_name('test')})", lambda: self.q.put(("test",)),
+                               self.f, 64, 26)
+        self.btn_test.pack(side="left", padx=(4, 0))
+        PixBtn(row, "Share Config", self.open_share, self.f, 88, 26).pack(side="left", padx=(4, 0))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(3, 1))
+        PixBtn(row, "Click the slots", lambda: self.q.put(("area_manual",)), self.f, 130, 26).pack(side="left")
+        self.label(row, "(2 clicks)", font=self.fs, fg=DIM).pack(side="left", padx=(6, 0))
+        self.area_lbl = self.label(p, self.fmt_bar(self.cfg["bar"]), font=self.fs, justify="left",
+                                   wraplength=PAGE_W - 40)
+        self.area_lbl.pack(fill="x", padx=8, pady=(3, 2))
+
+        self.rail(f).pack(fill="x")
+
+        # --- 2. profile ---
+        outer, p = self.panel(f, "2.Profile (one per class)")
+        outer.pack(fill="x")
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        self.label(row, "Active profile:", font=self.fs).pack(side="left")
+        self.profile_btn = PixBtn(row, self.cfg["active"] + " v", self.toggle_profile_menu, self.f,
+                                  self.PROFILE_W, 24, bd=2)
+        self.profile_btn.pack(side="right")
+        row2 = tk.Frame(p, bg=PARCH)
+        row2.pack(fill="x", padx=8, pady=(3, 2))
+        self.name_box, self.name_var = self.bound_entry(row2, "", lambda t: None, 104, 24, "left")
+        self.name_box.pack(side="left")
+        PixBtn(row2, "New", self.profile_new, self.f, 46, 24, bd=2).pack(side="left", padx=(4, 0))
+        PixBtn(row2, "Rename", self.profile_rename, self.f, 62, 24, bd=2).pack(side="left", padx=(4, 0))
+        self.del_btn = PixBtn(row2, "Delete", self.profile_delete, self.f, 56, 24, bd=2)
+        self.del_btn.pack(side="left", padx=(4, 0))
+        self.label(p, "Type a name, then New / Rename. Delete asks twice.", font=self.fs, fg=DIM
+                   ).pack(fill="x", padx=8, pady=(0, 2))
+
+        self.rail(f).pack(fill="x")
+
+        # --- 3. moves ---
+        outer, p = self.panel(f, "3.Moves")
+        outer.pack(fill="x")
+        self.moves_title = outer.title_lbl
+        self.label(p, "Cooldown Blank = Weapon (needed for disarm detection, M2 works fine)\n"
+                      "By Default M1 and M2 shares cooldown. Right clicking the M2 box tells the Assist Tool that it doesn't share cooldown.\n"
+                      "Right Clicking the Move name tell the Assist Tool it's a fist move",
+                   font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40
+                   ).pack(fill="x", padx=8, pady=(0, 3))
+        self.list_header(p, "Move name", m2=True)
+        self.moves_frame = tk.Frame(p, bg=PARCH)
+        self.moves_frame.pack(fill="x")
+        self.charged_frame = tk.Frame(p, bg=PARCH)            # Solan: the four Charged Blow cooldowns (only when needed)
+        self.charged_frame.pack(fill="x")
+        self._charged_sig = None
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(4, 4))
+        PixBtn(row, "+ Add move", self.add_move, self.f, 110, 26).pack(side="left")
+        self.label(row, "cooldown in seconds", font=self.fs, fg=DIM).pack(side="left", padx=(8, 0))
+
+        self.rail(f).pack(fill="x")
+
+        # --- 4. normal spells (left click) ---
+        outer, p = self.panel(f, "4.Normal Spells")
+        outer.pack(fill="x")
+        self.spells_title = outer.title_lbl
+        self.label(p, "Spells here aren't a Snap Spell. (Spells needed to be put here so the Assist Tool knows you're not using a Weapon Based Move.)",
+                   font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40
+                   ).pack(fill="x", padx=8, pady=(0, 3))
+        self.list_header(p, "Spell name", m2=False)
+        self.spells_frame = tk.Frame(p, bg=PARCH)
+        self.spells_frame.pack(fill="x")
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(4, 4))
+        PixBtn(row, "+ Add spell", lambda: self.add_move(spell=True), self.f, 110, 26).pack(side="left")
+        self.label(row, "cooldown in seconds", font=self.fs, fg=DIM).pack(side="left", padx=(8, 0))
+
+        self.rail(f).pack(fill="x")
+
+        # --- 5. snap spells (right click, blue) ---
+        outer, p = self.panel(f, "5.Snap spells")
+        outer.pack(fill="x")
+        self.snaps_title = outer.title_lbl
+        self.label(p, "Snap Spells shares cooldown with each other based on which Snap is used. (Dominus doesn't count as a Snap so put it somewhere else)",
+                   font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40
+                   ).pack(fill="x", padx=8, pady=(0, 3))
+        self.list_header(p, "Snap spell name")
+        self.snaps_frame = tk.Frame(p, bg=PARCH)
+        self.snaps_frame.pack(fill="x")
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(4, 4))
+        PixBtn(row, "+ Add snap spell", lambda: self.add_move(snap=True), self.f, 130, 26).pack(side="left")
+        self.label(row, "cooldown in seconds", font=self.fs, fg=DIM).pack(side="left", padx=(8, 0))
+
+        self.rail(f).pack(fill="x")
+
+        # --- 6. status ---
+        outer, p = self.panel(f, "6.Status")
+        outer.pack(fill="x")
+        self.armed_lbl = self.label(p, "Armed: Fist", font=self.fs)
+        self.armed_lbl.pack(fill="x", padx=8, pady=(0, 2))
+        self.last_lbl = self.label(p, "Last used: -", font=self.fs, justify="left", wraplength=PAGE_W - 40)
+        self.last_lbl.pack(fill="x", padx=8, pady=(0, 2))
+        self.msg_lbl = self.label(p, "", font=self.fs, justify="left", wraplength=PAGE_W - 40, fg="#6b5d50")
+        self.msg_lbl.pack(fill="x", padx=8, pady=(0, 4))
+        self.rebuild_moves()
+
+    # ---------- moves + snap spells ----------
+    KEY_W, NAME_W, CD_W, M2_W, X_W = 36, 116, 50, 44, 22          # column widths of a move row
+
+    def list_header(self, parent, name_title, m2=False):
+        hdr = tk.Frame(parent, bg=PARCH)
+        hdr.pack(fill="x", padx=8)
+        cols = [(self.KEY_W, "Key", 0), (self.NAME_W, name_title, 4), (self.CD_W, "Cooldown", 4)]
+        if m2:
+            cols.append((self.M2_W, "M2", 4))
+        for w, t, padl in cols:
+            c = tk.Frame(hdr, bg=PARCH, width=w, height=16)
+            c.pack(side="left", padx=(padl, 0))
+            c.pack_propagate(False)
+            self.label(c, t, font=self.fs).pack(fill="both")
+
+    def moves(self):
+        return self.cfg["profiles"][self.cfg["active"]]
+
+    def snaps(self):
+        return self.cfg["snaps"].setdefault(self.cfg["active"], [])
+
+    def list_of(self, mv):
+        """Which list (normal moves or snap spells) a row dict belongs to, plus its kind."""
+        if any(m is mv for m in self.snaps()):
+            return self.snaps(), "snap"
+        return self.moves(), "move"
+
+    def _keep_scroll(self, key, fn):
+        """Run fn (it rebuilds rows, so the page is briefly shorter) and put the page back where it was scrolled."""
+        cv = self.scroll_cvs.get(key)
+        y = cv.yview()[0] if cv is not None else 0.0
+        fn()
+        if cv is not None:
+            self.root.update_idletasks()                   # let the page size settle first
+            cv.yview_moveto(y)
+
+    def rebuild_moves(self):
+        self._keep_scroll("main", self._rebuild_moves)
+
+    def _rebuild_moves(self):
+        """Rebuild the rows of BOTH lists (normal moves + snap spells) for the active profile."""
+        self.move_key_btns = {}
+        for frame, title, text, lst in ((self.moves_frame, self.moves_title, "3.Moves in '{}' (left click)",
+                                         [m for m in self.moves() if not m.get("spell")]),
+                                        (self.spells_frame, self.spells_title, "4.Normal Spells in '{}' (left click)",
+                                         [m for m in self.moves() if m.get("spell")]),
+                                        (self.snaps_frame, self.snaps_title, "5.Snap spells in '{}' (right click)", self.snaps())):
+            for w in frame.winfo_children():
+                w.destroy()
+            title.config(text=text.format(self.cfg["active"]))
+            for mv in lst:
+                self.build_move_row(frame, mv)
+        self.refresh_charged(force=True)
+        self.rebuild_inv()                                 # (the Inventory page belongs to the profile too)
+
+    def charged_cds(self):
+        return self.cfg["charged"].setdefault(self.cfg["active"], clean_charged(None))
+
+    def refresh_charged(self, force=False):
+        """Solan: while the profile has a 'Charged Blow' move, show four extra rows - one cooldown per Charge.
+        Vanguard: while it has an 'Azure Ignition' move, show three more - one per Azure move."""
+        moves = self.moves()
+        has = any(is_charged_blow(m["name"]) for m in moves)
+        missing = tuple(label for kind, label in CHARGES if not any(charge_kind(m["name"]) == kind for m in moves))
+        has_az = any(is_azure_ignition(m["name"]) for m in moves)
+        missing_az = tuple(base for kind, base in AZURE_BASE.items() if not any(azure_kind(m["name"]) == kind for m in moves))
+        has_dk = any(is_dark_charged_blow(m["name"]) for m in moves)
+        missing_dk = tuple(label for kind, label in WK_CHARGES if not any(charge_kind(m["name"]) == kind for m in moves))
+        sig = (self.cfg["active"], has, missing if has else (), has_az, missing_az if has_az else (),
+               has_dk, missing_dk if has_dk else ())
+        if sig == self._charged_sig and not force:
+            return                                         # (rebuilding while typing in a box would steal the focus)
+        self._charged_sig = sig
+        for w in self.charged_frame.winfo_children():
+            w.destroy()
+        blocks = []
+        if has_dk:
+            blocks.append(("Dark Charged Blow (Wraith Knight): one cooldown per Charge. It goes on the Charge's slot "
+                           "(next to the Charge's own activation cooldown).",
+                           [(kind, f"{label} Dark Charged Blow") for kind, label in WK_CHARGES], missing_dk))
+        if has:
+            blocks.append(("Charged Blow: one cooldown per Charge. It goes on the Charge's slot "
+                           "(next to the Charge's own activation cooldown).",
+                           [(kind, label.replace(" Charge", " Charged Blow")) for kind, label in CHARGES], missing))
+        if has_az:
+            blocks.append(("Azure Ignition: the cooldown of each Azure move. While Azure Ignition is on, using the "
+                           "normal move puts this cooldown on its slot (blue box), shared with the normal move.",
+                           list(AZURES), missing_az))
+        for text, rows, miss in blocks:
+            self.label(self.charged_frame, text, font=self.fs, fg=DIM, justify="left",
+                       wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(4, 2))
+            for kind, label in rows:
+                row = tk.Frame(self.charged_frame, bg=PARCH)
+                row.pack(fill="x", padx=8, pady=1)
+                self.label(row, label, font=self.f).pack(side="left")
+                cur = self.charged_cds().get(kind) or 0.0
+                box, _ = self.bound_entry(row, f"{cur:g}" if cur else "",
+                                          lambda t, k=kind: self.charged_changed(k, t), 60, 24)
+                box.pack(side="right")
+            if miss:
+                self.label(self.charged_frame, "Also add these moves (exactly these names): " + ", ".join(miss),
+                           font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(2, 2))
+
+    def charged_changed(self, kind, text):
+        t = text.strip().replace(",", ".")
+        try:
+            v = max(0.0, float(t)) if t else 0.0
+        except ValueError:
+            return
+        self.charged_cds()[kind] = v
+        save_cfg(self.cfg)
+
+    def build_move_row(self, parent, mv):
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        kb = PixBtn(row, mv["key"], lambda m=mv: self.capture_move_key(m), self.f, self.KEY_W, 24, bd=2)
+        kb.pack(side="left")
+        self.move_key_btns[id(mv)] = kb
+
+        def set_name(v, m=mv):
+            m["name"] = v
+            if "cd2" in m and not m.get("spell"):          # a normal move called 'Soul Rip' IS Wraith Knight's Soul Rip (found by its name)
+                if is_soul_name(v) != bool(m.get("soul")):
+                    if is_soul_name(v):
+                        m["soul"], m["cd"], m["cd2"] = True, 0.0, 0.0
+                    else:
+                        m.pop("soul", None)
+                    self.soul_rebuild_later(False)
+                if is_awk_name(v) != bool(m.get("awk")):
+                    if is_awk_name(v):
+                        m["awk"], m["cd"], m["cd2"] = True, 0.0, 0.0
+                    else:
+                        m.pop("awk", None)
+                    self.soul_rebuild_later(False)
+                if bmove_kind(v) != m.get("bmove"):
+                    if bmove_kind(v):
+                        m["bmove"], m["cd"], m["cd2"] = bmove_kind(v), 0.0, 0.0
+                    else:
+                        m.pop("bmove", None)
+                    self.soul_rebuild_later(False)
+            save_cfg(self.cfg)
+            if "cd2" in m:                                 # (a normal move: Charged Blow / Charge names change the extra rows)
+                self.refresh_charged()
+
+        def set_cd(v, m=mv):
+            v = v.strip().replace(",", ".")
+            try:
+                if v:
+                    m["cd"] = max(0.0, float(v))
+                elif "cd2" in m:                           # normal moves: blank = WEAPON (no main cooldown)
+                    m["cd"] = 0.0
+                else:
+                    return                                 # snap spells need a cooldown
+            except ValueError:
+                return
+            save_cfg(self.cfg)
+        def set_cd2(v, m=mv):                              # M2: blank = off, a number = right-click cooldown
+            v = v.strip().replace(",", ".")
+            try:
+                m["cd2"] = max(0.0, float(v)) if v else 0.0
+            except ValueError:
+                return
+            save_cfg(self.cfg)
+        nb, _ = self.bound_entry(row, mv["name"], set_name, self.NAME_W, 24, "left")
+        nb.pack(side="left", padx=(4, 0))
+
+        def paint_name(m=mv, e=nb.entry):                  # green = this move unequips after use
+            e.config(bg=GREEN_BOX if m.get("unequip") else TAN)
+
+        def flip_name(_e=None, m=mv):                      # right-click the name box
+            m["unequip"] = not m.get("unequip")
+            save_cfg(self.cfg)
+            paint_name()
+            self.say(f"'{m['name']}' unequips after use (green name box)." if m["unequip"]
+                     else f"'{m['name']}' stays armed after use.",
+                     "Unequips after use" if m["unequip"] else "Stays armed")
+            return "break"
+        for w_ in (nb.entry, nb):
+            w_.bind("<Button-3>", flip_name)
+        paint_name()
+        cb, _ = self.bound_entry(row, f"{mv['cd']:g}" if (mv["cd"] > 0 or "cd2" not in mv) else "", set_cd, self.CD_W, 24)
+        cb.pack(side="left", padx=(4, 0))
+        if "cd2" in mv and not mv.get("spell"):            # normal moves only (snap spells and Normal Spells have no M2)
+            m2, _ = self.bound_entry(row, f"{mv['cd2']:g}" if mv["cd2"] > 0 else "", set_cd2, self.M2_W, 24)
+            m2.pack(side="left", padx=(4, 0))
+            ent = m2.entry
+
+            def paint(m=mv, e=ent):                        # green = M1 and M2 DON'T share a cooldown
+                e.config(bg=GREEN_BOX if m.get("split") else TAN)
+
+            def flip(_e=None, m=mv):                       # right-click the M2 box
+                m["split"] = not m.get("split")
+                save_cfg(self.cfg)
+                paint()
+                self.say(f"'{m['name']}': M1 and M2 DON'T share a cooldown (green box)." if m["split"]
+                         else f"'{m['name']}': M1 and M2 share a cooldown.",
+                         "M1/M2 separate" if m["split"] else "M1/M2 shared")
+                return "break"
+            for w_ in (ent, m2):
+                w_.bind("<Button-3>", flip)
+            paint()
+            if mv.get("soul") or mv.get("awk") or mv.get("bmove"):            # Soul Rip / Awakened / the buff moves: their cooldown boxes stay blank, the extra row is below
+                for b_ in (cb, m2):
+                    try:
+                        b_.entry.config(state="disabled")
+                    except Exception:
+                        pass
+        PixBtn(row, "x", lambda m=mv: self.delete_move(m), self.f, self.X_W, 24, bd=2).pack(side="right")
+        if mv.get("soul"):
+            self.build_soul_row(parent)                    # Soul Rip: the Soul Berserk row sits under it
+        if mv.get("awk"):
+            self.build_awk_row(parent)                     # Awakened: its duration / cooldown row sits under it
+        if mv.get("bmove"):
+            self.build_bmove_row(parent, mv["bmove"])      # Agility / Bane / Leviathan Plunge / Hyper Body
+
+    def soul_rebuild_later(self, inv):
+        """The name just became / stopped being 'Soul Rip': redraw the rows (a moment after the typing stops)."""
+        self.tracker.reset_soul()
+        try:
+            self.root.after_cancel(self._soul_rb)
+        except Exception:
+            pass
+        self._soul_rb = self.root.after(900, self.rebuild_inv if inv else self.rebuild_moves)
+
+    def build_soul_row(self, parent):
+        """Under the Soul Rip move: the Soul Berserk box. It is not a move - it holds the cooldown (under Cooldown) and
+        the buff time that comes first (under M2)."""
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        tk.Frame(row, bg=PARCH, width=self.KEY_W, height=24).pack(side="left")
+
+        def setter(key):
+            def go(v):
+                v = v.strip().replace(",", ".")
+                try:
+                    f = float(v)
+                except ValueError:
+                    return
+                if f > 0:
+                    self.cfg["settings"][key] = f
+                    save_cfg(self.cfg)
+            return go
+        nb, _ = self.bound_entry(row, "Soul Berserk (M2)", lambda v: None, self.NAME_W, 24, "left")
+        nb.pack(side="left", padx=(4, 0))
+        try:
+            nb.entry.config(state="disabled")
+        except Exception:
+            pass
+        c_, _ = self.bound_entry(row, f"{cd_value(self.cfg['settings'], 'soul_cd'):g}", setter("soul_cd"), self.CD_W, 24)
+        c_.pack(side="left", padx=(4, 0))
+        d_, _ = self.bound_entry(row, f"{cd_value(self.cfg['settings'], 'soul_dur'):g}", setter("soul_dur"), self.M2_W, 24)
+        d_.pack(side="left", padx=(4, 0))
+        self.label(parent, "Soul Berserk: the Cooldown box is its cooldown (starts when the buff ends), the M2 box is how long the buff lasts (seconds).",
+                   font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8, pady=(0, 2))
+
+    def build_awk_row(self, parent):
+        """Under the Awakened move: the cooldown (under Cooldown) and how long it lasts (under M2)."""
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        tk.Frame(row, bg=PARCH, width=self.KEY_W, height=24).pack(side="left")
+
+        def setter(key):
+            def go(v):
+                v = v.strip().replace(",", ".")
+                try:
+                    f = float(v)
+                except ValueError:
+                    return
+                if f > 0:
+                    self.cfg["settings"][key] = f
+                    save_cfg(self.cfg)
+            return go
+        nb, _ = self.bound_entry(row, "Awakened (Dzin)", lambda v: None, self.NAME_W, 24, "left")
+        nb.pack(side="left", padx=(4, 0))
+        try:
+            nb.entry.config(state="disabled")
+        except Exception:
+            pass
+        c_, _ = self.bound_entry(row, f"{cd_value(self.cfg['settings'], 'awk_cd'):g}", setter("awk_cd"), self.CD_W, 24)
+        c_.pack(side="left", padx=(4, 0))
+        d_, _ = self.bound_entry(row, f"{cd_value(self.cfg['settings'], 'awk_dur'):g}", setter("awk_dur"), self.M2_W, 24)
+        d_.pack(side="left", padx=(4, 0))
+        self.label(parent, "Awakened: the Cooldown box is its cooldown (starts when it ends), the M2 box is how long it lasts (seconds).",
+                   font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8, pady=(0, 2))
+
+    def build_bmove_row(self, parent, kind):
+        """Under a buff move: its cooldown (under Cooldown) and its duration (under M2). Starts with a LEFT click."""
+        name, dkey, ckey, label = BMOVES[kind]
+        if kind in TOGGLE_BM:                                              # no duration / cooldown: just a note
+            extra = (" It turns itself off at low health: the macro listens for that sound (Settings: 'Dragon Blood turns off by sound')."
+                     if kind == "dragonblood" else "")
+            self.label(parent, f"{name}: a LEFT click turns it on (a blue box without a number, and its icon next to the hotbar), the next "
+                               f"LEFT click with it armed turns it off. It can't be turned off in the first second.{extra}",
+                       font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8, pady=(0, 2))
+            return
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        tk.Frame(row, bg=PARCH, width=self.KEY_W, height=24).pack(side="left")
+        S = self.cfg["settings"]
+        mana = kind == "bane" and self.popt("mana_dash")                     # Bane: the longer time while the mana dashes are on
+        dkey = "bane_dur_mana" if mana else dkey
+
+        def setter(key):
+            def go(v):
+                v = v.strip().replace(",", ".")
+                try:
+                    f = float(v)
+                except ValueError:
+                    return
+                if f > 0:
+                    S[key] = f
+                    save_cfg(self.cfg)
+            return go
+        nb, _ = self.bound_entry(row, label, lambda v: None, self.NAME_W, 24, "left")
+        nb.pack(side="left", padx=(4, 0))
+        try:
+            nb.entry.config(state="disabled")
+        except Exception:
+            pass
+        c_, _ = self.bound_entry(row, f"{cd_value(S, ckey):g}", setter(ckey), self.CD_W, 24)
+        c_.pack(side="left", padx=(4, 0))
+        d_, _ = self.bound_entry(row, f"{cd_value(S, dkey):g}", setter(dkey), self.M2_W, 24)
+        d_.pack(side="left", padx=(4, 0))
+        extra = (" With Dragon Sage / Faceless dashes on, this box is the longer time." if kind == "bane" and mana else "")
+        self.label(parent, f"{name}: a LEFT click starts it. The Cooldown box is its cooldown (starts when it ends), the M2 box is "
+                           f"'{label}' (seconds).{extra}", font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM
+                   ).pack(fill="x", padx=8, pady=(0, 2))
+
+    def add_move(self, snap=False, spell=False):
+        lst, what = (self.snaps(), "snap spell") if snap else (self.moves(), "spell" if spell else "move")
+        used = {m["key"] for m in lst}              # (Moves and Normal Spells share one list: a key holds one of them)
+        free = next((k for k in HOTBAR_KEYS if k not in used), None)
+        if free is None:
+            self.say(f"All 12 hotbar slots already have a {what}.", "Hotbar is full")
+            return
+        lst.append({"key": free, "name": "New snap", "cd": 10.0, "unequip": False} if snap
+                   else {"key": free, "name": "New spell" if spell else "New move", "cd": 10.0, "cd2": 0.0, "split": False,
+                         "unequip": False, **({"spell": True} if spell else {})})
+        lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+        save_cfg(self.cfg)
+        self.rebuild_moves()
+        self.say(f"Added a {what} on key {free}. Click its Key button to change the key.",
+                 "Snap spell added" if snap else ("Spell added" if spell else "Move added"))
+
+    def delete_move(self, mv):
+        lst, kind = self.list_of(mv)
+        if any(m is mv for m in lst):
+            lst[:] = [m for m in lst if m is not mv]
+            self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
+            save_cfg(self.cfg)
+            self.rebuild_moves()
+
+    # ---------- profiles ----------
+    def toggle_profile_menu(self):
+        if self.profile_menu is not None:
+            self.close_profile_menu()
+            return
+        host = self.main_inner
+        menu = tk.Frame(host, bg=BROWN)
+        for name in self.cfg["profiles"]:
+            PixBtn(menu, name, lambda n=name: self.set_profile(n), self.f, self.PROFILE_W, 21, bd=2).pack()
+        x = self.profile_btn.winfo_rootx() - host.winfo_rootx()
+        y = self.profile_btn.winfo_rooty() - host.winfo_rooty() + self.profile_btn.winfo_height() - 1
+        menu.place(x=x, y=y)
+        menu.lift()
+        self.profile_menu = menu
+
+    def close_profile_menu(self):
+        if self.profile_menu is not None:
+            try:
+                self.profile_menu.destroy()
+            except Exception:
+                pass
+            self.profile_menu = None
+
+    def _maybe_close_menu(self, e):
+        if self.profile_menu is None:
+            return
+        path = str(e.widget)
+        for w in (self.profile_menu, self.profile_btn):
+            p = str(w)
+            if path == p or path.startswith(p + "."):
+                return                                       # their own handlers deal with it
+        self.close_profile_menu()
+
+    def set_profile(self, name):
+        self.close_profile_menu()
+        if name == self.cfg["active"] or name not in self.cfg["profiles"]:
+            return
+        self.cfg["active"] = name
+        save_cfg(self.cfg)
+        self.tracker.reset()                                 # different moves: old timers don't apply
+        self.profile_btn.lbl.config(text=name + " v")
+        self.rebuild_moves()
+        self.sel_mark = None
+        self.mana_ov.sig = None
+        self.rebuild_marks()
+        self._sig = None
+        self.repaint_mana_dash()
+        self.say(f"Profile: {name}", f"Profile: {name}")
+
+    def _new_name(self):
+        name = self.name_var.get().strip()
+        if not name:
+            self.say("Type a profile name in the box first.", "Type a name")
+            return None
+        if len(name) > 24:
+            name = name[:24]
+        if name.lower() in (n.lower() for n in self.cfg["profiles"]):
+            self.say(f"There is already a profile called '{name}'.", "Name taken")
+            return None
+        return name
+
+    # ---------- mana overlay ----------
+    PV_H, PV_PAD = 300, 8
+
+    def marks(self):
+        return self.cfg["marks"].setdefault(self.cfg["active"], [])
+
+    def marks_front(self, marks=None):
+        """The marks in drawing order: the selected one LAST, so it is on top of the others."""
+        lst = list(self.marks() if marks is None else marks)
+        return sorted(lst, key=lambda m: m is self.sel_mark)             # (stable: the rest keep their order)
+
+    def mana_image(self):
+        """The current overlay picture (cached; reloaded when the file changes). Falls back to the built-in one."""
+        path = self.cfg["mana"].get("image", "")
+        try:
+            mt = os.path.getmtime(path) if path else 0
+        except OSError:
+            mt = -1
+        key = (path, mt)
+        if self._mana_img is None or self._mana_img[0] != key:
+            img = load_mana_image(path)
+            if img is None:
+                self.append_log(f"Couldn't read the overlay picture '{path}' - using the built-in one.")
+                img = default_mana_image()
+            self._mana_img = (key, img, mana_inner(img))
+        return self._mana_img[1]
+
+    def game_focused(self):
+        """True while the game window (title in Settings) is the active window; always True if no title is set."""
+        want = str(self.cfg["settings"]["game_title"]).strip().lower()
+        if not want:
+            return True
+        now = time.time()
+        if now - getattr(self, "_fg_t", 0.0) > 0.1:
+            self._fg_title, self._fg_t = foreground_title().lower(), now
+        return want in self._fg_title
+
+    def _mana_tick(self, now):
+        S, m = self.cfg["settings"], self.cfg["mana"]
+        ov = self.mana_ov
+        hidden_by_focus = (S.get("mana_only_focused", True) and self.mana_edit is None and now >= self.demo_until
+                           and not self.game_focused())
+        if (not S["mana_on"] or hidden_by_focus or (self.mana_edit is not None and self._edit_item is None) or self.selecting
+                or self.mana_hidden(now)):
+            self._boxes_now = []
+            if ov.shown:
+                ov.hide()
+            ov.sig = None
+            return
+        img = self.mana_image()
+        inner = self._mana_img[2]
+        marks = self.marks()
+        if now < self.demo_until:                                   # F7: show every mark so you can check them
+            shown = marks
+        elif getattr(self, "train", None) and self.train.running:
+            shown = self.train_shown_marks()                        # Snap Training: the spell's mark, the whole time
+        else:
+            k = self.tracker.armed_key(now)                         # only the marks of the key that is armed
+            shown = [mk for mk in marks if mk["key"] == k] if k else []
+        boxes = mana_boxes(m, inner, self.marks_front(shown))
+        self._boxes_now = list(boxes)
+        sig = (round(m["x"]), round(m["y"]), round(m["w"]), round(m["h"]), tuple(m["zone"]), self._mana_img[0],
+               tuple((round(b[0]), round(b[1]), round(b[2]), round(b[3]), b[4]) for b in boxes), S["mana_opacity"])
+        if sig != ov.sig:
+            ov.sig = sig
+            ov.show_art((m["x"], m["y"], m["w"], m["h"]), keyed_image(img, m["w"], m["h"]), boxes, S["mana_opacity"])
+        elif now - self._mana_top > 1.0:
+            self._mana_top = now
+            ov.raise_top()
+
+    def pick_mana(self):
+        """Find the in-game mana bar on the screen and fit the picture to it."""
+        if self.selecting:
+            return
+        self.selecting = True
+        self.ov.hide()
+        self.mana_ov.hide()
+        self.mana_ov.sig = None
+        self._sig = None
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.25)
+        found = None
+        try:
+            with mss.mss() as s:
+                for mon in s.monitors[1:]:
+                    shot = s.grab(mon)
+                    rgb = np.asarray(Image.frombytes("RGB", shot.size, shot.rgb))
+                    r = find_mana_bar(rgb)
+                    if r:
+                        found = (mon, r)
+                        break
+        finally:
+            self._restore_root()
+        if not found:
+            self.say("Couldn't find the mana bar (is it on screen?). Use 'Move / resize' to place the "
+                     "picture by hand.", "Mana bar not found")
+            return
+        mon, (gl, gr) = found
+        shift = lambda r: (r[0] + mon["left"], r[1] + mon["left"], r[2] + mon["top"], r[3] + mon["top"])
+        geo = fit_mana((shift(gl), shift(gr)), self.mana_image())
+        self.cfg["mana"].update({k: round(v, 1) for k, v in geo.items()})
+        save_cfg(self.cfg)
+        self.mana_fill_entries()
+        self.mana_ov.sig = None
+        self.start_demo()
+        self.say("Mana bar found - the picture now sits on it. Check the ticks against the game's bar.",
+                 "Mana bar found")
+
+    # --- on-screen move / resize ---
+    def _edit_dict(self):
+        """What the on-screen editor is changing: the mana picture or one decoration."""
+        return self._edit_item if self._edit_item is not None else self.cfg["mana"]
+
+    def toggle_mana_edit(self, item=None):
+        """Move / resize on the screen. item = a decoration dict (None = the mana picture)."""
+        if self.mana_edit is not None:
+            same = self._edit_item is item
+            self.close_mana_edit()
+            if same:
+                return
+        if item is not None and self.is_kda_item(item) and item.get("follow"):
+            item.update(zip(("x", "y", "w", "h"), self.kda_follow_rect()))
+        if item is not None and self.is_pct_item(item) and item.get("follow"):
+            item.update(zip(("x", "y", "w", "h"), self.pct_rect()))      # (start from where it is now)
+        self._edit_item = item
+        top = self.mana_edit = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        try:
+            top.attributes("-alpha", 0.85)
+        except tk.TclError:
+            pass
+        cv = self.mana_edit_cv = tk.Canvas(top, highlightthickness=0, bd=0, bg="#42352a", cursor="fleur")
+        cv.pack()
+        cv.bind("<ButtonPress-1>", self._edit_press)
+        cv.bind("<B1-Motion>", self._edit_motion)
+        cv.bind("<ButtonRelease-1>", self._edit_release)
+        cv.bind("<Double-Button-1>", lambda e: self.close_mana_edit())
+        cv.bind("<Button-3>", lambda e: self.close_mana_edit())
+        top.bind("<Escape>", lambda e: self.close_mana_edit())
+        self._edit_drag = None
+        if item is None:
+            self.mana_ov.hide()
+            self.mana_ov.sig = None
+        self._edit_render()
+        top.focus_force()
+        if item is None and self.mana_edit_btn is not None:
+            self.mana_edit_btn.lbl.config(text="Done")
+        elif item is not None and self.is_pct_item(item) and self.pct_btn is not None:
+            self.pct_btn.lbl.config(text="Done")
+        elif item is not None and self.is_kda_item(item) and self.kda_btn is not None:
+            self.kda_btn.lbl.config(text="Done")
+        elif item is not None and self.is_dash_item(item):
+            self.dash_btns[item["id"]].lbl.config(text="Done")
+        elif item is not None and item["id"] in self.decor_btns:
+            self.decor_btns[item["id"]].lbl.config(text="Done")
+        self.say("Drag the picture to move it. Drag an EDGE or CORNER to resize it. "
+                 "Right click / double click / Esc / the Done button finishes.", "Move / resize")
+
+    def close_mana_edit(self):
+        top, self.mana_edit = self.mana_edit, None
+        was_decor = self._edit_item is not None
+        self._edit_item = None
+        if top is not None:
+            try:
+                top.destroy()
+            except Exception:
+                pass
+        save_cfg(self.cfg)
+        if self.mana_edit_btn is not None:
+            self.mana_edit_btn.lbl.config(text="Move / resize")
+        for b in list(self.decor_btns.values()) + list(self.dash_btns.values()) + [x for x in (self.pct_btn, self.kda_btn) if x]:
+            b.lbl.config(text="Move / resize")
+        self.mana_ov.sig = None
+        self.mana_fill_entries()
+        self.decor_fill_entries()
+        self.dash_fill_entries()
+        self.pct_fill_entries()
+        self.kda_fill_entries()
+        self._kda_sig = None
+
+    def _edit_render(self):
+        t = self._edit_dict()
+        w, h = max(16, int(round(t["w"]))), max(16, int(round(t["h"])))
+        if self._edit_item is not None and self.is_kda_item(self._edit_item):
+            pil = Image.new("RGB", (w, h), (66, 52, 62))
+            ImageDraw.Draw(pil).text((6, max(0, h // 2 - 5)), "Grip 0  Death 0  Assist 0  Knocked 0", fill=(255, 255, 255))
+        elif self._edit_item is not None and self.is_pct_item(self._edit_item):
+            pil = pct_edit_picture(w, h)
+        elif self._edit_item is not None and self.is_dash_item(self._edit_item):
+            k = self._edit_item["id"]
+            pil = compose_decor(dash_art(k, w, h, [True] * MANA_COINS if k == "mana" else ([True] * AWK_COINS if k in ("awk_dash", "fisch_dash") else True)), w, h, 1.0)
+        elif self._edit_item is not None:
+            img = self.decor_image(self._edit_item)[1] or Image.new("RGBA", (8, 8), (255, 255, 255, 255))
+            pil = compose_decor(img, w, h, t["opacity"])
+        else:
+            img = self.mana_image()
+            pil = compose_mana(img, w, h, t["zone"], self._mana_img[2], self.marks_front(),
+                               alpha=self.cfg["settings"]["mana_opacity"])
+        d = ImageDraw.Draw(pil)
+        d.rectangle([0, 0, w - 1, h - 1], outline=(255, 60, 60))
+        d.rectangle([w - 9, h - 9, w - 1, h - 1], fill=(255, 60, 60))              # resize corner
+        self._edit_photo = ImageTk.PhotoImage(pil)
+        cv = self.mana_edit_cv
+        cv.delete("all")
+        cv.config(width=w, height=h)
+        cv.create_image(0, 0, image=self._edit_photo, anchor="nw")
+        self.mana_edit.geometry(f"{w}x{h}+{int(round(t['x']))}+{int(round(t['y']))}")
+
+    def _edit_press(self, e):
+        m, M = self._edit_dict(), 8
+        mode = ("l" if e.x < M else "") + ("r" if e.x > m["w"] - M else "") + \
+               ("t" if e.y < M else "") + ("b" if e.y > m["h"] - M else "")
+        self._edit_drag = (mode or "move", e.x_root, e.y_root, dict(m))
+
+    def _edit_motion(self, e):
+        if not self._edit_drag or self.mana_edit is None:
+            return
+        mode, x0, y0, st = self._edit_drag
+        dx, dy = e.x_root - x0, e.y_root - y0
+        x, y, w, h = st["x"], st["y"], st["w"], st["h"]
+        if mode == "move":
+            x, y = x + dx, y + dy
+        else:
+            if "l" in mode:
+                x, w = x + dx, w - dx
+            if "r" in mode:
+                w += dx
+            if "t" in mode:
+                y, h = y + dy, h - dy
+            if "b" in mode:
+                h += dy
+            if w < 16:
+                x, w = (x + w - 16 if "l" in mode else x), 16
+            if h < 16:
+                y, h = (y + h - 16 if "t" in mode else y), 16
+        d_ = self._edit_dict()
+        d_.update({"x": x, "y": y, "w": w, "h": h})
+        if "follow" in d_:
+            d_["follow"] = False                              # moved by hand: it stays where you put it
+        self._edit_render()
+
+    def _edit_release(self, e):
+        self._edit_drag = None
+        t = self._edit_dict()
+        for k in ("x", "y", "w", "h"):
+            t[k] = round(t[k], 1)
+        save_cfg(self.cfg)
+        self.mana_fill_entries()
+        self.decor_fill_entries()
+        self.dash_fill_entries()
+        self.pct_fill_entries()
+        self.kda_fill_entries()
+
+    # --- the Mana Overlay tab ---
+    def build_mana(self, page):
+        f = self.mana_inner = self.scroll_page(page, "mana", PAGE_W - 8)
+        outer, p = self.panel(f, "1.Mana bar on the screen")
+        outer.pack(fill="x")
+        self.label(p, "The picture goes over the game's mana bar and shows where each spell must be cast.",
+                   font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8)
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(3, 1))
+        self.btn_mana = PixBtn(row, f"Find bar ({self.key_name('mana')})", lambda: self.q.put(("mana",)),
+                               self.f, 116, 26)
+        self.btn_mana.pack(side="left")
+        self.mana_edit_btn = PixBtn(row, "Move / resize", self.toggle_mana_edit, self.f, 110, 26)
+        self.mana_edit_btn.pack(side="left", padx=(4, 0))
+        self.check_row(p, "Show the Mana Overlay", "mana_on", extra=lambda v: setattr(self.mana_ov, "sig", None))
+        self.check_row(p, "Only show the cooldown boxes, Mana Overlay, Decorations and Dash / PB coins while the game window is in front", "mana_only_focused", wrap=230)
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(1, 1))
+        self.mana_vars = {}
+        for k in ("x", "y", "w", "h"):
+            self.label(row, k.upper() + ":", font=self.fs).pack(side="left", padx=(0, 2))
+            box, var = self.bound_entry(row, str(round(self.cfg["mana"][k])),
+                                        lambda t, k=k: self.mana_geo_changed(k, t), 48, 22)
+            box.pack(side="left", padx=(0, 6))
+            self.mana_vars[k] = var
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(3, 1))
+        PixBtn(row, "Upload picture", self.mana_upload, self.f, 116, 26).pack(side="left")
+        PixBtn(row, "Built-in", self.mana_default, self.f, 70, 26).pack(side="left", padx=(4, 0))
+        PixBtn(row, "Share Mana", self.open_mana_share, self.f, 92, 26).pack(side="left", padx=(4, 0))
+        self.mana_file_lbl = self.label(p, "", font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40)
+        self.mana_file_lbl.pack(fill="x", padx=8)
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(1, 1))
+        self.label(row, "100% line / 0% line (% of picture height):", font=self.fs).pack(side="left")
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(0, 2))
+        for i in (0, 1):
+            box, var = self.bound_entry(row, f"{self.cfg['mana']['zone'][i] * 100:.1f}",
+                                        lambda t, i=i: self.mana_zone_changed(i, t), 56, 22)
+            box.pack(side="left", padx=(0, 6))
+            self.mana_vars["z%d" % i] = var
+        self.entry_row(p, "Cast-mark box strength (0.1 - 1)", "mana_opacity", float, w=56, h=22, wrap=190)
+        self.mana_status()
+
+        self.rail(f).pack(fill="x")
+        outer, p = self.panel(f, "2.Cast marks")
+        outer.pack(fill="x")
+        self.marks_title = outer.title_lbl
+        self.label(p, "A Mark is a Box inside the Bar. Whenever a key is pressed it shows the % you set it to. "
+                      "(YOU NEED TO PUT THE SPELLS UNDER SPELLS SECTION IN \"MAIN\" TAB FIRST)",
+                   font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8)
+        body = tk.Frame(p, bg=PARCH)
+        body.pack(fill="x", padx=8, pady=(3, 1))
+        self.pv_cv = tk.Canvas(body, bg=PARCH, highlightthickness=0, bd=0, width=70, height=self.PV_H)
+        self.pv_cv.pack(side="left", anchor="n")
+        self.pv_cv.bind("<ButtonPress-1>", self._pv_press)
+        self.pv_cv.bind("<B1-Motion>", self._pv_motion)
+        self.pv_cv.bind("<ButtonRelease-1>", self._pv_release)
+        self.marks_frame = tk.Frame(body, bg=PARCH)
+        self.marks_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(3, 2))
+        PixBtn(row, "+ Add mark", self.mark_add, self.f, 100, 26).pack(side="left")
+        self.label(row, "  % = mana %", font=self.fs, fg=DIM).pack(side="left")
+        self.rail(f).pack(fill="x")
+        outer, p = self.panel(f, "3.Decorations")
+        outer.pack(fill="x")
+        self.label(p, "Cute pictures on your screen - add as many as you like. Each one can be switched "
+                      "off, moved / resized on the screen and made see-through.",
+                   font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8)
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(3, 1))
+        PixBtn(row, "+ Add pictures", self.decor_add, self.f, 124, 26).pack(side="left")
+        self.check_row(p, "Show the decorations", "decor_on")
+        self.decor_frame = tk.Frame(p, bg=PARCH)
+        self.decor_frame.pack(fill="x", padx=8, pady=(2, 4))
+        self.rail(f).pack(fill="x")
+        outer, p = self.panel(f, "4.Mana %")
+        outer.pack(fill="x")
+        self.label(p, "Reads your screen and tells you how much mana you have based off what Assist Tool sees.",
+                   font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8)
+        self.check_row(p, "Show the mana % on the mana bar", "mana_pct_on")
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(3, 1))
+        self.pct_btn = PixBtn(row, "Move / resize", lambda: self.toggle_mana_edit(self.cfg["pctpos"]), self.f, 110, 26)
+        self.pct_btn.pack(side="left")
+        PixBtn(row, "Reset position", self.pct_reset, self.f, 110, 26).pack(side="left", padx=(4, 0))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(1, 3))
+        self.pct_vars = {}
+        for k, v in zip(("x", "y", "w", "h"), self.pct_rect()):
+            self.label(row, k.upper() + ":", font=self.fs).pack(side="left", padx=(0, 2))
+            box, var = self.bound_entry(row, str(round(v)), lambda t, k=k: self.pct_geo(k, t), 48, 22)
+            box.pack(side="left", padx=(0, 6))
+            self.pct_vars[k] = var
+        self.rail(f).pack(fill="x")
+        self.rebuild_decor()
+        self.rebuild_marks()
+
+    # ---------- decorations ----------
+    def decor_image(self, item):
+        """(file key, RGBA picture or None) of a decoration, cached until the file changes."""
+        path = item["file"]
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            self._decor_imgs.pop(path, None)
+            return (path, None), None
+        c = self._decor_imgs.get(path)
+        if c is None or c[0] != mt:
+            c = self._decor_imgs[path] = (mt, load_decor(path))
+        if c[1] is None:
+            return (path, c[0], 0), None
+        frames, durs = c[1]
+        i = frame_at(durs, time.time())                           # (an animated picture: the frame that is showing now)
+        return (path, c[0], i), frames[i]
+
+    def _decor_tick(self, now):
+        items = []
+        S = self.cfg["settings"]
+        hidden_by_focus = (S.get("mana_only_focused", True) and self._edit_item is None and now >= self.demo_until
+                           and not self.game_focused())              # (same rule as the Mana Overlay)
+        if S["decor_on"] and not self.selecting and not hidden_by_focus:
+            items = [d for d in self.cfg["decor"] if d["on"] and d is not self._edit_item]
+        self.decor_ov.sync(items, self.decor_image)
+        if self.decor_ov.shown and now - self._decor_top > 1.0:       # stay above the game, under the mana picture
+            self._decor_top = now
+            self.decor_ov.raise_top()
+            if self.mana_ov.shown:
+                self.mana_ov.raise_top()
+
+    def decor_add(self):
+        try:
+            from tkinter import filedialog
+            paths = filedialog.askopenfilenames(parent=self.root, title="Pick pictures to decorate your screen",
+                                                filetypes=[("Pictures (animated PNG too)", "*.png *.apng *.gif *.jpg *.jpeg *.bmp *.webp"),
+                                                           ("All files", "*.*")])
+        except Exception as ex:
+            self.say(f"Couldn't open the file picker: {ex}", "Upload failed")
+            return
+        added = bad = 0
+        for path in paths or ():
+            if len(self.cfg["decor"]) >= MAX_DECOR:
+                self.say(f"That's the limit ({MAX_DECOR} decorations).", "Limit reached")
+                break
+            data = load_decor(path)
+            if data is None:
+                bad += 1
+                continue
+            img = data[0][0]
+            animated = len(data[0]) > 1
+            folder = os.path.join(APP_DIR, "decorations")
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except Exception:
+                folder = APP_DIR
+            iid = str(int(time.time() * 1000)) + str(len(self.cfg["decor"]))
+            ext = os.path.splitext(path)[1].lower() if animated and os.path.splitext(path)[1].lower() in (".png", ".apng", ".gif", ".webp") else ".png"
+            dest = os.path.join(folder, f"decor_{iid}{ext}")
+            try:
+                if animated:
+                    import shutil
+                    shutil.copyfile(path, dest)                      # (saving the first frame only would stop the animation)
+                else:
+                    img.save(dest)
+            except Exception:
+                dest = path
+            k = min(1.0, 200.0 / max(img.width, img.height))                 # start at most 200 px big
+            n = len(self.cfg["decor"])
+            self.cfg["decor"].append({"id": iid, "file": dest, "name": os.path.splitext(os.path.basename(path))[0][:30], "x": 120.0 + 24 * (n % 10), "y": 120.0 + 24 * (n % 10),
+                                      "w": round(img.width * k, 1), "h": round(img.height * k, 1),
+                                      "opacity": 1.0, "on": True})
+            added += 1
+        if added or bad:
+            save_cfg(self.cfg)
+            self.rebuild_decor()
+            self.say((f"{added} picture(s) added - use 'Move / resize' to place them." if added else "")
+                     + (f" {bad} file(s) couldn't be read." if bad else ""), "Decorations")
+
+    def rebuild_decor(self):
+        self._keep_scroll("mana", self._rebuild_decor)
+
+    def _rebuild_decor(self):
+        self.decor_vars, self.decor_btns, self.decor_onbtns = {}, {}, {}
+        for w in self.decor_frame.winfo_children():
+            w.destroy()
+        if not self.cfg["decor"]:
+            self.label(self.decor_frame, "(none yet)", font=self.fs, fg=DIM).pack(fill="x")
+        for it in self.cfg["decor"]:
+            self.build_decor_row(self.decor_frame, it)
+
+    def build_decor_row(self, parent, it):
+        box = tk.Frame(parent, bg=PARCH, highlightthickness=0)
+        box.pack(fill="x", pady=(0, 5))
+        row = tk.Frame(box, bg=PARCH)
+        row.pack(fill="x")
+        onb = PixBtn(row, "On" if it["on"] else "Off", lambda d=it: self.decor_toggle(d), self.f, 40, 22, bd=2)
+        onb.pack(side="left")
+        self.decor_onbtns[it["id"]] = onb
+        nb, _ = self.bound_entry(row, it.get("name") or os.path.splitext(os.path.basename(it["file"]))[0],
+                                 lambda t, d=it: self.decor_rename(d, t), 116, 22, "left")
+        nb.pack(side="left", padx=(4, 0))                  # click it and type: any name you like
+        PixBtn(row, "x", lambda d=it: self.decor_delete(d), self.f, 20, 22, bd=2).pack(side="right")
+        mv = PixBtn(row, "Move / resize", lambda d=it: self.toggle_mana_edit(d), self.f, 104, 22, bd=2)
+        mv.pack(side="right", padx=(0, 3))
+        self.decor_btns[it["id"]] = mv
+        row = tk.Frame(box, bg=PARCH)
+        row.pack(fill="x", pady=(2, 0))
+        vars_ = {}
+        for k in ("x", "y", "w", "h"):
+            self.label(row, k.upper() + ":", font=self.fs).pack(side="left", padx=(0, 1))
+            b, var = self.bound_entry(row, str(round(it[k])), lambda t, d=it, k=k: self.decor_geo(d, k, t), 44, 20)
+            b.pack(side="left", padx=(0, 4))
+            vars_[k] = var
+        row = tk.Frame(box, bg=PARCH)
+        row.pack(fill="x", pady=(2, 0))
+        self.label(row, "Opacity (0.1 - 1):", font=self.fs).pack(side="left")
+        b, var = self.bound_entry(row, f"{it['opacity']:g}", lambda t, d=it: self.decor_opacity(d, t), 50, 20)
+        b.pack(side="left", padx=(4, 0))
+        vars_["opacity"] = var
+        self.decor_vars[it["id"]] = vars_
+        tk.Frame(box, bg=GREYT, height=1).pack(fill="x", pady=(4, 0))
+
+    def decor_fill_entries(self):
+        self._mana_busy = True
+        try:
+            for it in self.cfg["decor"]:
+                v = self.decor_vars.get(it["id"])
+                if v:
+                    for k in ("x", "y", "w", "h"):
+                        v[k].set(str(round(it[k])))
+                    v["opacity"].set(f"{it['opacity']:g}")
+        finally:
+            self._mana_busy = False
+
+    def decor_geo(self, it, key, text):
+        if self._mana_busy:
+            return
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            return
+        if key in ("w", "h") and v < 8:
+            return
+        it[key] = v
+        save_cfg(self.cfg)
+        if self.mana_edit is not None and self._edit_item is it:
+            self._edit_render()
+
+    def decor_opacity(self, it, text):
+        if self._mana_busy:
+            return
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            return
+        it["opacity"] = min(1.0, max(0.1, v))
+        save_cfg(self.cfg)
+        if self.mana_edit is not None and self._edit_item is it:
+            self._edit_render()
+
+    def decor_rename(self, it, text):
+        it["name"] = text[:30]
+        save_cfg(self.cfg)
+
+    def decor_toggle(self, it):
+        it["on"] = not it["on"]
+        save_cfg(self.cfg)
+        b = self.decor_onbtns.get(it["id"])               # just change the button: rebuilding the list jumps the page
+        if b is not None:
+            b.lbl.config(text="On" if it["on"] else "Off")
+
+    def decor_delete(self, it):
+        if self._edit_item is it:
+            self.close_mana_edit()
+        self.cfg["decor"] = [d for d in self.cfg["decor"] if d is not it]
+        try:                                              # remove our own copy of the picture
+            if os.path.dirname(os.path.abspath(it["file"])).endswith("decorations"):
+                os.remove(it["file"])
+        except Exception:
+            pass
+        save_cfg(self.cfg)
+        self.rebuild_decor()
+
+    def mana_status(self):
+        path = self.cfg["mana"].get("image", "")
+        self.mana_file_lbl.config(text="Picture: " + (os.path.basename(path) if path else "built-in"))
+
+    def mana_fill_entries(self):
+        if not getattr(self, "mana_vars", None):
+            return
+        self._mana_busy = True
+        try:
+            for k in ("x", "y", "w", "h"):
+                self.mana_vars[k].set(str(round(self.cfg["mana"][k])))
+            for i in (0, 1):
+                self.mana_vars["z%d" % i].set(f"{self.cfg['mana']['zone'][i] * 100:.1f}")
+        finally:
+            self._mana_busy = False
+        self.draw_preview()
+
+    def mana_geo_changed(self, key, text):
+        if self._mana_busy:
+            return
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            return
+        if key in ("w", "h") and v < 8:
+            return
+        self.cfg["mana"][key] = v
+        save_cfg(self.cfg)
+        if self.mana_edit is not None and self._edit_item is None:
+            self._edit_render()
+
+    def mana_zone_changed(self, i, text):
+        if self._mana_busy:
+            return
+        try:
+            v = float(text.replace(",", ".")) / 100.0
+        except ValueError:
+            return
+        z = list(self.cfg["mana"]["zone"])
+        z[i] = v
+        if not (0 <= z[0] < z[1] <= 1):
+            return
+        self.cfg["mana"]["zone"] = z
+        save_cfg(self.cfg)
+        self.draw_preview()
+
+    def mana_upload(self):
+        try:
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(parent=self.root, title="Pick a picture for the Mana Overlay",
+                                              filetypes=[("Pictures", "*.png *.gif *.jpg *.jpeg *.bmp *.webp"),
+                                                         ("All files", "*.*")])
+        except Exception as ex:
+            self.say(f"Couldn't open the file picker: {ex}", "Upload failed")
+            return
+        if not path:
+            return
+        img = load_mana_image(path)
+        if img is None:
+            self.say("That file isn't a picture I can read (try a PNG).", "Can't read it")
+            return
+        dest = os.path.join(APP_DIR, "mana_overlay_custom.png")      # keep a copy next to the program
+        try:
+            img.save(dest)
+        except Exception:
+            dest = path
+        m = self.cfg["mana"]
+        m["image"] = dest
+        m["zone"] = [0.02, 0.98]
+        m["w"] = round(m["h"] * img.width / float(img.height), 1)   # same height, the picture's own shape
+        self._after_mana_picture()
+        self.say("Picture loaded. Use 'Move / resize' (or Find bar) to fit it, and the two % lines to put "
+                 "100% and 0% where the bar's ticks are.", "Picture loaded")
+
+    def mana_default(self):
+        m = self.cfg["mana"]
+        m["image"] = ""
+        m["zone"] = list(DEFAULT_MANA["zone"])
+        m["w"] = round(m["h"] * 56.0 / 346.0, 1)
+        self._after_mana_picture()
+        self.say("Built-in picture restored.", "Built-in picture")
+
+    def _after_mana_picture(self):
+        save_cfg(self.cfg)
+        self._mana_img = None
+        self.mana_ov.sig = None
+        self.mana_status()
+        self.mana_fill_entries()
+        if self.mana_edit is not None and self._edit_item is None:
+            self._edit_render()
+
+    # --- cast marks ---
+    def rebuild_marks(self):
+        self._keep_scroll("mana", self._rebuild_marks)
+
+    def _rebuild_marks(self):
+        self.mark_key_btns = {}
+        self.mark_vars = {}
+        self.marks_title.config(text=f"2.Cast marks for '{self.cfg['active']}'")
+        for w in self.marks_frame.winfo_children():
+            w.destroy()
+        for mk in self.marks():
+            self.build_mark_row(self.marks_frame, mk)
+        self.draw_preview()
+
+    def build_mark_row(self, parent, mk):
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", pady=1)
+        kb = PixBtn(row, mk["key"], lambda m=mk: (self._select_mark(m), self.capture_mark_key(m)), self.f, 30, 22, bd=2)
+        kb.pack(side="left")
+        self.mark_key_btns[id(mk)] = kb
+        kind = PixBtn(row, "Snap" if mk["kind"] == "snap" else "Move", lambda m=mk: (self._select_mark(m), self.mark_toggle_kind(m)),
+                      self.fs, 46, 22, bd=2)
+        kind.pack(side="left", padx=(2, 0))
+        vars_ = []
+        for fld in ("lo", "hi"):
+            box, var = self.bound_entry(row, f"{mk[fld]:g}", lambda t, m=mk, f=fld: self.mark_value(m, f, t), 38, 22)
+            box.pack(side="left", padx=(2, 0))
+            box.entry.bind("<FocusIn>", lambda e, m=mk: self._select_mark(m), add="+")
+            vars_.append(var)
+        self.mark_vars[id(mk)] = vars_
+        sw = PixBtn(row, "", lambda m=mk: (self._select_mark(m), self.mark_pick_color(m)), self.fs, 24, 22, bd=2)
+        sw.lbl.config(bg=mk["color"])
+        sw.lbl.bind("<Enter>", lambda e: None)
+        sw.lbl.bind("<Leave>", lambda e: None)
+        sw.pack(side="left", padx=(2, 0))
+        PixBtn(row, "x", lambda m=mk: self.mark_delete(m), self.f, 20, 22, bd=2).pack(side="left", padx=(2, 0))
+
+    def _select_mark(self, mk):
+        if self.sel_mark is not mk:
+            self.sel_mark = mk
+            self.mana_ov.sig = None                       # (the real bar draws the selected one on top too)
+            self.draw_preview()
+
+    def mark_value(self, mk, fld, text):
+        if self._mana_busy:
+            return
+        try:
+            v = min(100.0, max(0.0, float(text.replace(",", "."))))
+        except ValueError:
+            return
+        other = "hi" if fld == "lo" else "lo"
+        if (fld == "lo" and v > mk["hi"] - 0.5) or (fld == "hi" and v < mk["lo"] + 0.5):
+            return                                      # lo must stay under hi (the box needs some height)
+        mk[fld] = v
+        save_cfg(self.cfg)
+        self.mana_ov.sig = None
+        self._select_mark(mk)
+        self.draw_preview()
+
+    def mark_toggle_kind(self, mk):
+        mk["kind"] = "move" if mk["kind"] == "snap" else "snap"
+        mk["color"] = MARK_COLORS[mk["kind"]]
+        save_cfg(self.cfg)
+        self.mana_ov.sig = None
+        self.rebuild_marks()
+
+    def mark_pick_color(self, mk):
+        try:
+            from tkinter import colorchooser
+            rgb, hexcol = colorchooser.askcolor(color=mk["color"], parent=self.root, title="Colour of this mark")
+        except Exception as ex:
+            self.say(f"Couldn't open the colour picker: {ex}", "Colour failed")
+            return
+        if hexcol:
+            mk["color"] = str(hexcol).lower()
+            save_cfg(self.cfg)
+            self.mana_ov.sig = None
+            self.rebuild_marks()
+
+    def mark_add(self):
+        used = {m["key"] for m in self.marks()}
+        keys = [m["key"] for m in self.moves() + self.snaps()] or list(HOTBAR_KEYS)
+        key = next((k for k in keys if k not in used), keys[0])
+        mk = {"key": key, "kind": "move", "lo": 40.0, "hi": 50.0, "color": MARK_COLORS["move"]}
+        self.marks().append(mk)
+        self.sel_mark = mk
+        save_cfg(self.cfg)
+        self.mana_ov.sig = None
+        self.rebuild_marks()
+        self.say("Mark added: press its Key button to set the hotbar key, then drag the box on the "
+                 "bar (or type the two % numbers).", "Mark added")
+
+    def mark_delete(self, mk):
+        lst = self.marks()
+        lst[:] = [m for m in lst if m is not mk]
+        if self.sel_mark is mk:
+            self.sel_mark = None
+        save_cfg(self.cfg)
+        self.mana_ov.sig = None
+        self.rebuild_marks()
+
+    def capture_mark_key(self, mk):
+        if self.capturing and self.capturing[0] == "mark" and self.capturing[1] is mk:
+            self.cancel_move_capture()
+            self.update_key_texts()
+            return
+        self.cancel_move_capture()
+        token = ("mark", mk, time.time())
+        self.capturing = token
+
+        def cb(name):
+            if name == "esc" or name in HOTBAR_KEYS:
+                self.q.put(("movekey", token, name))
+                return True
+            return False
+        self.inputs.capture_cb = cb
+        self.update_key_texts()
+        self.say("Press the hotbar key this mark belongs to. Esc = cancel.", "Press the key...")
+
+    # --- the preview with draggable boxes ---
+    def draw_preview(self):
+        cv = getattr(self, "pv_cv", None)
+        if cv is None:
+            return
+        img = self.mana_image()
+        inner = self._mana_img[2]
+        zone = self.cfg["mana"]["zone"]
+        ph = self.PV_H
+        pw = max(12, int(round(img.width * ph / float(img.height))))
+        pad = self.PV_PAD
+        pil = compose_mana(img, pw, ph, zone, inner, self.marks_front(), alpha=self.cfg["settings"]["mana_opacity"])
+        self._pv_photo = ImageTk.PhotoImage(pil)
+        cv.delete("all")
+        cv.config(width=pw + 2 * pad, height=ph)
+        cv.create_image(pad, 0, image=self._pv_photo, anchor="nw")
+        self._pv = {"pad": pad, "pw": pw, "ph": ph, "inner": inner, "zone": zone}
+        sel = self.sel_mark
+        if sel is not None and any(m is sel for m in self.marks()):
+            g = {"y": 0, "h": ph, "zone": zone}
+            x0, y0, x1, y1, _ = mana_boxes({"x": pad, "w": pw, **g}, inner, [sel])[0]
+            cv.create_rectangle(x0, y0, x1, y1, outline="#ffffff", dash=(3, 2))
+            for yy in (y0, y1):
+                cv.create_rectangle(x0 - 3, yy - 2, x1 + 3, yy + 2, fill="#ffffff", outline="#423529")
+
+    def _pv_pct(self, y):
+        pv = self._pv
+        return y_to_pct({"y": 0, "h": pv["ph"], "zone": pv["zone"]}, y)
+
+    def _pv_hit(self, x, y):
+        pv = self._pv
+        g = {"y": 0, "h": pv["ph"], "zone": pv["zone"]}
+        for mk in reversed(self.marks_front()):                 # the box on top (the selected one) gets the click first
+            x0, y0, x1, y1, _ = mana_boxes({"x": pv["pad"], "w": pv["pw"], **g}, pv["inner"], [mk])[0]
+            if x0 - 4 <= x <= x1 + 4 and y0 - 4 <= y <= y1 + 4:
+                if abs(y - y0) <= 4:
+                    return mk, "hi"                       # top edge = the upper % (hi)
+                if abs(y - y1) <= 4:
+                    return mk, "lo"
+                return mk, "move"
+        return None, None
+
+    def _pv_press(self, e):
+        if not getattr(self, "_pv", None):
+            return
+        mk, mode = self._pv_hit(e.x, e.y)
+        self.sel_mark = mk
+        self._pv_drag = (mk, mode, self._pv_pct(e.y), mk["lo"], mk["hi"]) if mk else None
+        self.draw_preview()
+
+    def _pv_motion(self, e):
+        d = getattr(self, "_pv_drag", None)
+        if not d:
+            return
+        mk, mode, p0, lo, hi = d
+        p = self._pv_pct(e.y)
+        if mode == "move":
+            dp = p - p0
+            dp = max(-lo, min(100.0 - hi, dp))
+            mk["lo"], mk["hi"] = round(lo + dp, 1), round(hi + dp, 1)
+        elif mode == "hi":
+            mk["hi"] = round(min(100.0, max(mk["lo"] + 0.5, p)), 1)
+        else:
+            mk["lo"] = round(max(0.0, min(mk["hi"] - 0.5, p)), 1)
+        self._mana_busy = True
+        try:
+            v = self.mark_vars.get(id(mk))
+            if v:
+                v[0].set(f"{mk['lo']:g}")
+                v[1].set(f"{mk['hi']:g}")
+        finally:
+            self._mana_busy = False
+        self.mana_ov.sig = None
+        self.draw_preview()
+
+    def _pv_release(self, e):
+        if getattr(self, "_pv_drag", None):
+            self._pv_drag = None
+            save_cfg(self.cfg)
+
+    # ---------- share codes ----------
+    def open_mana_share(self):
+        old = getattr(self, "mana_share_win", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        top = self.mana_share_win = tk.Toplevel(self.root)
+        top.title("Share Mana Overlay")
+        top.configure(bg=BROWN)
+        top.attributes("-topmost", True)
+        top.geometry(f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 120}")
+        body = tk.Frame(top, bg=PARCH)
+        body.pack(padx=3, pady=3)
+        W = 330
+        status = self.label(body, "", font=self.fs, justify="left", wraplength=W, fg=DIM)
+        name = self.cfg["active"]
+        self.label(body, f"Share the Mana Overlay of profile '{name}': its cast marks, the 100% / 0% lines and "
+                         "your picture. (Where it sits on your screen is not shared.)",
+                   font=self.fs, justify="left", wraplength=W).pack(fill="x", padx=8, pady=(8, 2))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8)
+        code = make_mana_code(self.cfg, name)
+        box, _ = self.bound_entry(row, code, lambda t: None, 226, 24, "left")
+        box.pack(side="left")
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(code)
+            status.config(text="Code copied - paste it to your friend.", fg=OKGREEN)
+
+        PixBtn(row, "Copy", copy, self.f, 62, 24, bd=2).pack(side="left", padx=(6, 0))
+        tk.Frame(body, bg=BROWN, height=2).pack(fill="x", padx=8, pady=8)
+        self.label(body, f"Import: paste a code, press Import. Its marks are ADDED to profile '{name}'.",
+                   font=self.fs, justify="left", wraplength=W).pack(fill="x", padx=8, pady=(0, 2))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8)
+        ibox, ivar = self.bound_entry(row, "", lambda t: None, 226, 24, "left")
+        ibox.pack(side="left")
+
+        def paste():
+            try:
+                ivar.set(self.root.clipboard_get().strip())
+            except Exception:
+                status.config(text="Nothing to paste - the clipboard is empty.", fg=BROWN)
+
+        def do_import():
+            try:
+                msg = self.import_mana(ivar.get())
+            except ValueError as e:
+                status.config(text=str(e), fg=BROWN)
+                return
+            status.config(text=msg, fg=OKGREEN)
+            ivar.set("")
+
+        PixBtn(row, "Paste", paste, self.f, 62, 24, bd=2).pack(side="left", padx=(6, 0))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(6, 0))
+        PixBtn(row, "Import", do_import, self.f, 90, 26).pack(side="left")
+        PixBtn(row, "Close", top.destroy, self.f, 90, 26).pack(side="left", padx=(6, 0))
+        status.pack(fill="x", padx=8, pady=(6, 8))
+
+    def import_mana(self, code):
+        """Apply a Mana Overlay code to the active profile: marks are added, the lines / picture are taken over.
+        Position and size on the screen stay yours. Returns a message; raises ValueError for a bad code."""
+        d = read_mana_code(code)
+        m = self.cfg["mana"]
+        m["zone"] = d["zone"]
+        extra = ""
+        if d["image"] is not None:
+            dest = os.path.join(APP_DIR, "mana_overlay_custom.png")
+            try:
+                d["image"].save(dest)
+                m["image"] = dest
+                m["w"] = round(m["h"] * d["image"].width / float(d["image"].height), 1)
+                extra = " + their picture (use Move / resize or Find bar to fit it)"
+            except Exception:
+                extra = " (couldn't save their picture)"
+        elif m.get("image"):
+            extra = ""
+        else:
+            m["image"] = ""
+        self.marks().extend(d["marks"])
+        save_cfg(self.cfg)
+        self._mana_img = None
+        self.mana_ov.sig = None
+        self.mana_status()
+        self.mana_fill_entries()
+        self.rebuild_marks()
+        msg = f"Imported {len(d['marks'])} mark(s) into '{self.cfg['active']}'" + extra + "."
+        self.say(msg, "Mana imported")
+        return msg
+
+    def open_share(self):
+        old = getattr(self, "share_win", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        top = self.share_win = tk.Toplevel(self.root)
+        top.title("Share Config")
+        top.configure(bg=BROWN)
+        top.attributes("-topmost", True)
+        top.geometry(f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 120}")
+        body = tk.Frame(top, bg=PARCH)
+        body.pack(padx=3, pady=3)
+        W = 330
+        status = self.label(body, "", font=self.fs, justify="left", wraplength=W, fg=DIM)
+
+        def copy(text, what):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            status.config(text=f"{what} copied - paste it to your friend.", fg=OKGREEN)
+
+        name = self.cfg["active"]
+        self.label(body, f"Share: profile '{name}'  (moves, snap spells, mana marks)", font=self.fs, justify="left",
+                   wraplength=W).pack(fill="x", padx=8, pady=(8, 2))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8)
+        one = make_share_code(self.cfg, [name])
+        box, _ = self.bound_entry(row, one, lambda t: None, 226, 24, "left")
+        box.pack(side="left")
+        PixBtn(row, "Copy", lambda: copy(one, "Code"), self.f, 62, 24, bd=2).pack(side="left", padx=(6, 0))
+        self.label(body, "...or ALL your profiles in one code:", font=self.fs, justify="left", wraplength=W
+                   ).pack(fill="x", padx=8, pady=(8, 2))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8)
+        every = make_share_code(self.cfg, list(self.cfg["profiles"]))
+        box, _ = self.bound_entry(row, every, lambda t: None, 226, 24, "left")
+        box.pack(side="left")
+        PixBtn(row, "Copy", lambda: copy(every, "Code"), self.f, 62, 24, bd=2).pack(side="left", padx=(6, 0))
+        tk.Frame(body, bg=BROWN, height=2).pack(fill="x", padx=8, pady=8)
+        self.label(body, "Import: paste a code you got, then press Import.", font=self.fs, justify="left",
+                   wraplength=W).pack(fill="x", padx=8, pady=(0, 2))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8)
+        ibox, ivar = self.bound_entry(row, "", lambda t: None, 226, 24, "left")
+        ibox.pack(side="left")
+
+        def paste():
+            try:
+                ivar.set(self.root.clipboard_get().strip())
+            except Exception:
+                status.config(text="Nothing to paste - the clipboard is empty.", fg=BROWN)
+
+        def do_import():
+            try:
+                msg = self.import_share(ivar.get())
+            except ValueError as e:
+                status.config(text=str(e), fg=BROWN)
+                return
+            status.config(text=msg, fg=OKGREEN)
+            ivar.set("")
+
+        PixBtn(row, "Paste", paste, self.f, 62, 24, bd=2).pack(side="left", padx=(6, 0))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(6, 0))
+        PixBtn(row, "Import", do_import, self.f, 90, 26).pack(side="left")
+        PixBtn(row, "Close", top.destroy, self.f, 90, 26).pack(side="left", padx=(6, 0))
+        status.pack(fill="x", padx=8, pady=(6, 8))
+
+    def import_share(self, code):
+        """Add the profiles in a share code (never overwrites: a taken name gets ' (2)'). The first one
+        becomes the active profile. Returns a message; raises ValueError for a bad code."""
+        items = read_share_code(code)
+        opts = read_share_opts(code)
+        invs = read_share_inv(code)
+        added = []
+        for i, (name, moves, snaps, marks, charged) in enumerate(items):
+            final = unique_name(name, self.cfg["profiles"])
+            self.cfg["popts"][final] = dict(opts[i]) if i < len(opts) else default_popts()
+            self.cfg["profiles"][final] = moves
+            self.cfg["inv"][final] = invs[i] if i < len(invs) else clean_inv(None)
+            self.cfg["snaps"][final] = snaps
+            self.cfg["marks"][final] = marks
+            self.cfg["charged"][final] = charged
+            added.append(final)
+        save_cfg(self.cfg)
+        self.set_profile(added[0])
+        self.say("Imported: " + ", ".join(added), "Imported")
+        return "Imported: " + ", ".join(f"'{n}'" for n in added) + (" - now active." if len(added) == 1
+                                                                       else " - the first one is active.")
+
+    def profile_new(self):
+        name = self._new_name()
+        if not name:
+            return
+        self.cfg["profiles"][name] = []
+        self.cfg["snaps"][name] = []
+        self.cfg["marks"][name] = []
+        self.cfg["charged"][name] = clean_charged(None)
+        self.cfg["popts"][name] = default_popts()
+        self.cfg["inv"][name] = clean_inv(None)
+        self.name_var.set("")
+        self.set_profile(name)
+        save_cfg(self.cfg)
+        self.say(f"Profile '{name}' created. Press '+ Add move' / '+ Add snap spell' to fill it.", "Profile created")
+
+    def profile_rename(self):
+        name = self._new_name()
+        if not name:
+            return
+        old = self.cfg["active"]
+        self.cfg["snaps"].setdefault(old, [])
+        self.cfg["profiles"] = {(name if k == old else k): v for k, v in self.cfg["profiles"].items()}
+        self.cfg["snaps"] = {(name if k == old else k): v for k, v in self.cfg["snaps"].items()}
+        self.cfg["marks"].setdefault(old, [])
+        self.cfg["marks"] = {(name if k == old else k): v for k, v in self.cfg["marks"].items()}
+        self.cfg["charged"].setdefault(old, clean_charged(None))
+        self.cfg["charged"] = {(name if k == old else k): v for k, v in self.cfg["charged"].items()}
+        self.cfg["popts"] = {(name if k == old else k): v for k, v in self.cfg["popts"].items()}
+        self.cfg["inv"] = {(name if k == old else k): v for k, v in self.cfg["inv"].items()}
+        self.cfg["active"] = name
+        self.name_var.set("")
+        self.profile_btn.lbl.config(text=name + " v")
+        self.rebuild_moves()                                 # (refreshes the section titles)
+        self.rebuild_marks()
+        save_cfg(self.cfg)
+        self.say(f"Renamed '{old}' to '{name}'.", "Renamed")
+
+    def profile_delete(self):
+        if len(self.cfg["profiles"]) <= 1:
+            self.say("You need at least one profile.", "Last profile")
+            return
+        now = time.time()
+        if now > self.confirm_delete_until:
+            self.confirm_delete_until = now + 3.0
+            self.del_btn.lbl.config(text="Sure?")
+            self.say(f"Press Delete again within 3 seconds to delete '{self.cfg['active']}'.", "Press again")
+            return
+        self.confirm_delete_until = 0.0
+        self.del_btn.lbl.config(text="Delete")
+        gone = self.cfg["active"]
+        del self.cfg["profiles"][gone]
+        self.cfg["snaps"].pop(gone, None)
+        self.cfg["marks"].pop(gone, None)
+        self.cfg["charged"].pop(gone, None)
+        self.cfg["popts"].pop(gone, None)
+        self.cfg["inv"].pop(gone, None)
+        self.cfg["active"] = next(iter(self.cfg["profiles"]))
+        self.tracker.reset()
+        self.profile_btn.lbl.config(text=self.cfg["active"] + " v")
+        self.rebuild_moves()
+        self.sel_mark = None
+        self.rebuild_marks()
+        self.repaint_mana_dash()
+        save_cfg(self.cfg)
+        self.say(f"Deleted '{gone}'. Now using '{self.cfg['active']}'.", "Deleted")
+
+    # ---------- other tabs ----------
+    # ---------- Extras tab: Snap Training ----------
+    # ---------- Extras tab: a menu of extra tools (each opens its own page) ----------
+    def build_extras(self, f):
+        self.train = None
+        self.train_total = 0
+        self.extra_pages = {}
+        self.dash_btns, self.dash_vars = {}, {}
+        for name in ("menu", "auto", "snap", "brew", "dash", "rc", "class", "race", "inv", "other", "gank", "check", "cview", "kda", "imenu"):
+            pg = tk.Frame(f, bg=PARCH)
+            pg.place(x=0, y=0, relwidth=1, relheight=1)
+            self.extra_pages[name] = pg
+        self.build_extras_menu(self.extra_pages["menu"])
+        self.build_auto(self.extra_pages["auto"])
+        self.build_snap(self.extra_pages["snap"])
+        self.build_brew(self.extra_pages["brew"])
+        self.build_dash(self.extra_pages["dash"])
+        self.build_rc(self.extra_pages["rc"])
+        self.build_class(self.extra_pages["class"])
+        self.build_race(self.extra_pages["race"])
+        self.build_inv(self.extra_pages["inv"])
+        self.build_other(self.extra_pages["other"])
+        self.build_gank(self.extra_pages["gank"])
+        self.build_check(self.extra_pages["check"])
+        self.build_cview(self.extra_pages["cview"])
+        pg = self.extra_pages["kda"]
+        self.back_button(pg, "other")
+        self.label(pg, "KDA", font=(self.family, -(UI_FONT_PX + 6))).pack(fill="x", padx=12, pady=(8, 0))
+        box, p = self.panel(pg, "KDA")
+        box.pack(fill="x", padx=6, pady=6)
+        self.label(p, "Left click to increase amounts, Right click to decrease amount", font=self.fs, justify="left",
+                   wraplength=PAGE_W - 60, fg=DIM).pack(fill="x", padx=8, pady=(0, 3))
+        for k, lab in (("kill", "Kill"), ("death", "Death"), ("assist", "Assist"), ("knock", "Knock")):
+            self.check_row(p, lab, "kda_" + k)
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(6, 1))
+        self.kda_btn = PixBtn(row, "Move / resize", lambda: self.toggle_mana_edit(self.cfg["kdapos"]), self.f, 110, 26)
+        self.kda_btn.pack(side="left")
+        PixBtn(row, "Reset position", self.kda_reset_pos, self.f, 110, 26).pack(side="left", padx=(4, 0))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(1, 3))
+        r_ = self.kda_rect()
+        for k, v, nm in (("x", r_[0], "X:"), ("y", r_[1], "Y:"), ("h", r_[3], "Size:")):
+            self.label(row, nm, font=self.fs).pack(side="left", padx=(0, 2))
+            box, var = self.bound_entry(row, str(round(v)), lambda t, k=k: self.kda_geo(k, t), 48, 22)
+            box.pack(side="left", padx=(0, 6))
+            self.kda_vars[k] = var
+        PixBtn(p, "Reset Counter", self.kda_reset, self.f, 130, 26, bd=2).pack(anchor="w", padx=8, pady=(6, 6))
+        pg = self.extra_pages["imenu"]
+        self.back_button(pg, "other")
+        self.label(pg, "Instant Menu", font=(self.family, -(UI_FONT_PX + 6))).pack(fill="x", padx=12, pady=(8, 0))
+        box, p = self.panel(pg, "Instant Menu")
+        box.pack(fill="x", padx=6, pady=6)
+        self.label(p, "Press the keybind to menu instantly... thats all.", font=self.fs, justify="left", fg=DIM,
+                   wraplength=PAGE_W - 60).pack(fill="x", padx=8, pady=(0, 3))
+        krow = tk.Frame(p, bg=PARCH)
+        krow.pack(fill="x", padx=8, pady=(4, 6))
+        self.label(krow, "Instant Menu keybind", font=self.fs).pack(side="left")
+        self.btn_imenu = PixBtn(krow, self.key_name("imenu"), lambda: self.start_capture("imenu"), self.f, 110, 24)
+        self.btn_imenu.pack(side="right")
+        self.key_btns["imenu"] = self.btn_imenu
+        self.show_extra("menu")
+
+    def show_extra(self, name):
+        self.extra_page = name
+        self.extra_pages[name].tkraise()
+
+    def build_extras_menu(self, f):
+        big = (self.family, -(UI_FONT_PX + 6))
+        self.extra_icons = {k: ImageTk.PhotoImage(_img(v)) for k, v in EXTRA_ICONS.items()}      # (kept alive here)
+        self.other_menu_icon = ImageTk.PhotoImage(_img(CHECK_ICONS["other"]))
+        for i, (key, text) in enumerate((("auto", "Automation"), ("dash", "Dash/PB CD"), ("rc", "Race/Class"), ("inv", "Inventory"), ("other", "Other Stuff"))):
+            row = tk.Frame(f, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(14 if i == 0 else 6, 0))
+            tk.Label(row, image=(self.other_menu_icon if key == "other" else self.extra_icons[key]), bg=PARCH, bd=0, width=62).pack(side="left")
+            PixBtn(row, text, lambda k=key: self.show_extra(k), big, 200, 44).pack(side="left", padx=(8, 0))
+
+    def back_button(self, parent, to="menu"):
+        PixBtn(parent, "< Back", lambda: self.show_extra(to), self.f, 70, 24).pack(anchor="w", padx=8, pady=(6, 0))
+
+    def build_auto(self, f):
+        """Extras > Automation: the things the Assist Tool does for you (Snap Trainer, Potion Brewer / Weapon Smithing)."""
+        self.back_button(f)
+        big = (self.family, -(UI_FONT_PX + 6))
+        self.label(f, "Automation", font=big).pack(fill="x", padx=12, pady=(8, 0))
+        for i, (key, text, icon) in enumerate((("snap", "Snap Trainer", "snap"), ("brew", "Alchemy/Smith", "brew"))):
+            row = tk.Frame(f, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(10 if i == 0 else 6, 0))
+            tk.Label(row, image=self.extra_icons[icon], bg=PARCH, bd=0, width=62).pack(side="left")
+            PixBtn(row, text, lambda k=key: self.show_extra(k), big, 200, 44).pack(side="left", padx=(8, 0))
+
+    def build_rc(self, f):
+        """Race/Class: the menu with 'Classes' and 'Races' (same look as the Extras menu)."""
+        self.back_button(f)
+        big = (self.family, -(UI_FONT_PX + 6))
+        for i, (key, text) in enumerate((("class", "Classes"), ("race", "Races"))):
+            row = tk.Frame(f, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(14 if i == 0 else 6, 0))
+            tk.Label(row, image=self.extra_icons[key], bg=PARCH, bd=0, width=62).pack(side="left")
+            PixBtn(row, text, lambda k=key: self.show_extra(k), big, 200, 44).pack(side="left", padx=(8, 0))
+
+    # ---------- Extras tab: Inventory ----------
+    INV_LEARN_W, INV_NAME_W, INV_SW_W, INV_CD_W, INV_M2_W = 46, 70, 24, 46, 40       # (the row, with the [x], has to fit the page: 46+74+28+50+44+22 = 264)
+
+    def build_inv(self, f):
+        """Extras > Inventory: the profile's inventory moves + potions, and what the macro has learned to recognise."""
+        host = self.scroll_page(f, "inv", PAGE_W - 12)
+        self.back_button(host)
+        box, p = self.panel(host, "Inventory  (the ` key)")
+        box.pack(fill="x", padx=6, pady=6)
+        self.check_row(p, "Hide the coins while the inventory is open", "inv_hide", wrap=230)
+        self.entry_row(p, "Card box colour (#rrggbb)", "inv_box_color", str, w=84, h=22)
+        self.entry_row(p, "Card box thickness (px, 1 - 12)", "inv_box_width", int, w=56, h=22)
+        self.entry_row(p, "Card box opacity (0.1 - 1)", "inv_box_opacity", float, w=56, h=22)
+        self.entry_row(p, "Potion cooldown, all potions (s)", "potion_cd", float, w=56, h=22)
+        self.entry_row(p, "Fire Protection lasts (seconds)", "fire_dur", float, w=56, h=22)
+        self.entry_row(p, "Feather Feet lasts (seconds)", "feather_dur", float, w=56, h=22)
+        self.label(p, "How to Set this up\n\n1. Press Add Move, add the name, the cooldowns. Right Click the name to mark it as a potion\n"
+                      "2. Open your Inventory, click on Learn/Redo and right click twice on the thing you just named. (the name has to be "
+                      "the exact same, for example if you want to detect Ignis in your inventory you have to name it Ignis here)\n"
+                      "3. thats all lol why r u still reading\n\n"
+                      "Every Profile has their own Inventory. The Inventory is shared with the Profile, but you need to teach the Assist Tool first.",
+                   font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM).pack(fill="x", padx=8, pady=(2, 3))
+        self.inv_body = tk.Frame(host, bg=PARCH)
+        self.inv_body.pack(fill="x")
+        self.rebuild_inv()
+
+    def rebuild_inv(self):
+        if getattr(self, "inv_body", None) is not None:
+            self._keep_scroll("inv", self._rebuild_inv)
+
+    def inv_list(self):
+        return inv_of(self.cfg)
+
+    def _rebuild_inv(self):
+        for w in self.inv_body.winfo_children():
+            w.destroy()
+        self.inv_status = {}
+        small = dict(font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM)
+        lst = self.inv_list()
+        box, p = self.panel(self.inv_body, f"Potions in '{self.cfg['active']}'")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        for e in lst:
+            if e.get("builtin"):
+                self._inv_row(p, e)
+        self.label(p, "lol drinking potion shows u it's duration lol", **small).pack(fill="x", padx=8, pady=(2, 3))
+        box, p = self.panel(self.inv_body, f"Moves in '{self.cfg['active']}'")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        hdr = tk.Frame(p, bg=PARCH)
+        hdr.pack(fill="x", padx=8)
+        for w, t, padl in ((self.INV_LEARN_W, "", 0), (self.INV_NAME_W, "Name", 4), (self.INV_SW_W, "Box", 4), (self.INV_CD_W, "Cooldown", 4), (self.INV_M2_W, "M2", 4)):
+            c = tk.Frame(hdr, bg=PARCH, width=w, height=16)
+            c.pack(side="left", padx=(padl, 0))
+            c.pack_propagate(False)
+            self.label(c, t, font=self.fs).pack(fill="both")
+        for e in lst:
+            if not e.get("builtin"):
+                self._inv_row(p, e)
+        PixBtn(p, "+ Add move", self.add_inv, self.f, 110, 26).pack(anchor="w", padx=8, pady=(4, 2))
+        self.label(p, "You can change the Box Color if you want", **small).pack(fill="x", padx=8, pady=(2, 3))
+        self.inv_refresh_status()
+
+    def _inv_row(self, parent, e):
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        lb = PixBtn(row, "Learn", lambda en=e: self.inv_start_learn(en["name"]), self.f, self.INV_LEARN_W, 24, bd=2)
+        lb.pack(side="left")
+        self.inv_status[e["name"]] = lb
+        last = {"name": e["name"]}                          # (the name the Learn / Redo button and the learned card are filed under)
+        builtin = bool(e.get("builtin"))
+        soul = (not builtin) and is_soul_name(e["name"])
+        awk = (not builtin) and is_awk_name(e["name"])
+        bmk = None if builtin else bmove_kind(e["name"])
+
+        def set_name(v, en=e):
+            v = " ".join(v.split())[:40]
+            old = last["name"]
+            en["name"] = v
+            if v and v != old:
+                self.inv_renamed(old, v, en, lb)             # the Learn / Redo button and the learned picture follow the new name
+                last["name"] = v
+            if is_soul_name(v) != bool(en.get("soul")):
+                if is_soul_name(v):
+                    en.update(soul=True, cd=0.0, cd2=0.0, potion=False)
+                else:
+                    en.pop("soul", None)
+                self.soul_rebuild_later(True)
+            if is_awk_name(v) != bool(en.get("awk")):
+                if is_awk_name(v):
+                    en.update(awk=True, cd=0.0, cd2=0.0, potion=False)
+                else:
+                    en.pop("awk", None)
+                self.soul_rebuild_later(True)
+            if bmove_kind(v) != en.get("bmove"):
+                if bmove_kind(v):
+                    en.update(bmove=bmove_kind(v), cd=0.0, cd2=0.0, potion=False)
+                else:
+                    en.pop("bmove", None)
+                self.soul_rebuild_later(True)
+            save_cfg(self.cfg)
+            self._sig = None
+            self.inv_refresh_status()
+        nb, _ = self.bound_entry(row, e["name"], set_name, self.INV_NAME_W, 24, "left")
+        nb.pack(side="left", padx=(4, 0))
+        self._inv_swatch(row, e)
+        if builtin:
+            nb.entry.config(state="disabled", disabledbackground=GREEN_BOX, disabledforeground=BROWN)
+            return
+        ent = nb.entry
+
+        def paint_name(en=e, w=ent):
+            w.config(bg=GREEN_BOX if en.get("potion") else TAN)
+
+        def flip_name(_e=None, en=e):                        # right-click the name box: potion or not
+            if is_soul_name(en["name"]) or is_awk_name(en["name"]) or bmove_kind(en["name"]):
+                self.say(f"{en['name']} is a move, not a potion.", "Not a potion")
+                return "break"
+            en["potion"] = not en.get("potion")
+            save_cfg(self.cfg)
+            self.tracker.clear_key(inv_vkey(en["name"]))
+            self.say(f"'{en['name']}' is a potion (green name box): click the screen to drink it (2 s)." if en["potion"]
+                     else f"'{en['name']}' is a normal move again.", "Potion" if en["potion"] else "Not a potion")
+            self.rebuild_inv()
+            return "break"
+        for w_ in (ent, nb):
+            w_.bind("<Button-3>", flip_name)
+        paint_name()
+
+        def num(key):
+            def go(v, en=e):
+                v = v.strip().replace(",", ".")
+                try:
+                    en[key] = max(0.0, float(v)) if v else 0.0
+                except ValueError:
+                    return
+                save_cfg(self.cfg)
+            return go
+        potion = bool(e.get("potion"))
+        cb, _ = self.bound_entry(row, f"{e['cd']:g}" if e.get("cd") else "", num("cd"), self.INV_CD_W, 24)
+        cb.pack(side="left", padx=(4, 0))
+        m2, _ = self.bound_entry(row, f"{e['cd2']:g}" if e.get("cd2") else "", num("cd2"), self.INV_M2_W, 24)
+        m2.pack(side="left", padx=(4, 0))
+
+        def paint(en=e, w=m2.entry):
+            w.config(bg=GREEN_BOX if en.get("split") else TAN)
+
+        def flip(_e=None, en=e):                             # right-click the M2 box: M1 and M2 don't share
+            en["split"] = not en.get("split")
+            save_cfg(self.cfg)
+            paint()
+            self.say(f"'{en['name']}': M1 and M2 DON'T share a cooldown (green box)." if en["split"]
+                     else f"'{en['name']}': M1 and M2 share a cooldown.", "M1/M2 separate" if en["split"] else "M1/M2 shared")
+            return "break"
+        for w_ in (m2.entry, m2):
+            w_.bind("<Button-3>", flip)
+        paint()
+        if potion or soul or awk or bmk:                          # a potion has no cooldown; Soul Rip's boxes stay blank (Soul Berserk is below)
+            for b_ in (cb, m2):
+                try:
+                    b_.entry.config(state="disabled")
+                except Exception:
+                    pass
+        PixBtn(row, "x", lambda en=e: self.delete_inv(en), self.f, self.X_W, 24, bd=2).pack(side="right")
+        if soul:
+            self.build_soul_row(parent)
+        if awk:
+            self.build_awk_row(parent)
+        if bmk:
+            self.build_bmove_row(parent, bmk)
+
+    def _inv_swatch(self, row, e):
+        """A little colour square: the colour of THIS card's green box. Click = pick a colour, right-click = back to the default."""
+        default = lambda: (INV_POTION_COLOR.get(e["name"]) if e.get("builtin") else None) or clean_hex(self.cfg["settings"].get("inv_box_color")) or "#46e060"
+        sw = tk.Frame(row, bg=BROWN, width=self.INV_SW_W, height=24)
+        sw.pack(side="left", padx=(4, 0))
+        sw.pack_propagate(False)
+        inner = tk.Frame(sw, bg=e.get("color") or default(), cursor="hand2")
+        inner.place(x=3, y=3, width=self.INV_SW_W - 6, height=18)
+
+        def pick(_e=None, en=e):
+            try:
+                from tkinter import colorchooser
+                res = colorchooser.askcolor(color=en.get("color") or default(), title=f"Box colour of {en['name']}")
+            except Exception as ex:
+                self.say(f"The colour picker didn't open: {ex}", "No picker")
+                return "break"
+            if res and res[1]:
+                en["color"] = clean_hex(res[1])
+                inner.config(bg=en["color"] or default())
+                save_cfg(self.cfg)
+                self.say(f"'{en['name']}': box colour {en['color']}.", "Box colour")
+            return "break"
+
+        def reset(_e=None, en=e):
+            en["color"] = INV_POTION_COLOR.get(en["name"], "") if en.get("builtin") else ""
+            inner.config(bg=default())
+            save_cfg(self.cfg)
+            self.say(f"'{en['name']}': box colour back to the default.", "Default colour")
+            return "break"
+        for w_ in (sw, inner):
+            w_.bind("<Button-1>", pick)
+            w_.bind("<Button-3>", reset)
+
+    def add_inv(self):
+        lst = self.inv_list()
+        names = {_norm_name(e["name"]) for e in lst}
+        nm, i = "New move", 1
+        while _norm_name(nm) in names:
+            i += 1
+            nm = f"New move {i}"
+        lst.append({"name": nm, "cd": 10.0, "cd2": 0.0, "split": False, "potion": False, "builtin": False})
+        save_cfg(self.cfg)
+        self.rebuild_inv()
+        self.say(f"Added '{nm}' to the inventory. Rename it, press Learn and left-click its card in the open inventory.", "Inventory move added")
+
+    def delete_inv(self, e):
+        lst = self.inv_list()
+        lst[:] = [x for x in lst if x is not e]
+        self.tracker.clear_key(inv_vkey(e["name"]))
+        self.tracker.reset_soul()
+        save_cfg(self.cfg)
+        self.rebuild_inv()
+
+    def build_race(self, f):
+        host = self.scroll_page(f, "race", PAGE_W - 12)
+        self.back_button(host, "rc")
+        small = dict(font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM)
+        box, p = self.panel(host, "Dzin")
+        box.pack(fill="x", padx=6, pady=6)
+        self.label(p, "Add Awakened to Moves or Inventory to turn this on", **small).pack(fill="x", padx=8, pady=(0, 3))
+        self.entry_row(p, "Awakened lasts (seconds)", "awk_dur", float, w=56, h=22)
+        self.entry_row(p, "Awakened cooldown (seconds)", "awk_cd", float, w=56, h=22)
+        box, p = self.panel(host, "Fischeran")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.fisch_row = self.check_row(p, "Fischeran Dodges - saved per profile", None, getter=self.fisch_on,
+                                        setter=lambda v: self.set_popt("fischeran", v))
+        self.entry_row(p, "Dodge regeneration (seconds)", "fisch_cd", float, w=56, h=22)
+        for nm, txt in (("Dinakeri", "Add Soul Rip to Moves or Inventory to turn this on"),
+                        ("Vind", "Add Tempest Soul to Moves or Inventory to turn this on"),
+                        ("Rigan", "Add Flood to Moves or Inventory to turn this on"),
+                        ("Construct", "Add Galvanize to Moves or Inventory to turn this on"),
+                        ("Haseldan", "Add Bloodline to Moves or Inventory to turn this on")):
+            box, p = self.panel(host, nm)
+            box.pack(fill="x", padx=6, pady=(0, 6))
+            self.label(p, txt, **small).pack(fill="x", padx=8, pady=(0, 3))
+        box, p = self.panel(host, "Where the coins go")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.coin_pos_rows(p, ("awk_pb", "awk_dash", "fisch_dash"))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(6, 4))
+        PixBtn(row, "Reset positions", self.dash_reset_pos, self.f, 124, 24).pack(side="left")
+
+    def coin_pos_rows(self, p, ids):
+        """'Move / resize' + X / Y / W / H rows for some of the coins."""
+        for k in ids:
+            it = self.cfg["dashpos"][k]
+            row = tk.Frame(p, bg=PARCH)
+            row.pack(fill="x", padx=8, pady=(4, 0))
+            self.label(row, DASH_LABEL[k], font=self.fs).pack(side="left")
+            mv = PixBtn(row, "Move / resize", lambda i=it: self.toggle_mana_edit(i), self.f, 104, 22, bd=2)
+            mv.pack(side="right")
+            self.dash_btns[k] = mv
+            row = tk.Frame(p, bg=PARCH)
+            row.pack(fill="x", padx=8, pady=(2, 0))
+            vars_ = {}
+            for n in ("x", "y", "w", "h"):
+                self.label(row, n.upper() + ":", font=self.fs).pack(side="left", padx=(0, 1))
+                b, var = self.bound_entry(row, str(round(it[n])), lambda t, d=it, n=n: self.dash_geo(d, n, t), 44, 20)
+                b.pack(side="left", padx=(0, 4))
+                vars_[n] = var
+            self.dash_vars[k] = vars_
+
+    def build_class(self, f):
+        """Race/Class > Classes: per-profile class options (all off by default, saved with the profile)."""
+        host = self.scroll_page(f, "class", PAGE_W - 12)
+        self.back_button(host, "rc")
+        small = dict(font=self.fs, justify="left", wraplength=PAGE_W - 40, fg=DIM)
+        box, p = self.panel(host, "Whisperer")
+        box.pack(fill="x", padx=6, pady=6)
+        self.label(p, "Double Jump is the Purple Border Icon yea dude crazy", **small).pack(fill="x", padx=8, pady=(0, 3))
+        self.dj_row = self.check_row(p, "Whisperer's Double Jump - saved per profile", None,
+                                     getter=lambda: self.popt("whisper_dj"), setter=lambda v: self.set_popt("whisper_dj", v))
+        self.entry_row(p, "Double jump cooldown (seconds)", "dj_cd", float, w=56, h=22)
+        self.entry_row(p, "Two Space presses within (seconds)", "dj_window", float, w=56, h=22)
+        box, p = self.panel(host, "Cadence")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.label(p, "Add a song to Moves or Inventory to turn this on: " + ", ".join(SONGS) + ".", **small).pack(fill="x", padx=8, pady=(0, 3))
+        self.entry_row(p, "Song Switch cooldown (seconds)", "song_switch_cd", float, w=56, h=22)
+        self.entry_row(p, "Song Fail cooldown (seconds)", "song_fail_cd", float, w=56, h=22)
+        self.check_row(p, "Auto Bard",
+                       "auto_bard", wrap=420)
+        self.entry_row(p, "Auto Bard click timing (ms, negative = earlier)", "bard_offset_ms", float, w=56, h=22)
+        box, p = self.panel(host, "Lapidarist")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.label(p, "Add Hammer to Moves or Inventory to turn this on: Sapphire, Opal and Ruby Shard are added to the Inventory. "
+                      "Using one puts all of them on this cooldown (like a snap).", **small).pack(fill="x", padx=8, pady=(0, 3))
+        self.entry_row(p, "Shard cooldown (seconds)", "shard_cd", float, w=56, h=22)
+        box, p = self.panel(host, "Dragon Sage / Faceless Dashes")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.label(p, "For classes with Mana Dash. yea dude crazy toooo lol promote my server", **small).pack(fill="x", padx=8, pady=(0, 3))
+        self.mana_dash_row = self.check_row(p, "Dragon Sage / Faceless Dashes (the 5 blue coins) - saved per profile",
+                                            None, getter=self.mana_dash_on, setter=self.set_mana_dash)
+        self.entry_row(p, "Mana needed for a mana dash (%)", "mana_dash_min", float, w=56, h=22)
+        self.entry_row(p, "Mana dash timeout (seconds)", "mana_dash_timeout", float, w=56, h=22)
+        self.entry_row(p, "Mana dash cooldown (each blue coin)", "mana_dash_cd", float, w=56, h=22)
+        self.label(p, "Timeout: after a mana dash, dash key presses are ignored for this long, so spamming the key "
+                      "doesn't use up several blue coins at once.", **small).pack(fill="x", padx=8, pady=(0, 3))
+        box, p = self.panel(host, "Wraith Knight")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.label(p, "Add Soul Rip to Moves or Inventory to turn this on", **small).pack(fill="x", padx=8, pady=(0, 3))
+        box, p = self.panel(host, "Where the coins go")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.coin_pos_rows(p, ("mana", "jump", "rune"))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(6, 4))
+        PixBtn(row, "Reset positions", self.dash_reset_pos, self.f, 124, 24).pack(side="left")
+
+    # ---------- Dash / PB CD page ----------
+    def is_dash_item(self, it):
+        return any(it is v for v in self.cfg["dashpos"].values())
+
+    def is_pct_item(self, it):
+        return it is self.cfg["pctpos"]
+
+    def build_dash(self, f):
+        host = self.scroll_page(f, "dash", PAGE_W - 12)
+        self.back_button(host)
+        box, p = self.panel(host, "Dash / PB cooldown")
+        box.pack(fill="x", padx=6, pady=6)
+        self.label(p, "The Icon turns black when you press the key for them. (Q for dash, M2 while holding Fist while shift locking is Fist M2, "
+                      "F for PB Cooldown)", font=self.fs, justify="left", wraplength=PAGE_W - 40,
+                   fg=DIM).pack(fill="x", padx=8, pady=(0, 3))
+        self.check_row(p, "Show the Dash coin", "dash_on")
+        self.check_row(p, "Show the PB coin", "pb_on")
+        self.check_row(p, "Show the Fist M2 coin (green): a right click while nothing is armed (Armed: Fist)", "fist_on", wrap=230)
+        box, p = self.panel(host, "Where the coins go")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.coin_pos_rows(p, BASIC_COINS)
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(6, 4))
+        PixBtn(row, "Reset positions", self.dash_reset_pos, self.f, 124, 24).pack(side="left")
+        box, p = self.panel(host, "Cooldowns (seconds) and keys")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.entry_row(p, "Dash cooldown", "dash_cd", float, w=56, h=22)
+        self.entry_row(p, "PB cooldown", "pb_cd", float, w=56, h=22)
+        self.entry_row(p, "Fist M2 cooldown", "fist_cd", float, w=56, h=22)
+        self.entry_row(p, "Dash key (a letter)", "key_dash", str, w=38, h=22)
+        self.entry_row(p, "PB key (a letter)", "key_pb", str, w=38, h=22)
+
+    def crosshair_visible(self, pt=None):
+        """True while the Shiftlock crosshair is up. In Roblox the crosshair IS the mouse cursor (a screenshot never shows
+        it), and Shiftlock holds that cursor in the middle of the game window: so it counts when the cursor is there."""
+        x, y = pt if pt else cursor_pos()
+        centres = []
+        c = foreground_center()
+        if c is not None:
+            centres.append(c)
+        with mss.mss() as s:
+            mon = s.monitors[1]
+            c2 = (mon["left"] + mon["width"] // 2, mon["top"] + mon["height"] // 2)
+        if not centres or abs(centres[0][0] - c2[0]) + abs(centres[0][1] - c2[1]) > 30:
+            centres.append(c2)                                    # (the middle of the screen too)
+        self._cross_dist = min(max(abs(x - cx), abs(y - cy)) for cx, cy in centres)
+        return self._cross_dist <= CROSS_NEAR
+
+    def fist_press(self, t, pt=None):
+        """A right click while no move is armed = a Fist M2 (from the input thread)."""
+        if self.cfg["settings"].get("fist_need_cross", True):
+            try:
+                if not self.crosshair_visible(pt):
+                    if time.time() - getattr(self, "_cross_no_t", 0.0) > 8:      # (say why, once in a while)
+                        self._cross_no_t = time.time()
+                        self.q.put(("msg", f"Fist M2: right click ignored - the cursor was {getattr(self, '_cross_dist', 0):.0f} px from the middle (Shiftlock off?). Turn Shiftlock on to count it."))
+                    return
+            except Exception as ex:
+                if time.time() - getattr(self, "_cross_err_t", 0.0) > 30:       # (tell once in a while, not on every click)
+                    self._cross_err_t = time.time()
+                    self.q.put(("msg", f"Fist M2: couldn't look for the crosshair ({ex})."))
+                return
+        with self.dash_lock:
+            self.dashcd.press_fist(t, cd_value(self.cfg["settings"], "fist_cd"))
+
+    def rune_box(self):
+        """Where the rune counter's number is: right of the rune coin / the game's rune icon (follows the coin when it is moved)."""
+        it = self.cfg["dashpos"]["rune"]
+        return {"left": int(it["x"] + it["w"] + 2), "top": int(it["y"] - 2), "width": max(16, int(it["w"] * 2.6)),
+                "height": max(10, int(it["h"] + 4))}
+
+    def read_runes(self):
+        """The rune count on the screen (an int), or None when it can't be read."""
+        try:
+            box = self.rune_box()
+            arr = self._grab_rgb(box)
+            return read_rune_count(arr, max(4, int(box["height"] * 0.3)))
+        except Exception:
+            return None
+
+    def popt(self, key):
+        """A per-profile switch of the ACTIVE profile (they travel with the profile's share code)."""
+        return bool(self.cfg["popts"].get(self.cfg["active"], {}).get(key))
+
+    def set_popt(self, key, v):
+        self.cfg["popts"].setdefault(self.cfg["active"], default_popts())[key] = bool(v)
+
+    def mana_dash_on(self):
+        """Dragon Sage / Faceless Dashes."""
+        return self.popt("mana_dash")
+
+    def set_mana_dash(self, v):
+        self.set_popt("mana_dash", v)
+
+    def dj_on(self):
+        return self.popt("whisper_dj")
+
+    def soul_on(self):
+        """Wraith Knight's Soul Rip: on while a move called 'Soul Rip' is in the profile's Moves or in its Inventory."""
+        act = self.cfg["active"]
+        return (any(is_soul_name(m.get("name")) and not m.get("spell") for m in self.cfg["profiles"].get(act, []))
+                or any(is_soul_name(e.get("name")) for e in inv_of(self.cfg)))
+
+    def awk_on(self):
+        """Dzin's Awakened: on while a move called 'Awakened' is in the profile's Moves or in its Inventory."""
+        act = self.cfg["active"]
+        return (any(is_awk_name(m.get("name")) and not m.get("spell") for m in self.cfg["profiles"].get(act, []))
+                or any(is_awk_name(e.get("name")) for e in inv_of(self.cfg)))
+
+    def fisch_on(self):
+        return self.popt("fischeran")
+
+    def dodge_state(self, now):
+        """What the Awakened / Fischeran coins show now: {'pb', 'dodges'} or None (neither is switched on). Awakened running wins;
+        otherwise the passive Fischeran dodges, otherwise the idle Awakened coins (all lit)."""
+        aw = self.tracker.awk_state(now) if self.awk_on() else None
+        if aw is not None:
+            return aw
+        if self.fisch_on():
+            return dict(self.tracker.fisch_state(now, int(self.cfg["settings"].get("fisch_dodges", 5))), fisch=True)
+        if self.awk_on():
+            return {"pb": 1.0, "dodges": [1.0] * AWK_COINS}
+        return None
+
+    def awk_loop(self):
+        """Looks at the 'DODGES: x' text ~15 times a second while Awakened runs (or the Fischeran dodges are on)."""
+        while True:
+            try:
+                now = time.time()
+                if self.cfg["settings"].get("awk_read", True) and (self.tracker.awk_reading(now) or self.fisch_on()):
+                    self.awk_look(now)
+                    time.sleep(0.07)
+                else:
+                    time.sleep(0.25)
+            except Exception:
+                time.sleep(0.5)
+
+    def awk_look(self, now):
+        if self.inv_is_open(now) or not self.game_focused():
+            self.tracker.awk_feed(now, None, None)                 # (the text may be hidden by a menu: no verdict)
+            self.tracker.fisch_feed(now, None, None, self.cfg["settings"])
+            return
+        x, y, w, h = self.dodge_region()
+        box = {"left": int(x), "top": int(y), "width": max(8, int(w)), "height": max(8, int(h))}
+        present, num = read_dodge_screen(self._grab_rgb(box), float(self.cfg["bar"]["pitch"]) / DEFAULT_BAR["pitch"])
+        self.tracker.awk_feed(now, present, num)
+        if self.fisch_on() and not self.tracker.awk_reading(now):
+            self.tracker.fisch_feed(now, present, num, self.cfg["settings"])
+
+    def repaint_mana_dash(self):
+        for name in ("mana_dash_row", "dj_row"):
+            row = getattr(self, name, None)
+            if row is not None:
+                row.repaint()
+
+    def dash_fill_entries(self):
+        self._mana_busy = True
+        try:
+            for k, it in self.cfg["dashpos"].items():
+                v = self.dash_vars.get(k)
+                if v:
+                    for n in ("x", "y", "w", "h"):
+                        v[n].set(str(round(it[n])))
+        finally:
+            self._mana_busy = False
+
+    def dash_geo(self, it, key, text):
+        if self._mana_busy:
+            return
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            return
+        if key in ("w", "h") and v < 8:
+            return
+        it[key] = v
+        save_cfg(self.cfg)
+        if self.mana_edit is not None and self._edit_item is it:
+            self._edit_render()
+
+    def anchor_now(self):
+        """The hotbar as it is now ('Find hotbar'), with the game window's left edge."""
+        t = time.time()
+        if t - getattr(self, "_cl_t", -9.0) > 2.0:
+            self._cl_t, self._cl = t, game_client_left(self.cfg["settings"].get("game_title") or "Roblox")
+        return bar_anchor(self.cfg["bar"], self._cl)
+
+    def sync_dash_anchor(self):
+        """The coins follow the hotbar: when 'Find hotbar' put it somewhere else (a window, another size) every coin moves and
+        scales with it. The saved anchor is the hotbar the coins were last placed against (first time: the 1920x1080 one)."""
+        B = self.anchor_now()
+        A = self.cfg.get("dash_anchor")
+        if not valid_anchor(A):
+            A = ref_anchor(*screen_size(self.root))
+        if abs(A["x"] - B["x"]) < 0.5 and abs(A["y"] - B["y"]) < 0.5 and abs(A["p"] - B["p"]) < 0.01:
+            if self.cfg.get("dash_anchor") is None:
+                self.cfg["dash_anchor"] = B
+                save_cfg(self.cfg)
+            elif B["cl"] is not None and self.cfg["dash_anchor"].get("cl") != B["cl"]:
+                self.cfg["dash_anchor"]["cl"] = B["cl"]       # (only the window's left edge differs: remember it)
+            return
+        if A.get("cl") is None:
+            A = dict(A, cl=0.0 if B["cl"] is not None else None)
+        for k, it in self.cfg["dashpos"].items():
+            move_item(it, A, B, left=(k == "rune"))
+        self.cfg["dash_anchor"] = B
+        save_cfg(self.cfg)
+        try:
+            self.dash_fill_entries()
+        except Exception:
+            pass
+
+    def dodge_region(self):
+        """Where 'DODGES: x' is on the screen now: the 1920x1080 spot moved / scaled with the hotbar."""
+        x, y, w, h = DODGE_REGION_1080
+        return ref_point(bar_anchor(self.cfg["bar"]), x, y, w, h)
+
+    def dash_reset_pos(self):
+        new = default_dashpos(*screen_size(self.root))
+        A, B = ref_anchor(*screen_size(self.root)), self.anchor_now()
+        for k, v in new.items():
+            self.cfg["dashpos"][k].update({n: v[n] for n in ("x", "y", "w", "h")})
+            move_item(self.cfg["dashpos"][k], A, B, left=(k == "rune"))
+        self.cfg["dash_anchor"] = B
+        save_cfg(self.cfg)
+        self.dash_fill_entries()
+        if self.mana_edit is not None and self.is_dash_item(self._edit_item):
+            self._edit_render()
+        self.say("Dash / PB coins are back at their starting places.", "Reset")
+
+    # --- the Dash / PB cooldowns themselves ---
+    def dash_press(self, name, t):
+        """A Dash / PB key press (not a key repeat) from the input thread."""
+        S = self.cfg["settings"]
+        dkey = letter_key(S.get("key_dash"), "q")
+        if name == "g":
+            self.g_t = t                                       # (for the mana dash failsafe below)
+            self.g_dn = t
+        if name == dkey:
+            normal = ctrl_down()                              # Ctrl + Q: a normal dash, whatever the mana says
+            use = self.mana_dash_on() and not normal
+            has = self.mana_charged_at(t) if use else False
+            both = use and not has and 0 <= t - self.g_dn <= GQ_WINDOW    # 0 mana, G and the dash within 0.08 s: normal coin AND blue coin
+            if use and not has and 0 <= t - self.g_t <= GDASH_WINDOW:
+                has = True                                    # failsafe: no mana seen, but G was pressed just before the dash (blue coin only)
+            with self.dash_lock:
+                r = self.dashcd.press_dash(t, cd_value(S, "dash_cd"), cd_value(S, "mana_dash_cd"), has, use,
+                                           cd_value(S, "mana_dash_timeout"), both, normal)
+            self.last_q, self.q_t = r, t
+        if name == letter_key(S.get("key_pb"), "f"):
+            with self.dash_lock:
+                self.dashcd.press_pb(t, cd_value(S, "pb_cd"))
+        if name == "space" and self.dj_on():               # Whisperer: Space twice in a row = the double jump
+            with self.dash_lock:
+                self.dashcd.press_jump(t, cd_value(S, "dj_cd"), cd_value(S, "dj_window"))
+
+    # --- the little Scroom that shows while the macro is hidden ---
+    def mascot_wanted(self):
+        """Shown while the macro window is hidden and the game window isn't in front (never while something is being picked)."""
+        if not self.cfg["settings"].get("mascot_on", True) or self.selecting or self.root.state() != "withdrawn":
+            return False
+        title = str(self.cfg["settings"].get("game_title", "")).strip()
+        return not (title and self.game_focused())
+
+    def mascot_xy(self):
+        m = self.cfg.get("mascot")
+        w, h = self.mascot.size if self.mascot.win is not None else (54, 48)
+        sw, sh = screen_size(self.root)
+        if m and -w < m["x"] < sw and -h < m["y"] < sh:
+            return m["x"], m["y"]
+        return mascot_default_pos(sw, sh, w, h)
+
+    def _mascot_tick(self):
+        if self.mascot_wanted():
+            x, y = self.mascot_xy()
+            self.mascot.show(x, y)
+        elif self.mascot.shown:
+            self.mascot.hide()
+
+    def mascot_pop(self):
+        """Clicked: the macro window comes back and the Scroom goes away."""
+        self.mascot.hide()
+        if self.root.state() == "withdrawn":
+            self.root.deiconify()
+            self.root.attributes("-topmost", bool(self.cfg["settings"]["topmost"]))
+
+    def mascot_moved(self, pos):
+        self.cfg["mascot"] = {"x": round(pos[0], 1), "y": round(pos[1], 1)}
+        save_cfg(self.cfg)
+
+    # --- the mana % number on the bar ---
+    def pct_rect(self):
+        """(x, y, w, h) of the number on screen: above the mana bar until you move / resize it yourself."""
+        P = self.cfg["pctpos"]
+        return pct_follow_rect(self.cfg["mana"]) if P.get("follow") else (P["x"], P["y"], P["w"], P["h"])
+
+    def _grab_rgb(self, box):
+        loc = self._mana_tls = getattr(self, "_mana_tls", threading.local())
+        if getattr(loc, "sct", None) is None:
+            loc.sct = mss.mss()                               # (one screen grabber per thread)
+        shot = loc.sct.grab(box)
+        return np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
+
+    def read_mana_pct(self):
+        """The mana % (0-100) read from the game's bar: where the fill's top edge is, between the picture's 100 % and 0 % lines."""
+        m = self.cfg["mana"]
+        inner = self._mana_img[2] if getattr(self, "_mana_img", None) else (0.1, 0.75)
+        y0, y1 = int(round(pct_to_y(m, 100))), int(round(pct_to_y(m, 1.5)))     # (the 0 % line / the cap of the bar is left out)
+        if y1 - y0 < 8:
+            return None
+        x0 = m["x"] + m["w"] * (inner[0] + (inner[1] - inner[0]) * 0.3)
+        x1 = m["x"] + m["w"] * (inner[0] + (inner[1] - inner[0]) * 0.7)
+        arr = self._grab_rgb({"left": int(x0), "top": y0, "width": max(2, int(x1 - x0)), "height": y1 - y0})
+        try:
+            alpha = min(1.0, max(0.1, float(self.cfg["settings"]["mana_opacity"])))
+        except (TypeError, ValueError):
+            alpha = 0.6
+        boxes = []
+        for bx0, by0, bx1, by1, col in list(self._boxes_now):                 # cast-mark boxes on the bar change its colours
+            try:
+                boxes.append((by0 - y0, by1 - y0, tuple(int(str(col)[i:i + 2], 16) for i in (1, 3, 5))))
+            except ValueError:
+                pass
+        seen = mana_bar_present(arr, boxes)
+        self._mana_seen_now = seen
+        b = mana_fill_boundary(arr, boxes, alpha)
+        if len(arr) - b <= 2:                                                   # (a few filled rows at the very bottom = a tick line)
+            return 0.0
+        return min(100.0, max(0.0, y_to_pct(m, y0 + b)))
+
+    def _mana_ding(self):
+        self.mana_keep_until = time.time() + MANA_KEEP
+
+    def mana_hidden(self, now):
+        """The mana picture / number are off: the game's empty mana bar isn't on screen - except for MANA_KEEP seconds after
+        a mana charge / the mana ding, and the whole time Soul Berserk / Flood Infinite runs."""
+        if not self.mana_absent or self.mana_edit is not None or now < self.demo_until:
+            return False
+        return not (now < self.mana_keep_until or self.tracker.soul_active(now) or self.tracker.flood_active(now))
+
+    def mana_listen(self, now):
+        """Listens for the mana ding (charge / full) while the mana picture is on: it keeps the picture on for MANA_KEEP s."""
+        if not self.cfg["settings"].get("mana_on") or self._mana_listen_off or not self.game_focused():
+            return
+        if self.mana_listener.stream is None and now >= self._mana_listen_next:
+            self._mana_listen_next = now + 30.0
+            if not self.mana_listener.start():
+                if not AudioListener.available():
+                    self._mana_listen_off = True                       # (no sound library: the G key below still keeps it on)
+
+    def _pct_once(self, now):
+        S = self.cfg["settings"]
+        try:
+            self.mana_listen(now)
+        except Exception:
+            pass
+        if not (S.get("mana_pct_on") or S.get("mana_on")):
+            self.mana_pct = None
+            self.mana_absent = False
+            return
+        if not self.game_focused() and now >= self.demo_until:
+            self._mana_gone = 0
+            self.mana_absent = False
+            return
+        self._mana_seen_now = True
+        v = self.read_mana_pct()
+        if self._mana_seen_now:                       # (the game's bar is on screen: both pictures show at once)
+            self._mana_gone, self.mana_absent = 0, False
+        else:                                         # (not there: the menus / loading; three looks in a row hide the pictures)
+            self._mana_gone += 1
+            if self._mana_gone >= 3:
+                self.mana_absent = True
+        hide_ = self.mana_hidden(now)
+        self.mana_pct = None if (v is None or not S.get("mana_pct_on") or hide_) else (now, v)
+
+    def _pct_loop(self):
+        while True:
+            try:
+                self._pct_once(time.time())
+            except Exception:
+                pass
+            time.sleep(0.04)
+
+    def _pct_tick(self, now):
+        S = self.cfg["settings"]
+        ov = self.pct_ov
+        hidden_by_focus = (S.get("mana_only_focused", True) and self.mana_edit is None and now >= self.demo_until
+                           and not self.game_focused())
+        v = self.mana_pct
+        if (not S.get("mana_pct_on") or hidden_by_focus or self.selecting or v is None or now - v[0] > 1.0
+                or (self.mana_edit is not None and self.is_pct_item(self._edit_item))):
+            ov.hide()
+            return
+        ov.show(self.pct_rect(), str(int(round(v[1]))), self.family)
+        if now - self._pct_top > 1.0:
+            self._pct_top = now
+            ov.raise_top()
+
+    def pct_fill_entries(self):
+        self._mana_busy = True
+        try:
+            if self.pct_vars:
+                for k, v in zip(("x", "y", "w", "h"), self.pct_rect()):
+                    self.pct_vars[k].set(str(round(v)))
+        finally:
+            self._mana_busy = False
+
+    def pct_geo(self, key, text):
+        if self._mana_busy:
+            return
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            return
+        if key in ("w", "h") and v < 8:
+            return
+        P = self.cfg["pctpos"]
+        if P.get("follow"):
+            P.update(zip(("x", "y", "w", "h"), self.pct_rect()))
+        P[key] = v
+        P["follow"] = False
+        save_cfg(self.cfg)
+        if self.mana_edit is not None and self._edit_item is P:
+            self._edit_render()
+
+    def pct_reset(self):
+        self.cfg["pctpos"]["follow"] = True
+        save_cfg(self.cfg)
+        self.pct_fill_entries()
+        if self.mana_edit is not None and self.is_pct_item(self._edit_item):
+            self.cfg["pctpos"].update(zip(("x", "y", "w", "h"), self.pct_rect()))
+            self._edit_render()
+        self.say("The mana % is back above the mana bar.", "Reset")
+
+    def mana_has_charge(self):
+        """True when the in-game mana bar is filled at least `mana_dash_min` % (reads a thin strip of the screen)."""
+        try:
+            pct = min(50.0, max(0.5, float(self.cfg["settings"].get("mana_dash_min", 3.0))))
+        except (TypeError, ValueError):
+            pct = 3.0
+        return not self.mana_strip_at(pct, -1, 3)
+
+    def _probe_once(self, now):
+        if self.mana_dash_on() and self.game_focused():
+            self._probe.append((now, self.mana_has_charge()))
+
+    def _probe_loop(self):
+        """Looks at the mana bar ~30 times a second while the mana dashes are on, so a dash is judged by the mana you had
+        just BEFORE the key press (the dash itself may use the mana up)."""
+        while True:
+            try:
+                self._probe_once(time.time())
+            except Exception:
+                pass
+            time.sleep(0.03)
+
+    def mana_charged_at(self, t):
+        best = None
+        for ts, v in list(self._probe):
+            if ts <= t:
+                best = (ts, v)
+        if best is not None and t - best[0] <= 0.25:
+            return best[1]
+        try:
+            return self.mana_has_charge()
+        except Exception:
+            return False
+
+    def dash_image(self, item):
+        """(cache key, RGBA picture) of one coin indicator in its current state."""
+        k = item["id"]
+        now = time.time()
+        with self.dash_lock:
+            r = self.dashcd.progress(now)
+        r["rune"] = self.tracker.soul_progress(now)                     # (Soul Berserk: drains while the buff runs, fills during the cooldown)
+        aw = self.dodge_state(now) or {"pb": 1.0, "dodges": [1.0] * AWK_COINS}
+        r["awk_pb"] = aw["pb"]                                          # (Awakened: the PB drains over the duration, fills over the cooldown)
+        q = lambda v: round(v * 30) / 30.0                              # (a new picture only every 1/30 of the cooldown)
+        fis = bool(aw.get("fisch"))
+        if k in ("awk_dash", "fisch_dash"):
+            st = tuple(q(v) for v in aw["dodges"])
+        else:
+            st = tuple(q(v) for v in r["mana"]) if k == "mana" else q(r[k])
+        w, h = max(2, int(round(item["w"]))), max(2, int(round(item["h"])))
+        art = "fisch_pb" if (k == "awk_pb" and fis) else k                 # (Fischeran's PB has a cyan border)
+        txt = ""
+        if k == "awk_pb" and self.cfg["settings"].get("buff_numbers") and aw.get("secs") is not None:
+            txt = str(int(math.ceil(aw["secs"])))                          # (the seconds left on top of the shield)
+        key = (art, w, h, st, txt)
+        img = self._dash_cache.get(key)
+        if img is None:
+            if len(self._dash_cache) > 200:
+                self._dash_cache.clear()
+            img = self._dash_cache[key] = dash_art(art, w, h, st if k not in ("mana", "awk_dash", "fisch_dash") else list(st))
+            if txt:
+                img = self._dash_cache[key] = draw_center_text(img.copy(), txt)
+        return f"{art}{st}{txt}", img
+
+    def live_slots(self, now):
+        """{key: screen x of its slot centre} when the hotbar isn't the full 12 slots (the game re-centres what is left) or the
+        player is disarmed - the real places of the slots; None when the saved full bar is where they are."""
+        cx = self.slot_cx
+        if cx and now >= self.demo_until and self.mana_edit is None and (self.tracker.disarmed or len(cx) < len(HOTBAR_KEYS)):
+            return dict(cx)
+        return None
+
+    def hot_edges(self, now):
+        """(left edge of the first slot, left edge of the slot after the last one) of the hotbar as it is on the screen now."""
+        bar = self.cfg["bar"]
+        pitch, w = float(bar["pitch"]), float(bar["w"])
+        live = self.live_slots(now)
+        if not live:
+            return bar["x"], bar["x"] + len(HOTBAR_KEYS) * pitch
+        xs = list(live.values())
+        return min(xs) - w / 2.0, max(xs) - w / 2.0 + pitch
+
+    def buff_items(self, now):
+        """The potion effect icons as picture items: the newest sits next to the 1st slot, older ones are pushed to the left."""
+        bar = self.cfg["bar"]
+        pitch = float(bar["pitch"])
+        sz = pitch * 0.74
+        right = self.hot_edges(now)[0] - pitch * 0.19
+        out = []
+        times = self.tracker.buff_times(now) if self.cfg["settings"].get("buff_numbers") else {}
+        for i, (kind, frac) in enumerate(self.tracker.buff_snapshot(now)):
+            out.append({"id": f"buff:{i}", "kind": kind, "frac": frac, "text": str(int(math.ceil(times[kind]))) if kind in times else "", "x": right - sz - i * (sz + pitch * 0.11),
+                        "y": bar["y"] + (bar["h"] - sz) / 2.0, "w": sz, "h": sz, "opacity": 1.0})
+        return out
+
+    def bm_items(self, now):
+        """The buff moves' icons as picture items, right of the last hotbar slot (the '=' one): the newest sits next to it and
+        the older ones are pushed to the right. Each picture has room for the number above the icon."""
+        bar = self.cfg["bar"]
+        pitch = float(bar["pitch"])
+        sz = pitch * 0.875                                               # as big as the hotbar slots (1 - 0, - =)
+        nh = bmove_num_h(sz)
+        numbers = bool(self.cfg["settings"].get("buff_numbers"))
+        out = []
+        for i, (kind, frac, left) in enumerate(self.tracker.bm_icons(now)):
+            out.append({"id": f"bm:{i}", "kind": kind, "frac": frac, "text": str(int(math.ceil(left))) if (numbers and left is not None) else "",
+                        "x": self.hot_edges(now)[1] + i * pitch, "y": bar["y"] + (bar["h"] - sz) / 2.0 - nh, "w": sz, "h": sz + nh, "opacity": 1.0, "bm": True})
+        return out
+
+    def buff_image(self, item):
+        if item.get("bm"):
+            n = int(round(item["frac"] * 100))
+            return f"bm{item['kind']}{n}{item.get('text') or ''}", bmove_art(item["kind"], item["frac"], item["w"], item.get("text") or "")
+        w = max(4, int(round(item["w"])))
+        n = int(round(item["frac"] * w))                  # (a new picture only every row of pixels)
+        txt = item.get("text") or ""
+        return f"{item['kind']}{n}{txt}", buff_art(item["kind"], n / float(w), w, txt)
+
+    # ---------- the inventory ----------
+    def inv_key(self, t):
+        """The ` key went down (input thread): flips the key's idea of the inventory; the screen has the last word."""
+        if self.game_focused():
+            self.inv_key_open, self.inv_key_t = not self.inv_key_open, t
+
+    def menu_hidden(self, now):
+        """No HP bar and no inventory open = the game's menu / loading screen: cooldown boxes, buff icons and the rune coin hide."""
+        S = self.cfg["settings"]
+        return bool(S.get("inv_hide", True) and self.mana_edit is None and now >= self.demo_until
+                    and self.hp_absent and not self.inv_is_open(now))
+
+    def inv_is_open(self, now=None):
+        """Open = the ` key says so (no screen look: a bright sky could fool it)."""
+        now = time.time() if now is None else now
+        if self.inv_key_open and now - self.inv_key_t > 600:             # (a lost key press never keeps the coins hidden for long)
+            self.inv_key_open = False
+        return self.inv_key_open
+
+    def inv_panel_rect(self):
+        """Where the inventory panel sits on the screen (scales with the screen size)."""
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+        f = INV_FRAC
+        return (mon["left"] + int(mon["width"] * f[0]), mon["top"] + int(mon["height"] * f[1]),
+                mon["left"] + int(mon["width"] * f[2]), mon["top"] + int(mon["height"] * f[3]))
+
+    def _inv_loop(self):
+        """Twice a second while the game is in front: see inv_step."""
+        while not getattr(self, "_closing", False):
+            time.sleep(0.4)
+            try:
+                self.inv_step()
+            except Exception as ex:
+                if time.time() - self.inv_err_t > 30:
+                    self.inv_err_t = time.time()
+                    self.q.put(("msg", f"Inventory scan error: {type(ex).__name__}: {ex}"))
+
+    def inv_step(self):
+        """While the inventory is open (the ` key): find the known items (Fire Protection, Feather Feet) on its cards."""
+        S = self.cfg["settings"]
+        if not (self.game_focused() and S.get("inv_equip", True) and self.inv_is_open()):
+            self.inv_boxes = []
+            self.inv_mem.clear()
+            return
+        if self.inv_learn_pending:
+            self.inv_learn_step()
+        self.inv_boxes = self.inv_remember(self.inv_cards(self.inv_panel_rect(), want_cells=True), time.time())
+        self.inv_boxes_t = time.time()
+
+    def _hp_loop(self):
+        """About 7 times a second while the game is in front: look at the HP bar (see hp_failsafe)."""
+        while not getattr(self, "_closing", False):
+            time.sleep(0.07)
+            try:
+                self.hp_failsafe()
+            except Exception:
+                pass
+
+    def hp_failsafe(self):
+        """One look at the HP bar in the middle of the screen. The game hides it while the inventory is open (and it is not
+        there in the menus), so: seen twice in a row -> the inventory is closed (even if the ` key said otherwise) and the
+        coins show again at once; missing three looks in a row -> hp_absent, the coins hide."""
+        now = time.time()
+        if not self.game_focused():
+            self._hp_seen = self._hp_gone = 0
+            self.hp_absent = False
+            return
+        try:
+            mon = getattr(self, "_hp_mon", None)
+            if mon is None:
+                with mss.mss() as sct0:
+                    mon = self._hp_mon = dict(sct0.monitors[1])
+            f = HP_BAR_FRAC
+            arr = self._grab_rgb({"left": mon["left"] + int(mon["width"] * f[0]), "top": mon["top"] + int(mon["height"] * f[1]),
+                                  "width": max(1, int(mon["width"] * (f[2] - f[0]))), "height": max(1, int(mon["height"] * (f[3] - f[1])))})
+            seen = hp_bar_visible(arr)
+        except Exception:
+            return
+        try:                                                         # the Songs' Error Meter (only when the profile has Songs)
+            if self.tracker.song_keys() or self.tracker.song_active():
+                e = ERROR_METER_AREA
+                arr_e = self._grab_rgb({"left": mon["left"] + int(mon["width"] * e[0]), "top": mon["top"] + int(mon["height"] * e[1]),
+                                        "width": max(1, int(mon["width"] * (e[2] - e[0]))), "height": max(1, int(mon["height"] * (e[3] - e[1])))})
+                msg_e = self.tracker.song_meter(error_meter_read(arr_e, mon["height"]), now)
+                if msg_e:
+                    self.q.put(("msg", msg_e))
+        except Exception:
+            pass
+        try:                                                         # how full the bar is (Bloodline needs it nearly empty)
+            g = HP_FILL_AREA
+            frac = hp_fill_fraction(self._grab_rgb({"left": mon["left"] + int(mon["width"] * g[0]), "top": mon["top"] + int(mon["height"] * g[1]),
+                                                    "width": max(1, int(mon["width"] * (g[2] - g[0]))), "height": max(1, int(mon["height"] * (g[3] - g[1])))}))
+            self.tracker.hp_frac = (frac, now)
+            if seen and self.tracker.bloodline_passive(frac, now):
+                self.q.put(("msg", f"Bloodline: below {BLOODLINE_PASSIVE_HP * 100:g}% HP - {BM_TITLE['bloodline']} for {BLOODLINE_PASSIVE_SECS:g}s (passive)."))
+        except Exception:
+            pass
+        if seen:
+            self._hp_seen, self._hp_gone = self._hp_seen + 1, 0
+            self.hp_absent = False                                   # (the bar is there: the coins show at once)
+            if self._hp_seen >= 2 and self.inv_key_open and now - self.inv_key_t > 0.3:
+                self.inv_key_open = False
+        else:
+            self._hp_seen, self._hp_gone = 0, self._hp_gone + 1
+            if self._hp_gone >= 4:
+                self.hp_absent = True
+
+    def inv_learn_step(self, now=None):
+        """A pending Learn: once the game's cursor has left the card (and the lift is over), take the card's picture."""
+        p = self.inv_learn_pending
+        if not p:
+            return
+        now = time.time() if now is None else now
+        if now - p["t"] > 25:
+            self.inv_learn_pending = None
+            self.q.put(("msg", f"Learn {self._ll(p['name'])}: timed out - press Learn and click the card again."))
+            return
+        x0, y0, x1, y1 = p["rect"]
+        try:
+            cx, cy = cursor_pos()
+        except Exception:
+            cx = cy = -9999
+        if x0 - 50 <= cx <= x1 + 30 and y0 - 60 <= cy <= y1 + 30:
+            return                                                   # the cursor is still on / near the card
+        if now - p["t"] < 0.25:
+            return                                                   # (a moment for the game to settle)
+        xm, ym = int((x0 + x1) / 2), int((y0 + y1) / 2)
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+        left, top = max(mon["left"], xm - 90), max(mon["top"], ym - 90)
+        arr = self._grab_rgb({"left": left, "top": top, "width": 180, "height": 180})
+        box = inv_card_find(arr, xm - left, ym - top)
+        sig = inv_card_sig(arr[box[1]:box[3], box[0]:box[2]]) if box else None
+        if sig is None or sig.sum() < 2.0:
+            return                                                   # (try again on the next look)
+        if str(p["name"]).startswith(BREW_PREFIX):
+            try:                                                     # (a little picture of the card for the Potion Brewer page)
+                self.cfg["settings"].setdefault("brew_thumbs", {})[p["name"]] = thumb_pack(arr[box[1]:box[3], box[0]:box[2]])
+            except Exception:
+                pass
+        old = self.cfg["settings"].get("inv_items") or {}
+        self.cfg["settings"]["inv_items"] = dict({k: v for k, v in old.items() if _norm_name(k) != _norm_name(p["name"])},
+                                                 **{p["name"]: inv_sig_pack(sig)})
+        self.inv_learn_pending = None
+        save_cfg(self.cfg)
+        self.q.put(("msg", f"Learned {self._ll(p['name'])}."))
+        self.q.put(("inv_status", None))
+
+    def inv_remember(self, res, now):
+        """The game draws its own cursor into the screen grab: the card under it can't be read (its text is covered), so a
+        card that WAS recognised stays recognised while the cursor sits on it. res = (items, n, cells) of inv_cards.
+        Returns [(name, rect)]."""
+        items, _n, cells = res
+        mem = self.inv_mem
+        found = {}
+        pos = self.__dict__.setdefault("inv_pos", {})            # where each item's card was last seen (kept while the inventory is closed)
+        cooling0 = set(self.tracker.inv_snapshot(now))
+        # an item under its own cooldown box can't be read, so a card that only LOOKS like it (Celeritas next to Galvanize) would
+        # take its name: while the item cools down, only the card where it really is counts
+        keep = []
+        for nm, r, bright in items:
+            cp = pos.get(_norm_name(nm))
+            if _norm_name(nm) in cooling0 and cp and (abs((r[0] + r[2]) / 2 - cp[0]) > 14 or abs((r[1] + r[3]) / 2 - cp[1]) > 14):
+                continue
+            keep.append((nm, r, bright))
+            if _norm_name(nm) not in cooling0:
+                pos[_norm_name(nm)] = ((r[0] + r[2]) / 2, (r[1] + r[3]) / 2)
+        items = keep
+        got = {_norm_name(nm) for nm, _r, _b in items}
+        for nk in cooling0:                                       # the real card is covered: it is still where it was
+            cp = pos.get(nk)
+            if nk in got or not cp:
+                continue
+            q = next((q for q, _n in cells if abs((q[0] + q[2]) / 2 - cp[0]) < 14 and abs((q[1] + q[3]) / 2 - cp[1]) < 14), None)
+            nm0 = next((k for k in self.inv_templates() if _norm_name(k) == nk), None)
+            if q and nm0:
+                items = items + [(nm0, q, False)]
+        for nm, r, _b in items:
+            ck = (round((r[0] + r[2]) / 2 / 24), round((r[1] + r[3]) / 2 / 24))
+            mem[ck] = (nm, r, now)
+            found[ck] = (nm, r)
+        try:
+            cx, cy = cursor_pos()
+        except Exception:
+            cx = cy = None
+
+        cooling = set(self.tracker.inv_snapshot(now))             # (a card under its own cooldown box can't be read either)
+
+        def covered(r, nm=None):                                 # the cursor graphic hangs right / down from its hot spot
+            return (nm is not None and _norm_name(nm) in cooling) or (
+                cx is not None and r[0] - 34 <= cx <= r[2] + 18 and r[1] - 44 <= cy <= r[3] + 10)
+        for ck, (nm, r, t) in list(mem.items()):
+            if now - t > 90:
+                del mem[ck]
+            elif ck not in found and covered(r, nm):                 # not recognised this time, and the cursor is on it: still the same card
+                cur = next((q for q, _n in cells if abs((q[0] + q[2]) / 2 - (r[0] + r[2]) / 2) < 14
+                            and abs((q[1] + q[3]) / 2 - (r[1] + r[3]) / 2) < 14), r)
+                found[ck] = (nm, cur)
+        known = set(self.inv_templates())
+        return [(nm, r) for nm, r in found.values() if nm in known]
+
+    def inv_cards(self, rc, want_cells=False):
+        """(items, n) of the cards inside the screen rectangle rc - see inv_scan_cards (want_cells: (items, n, cells))."""
+        l, t, r, b = rc
+        arr = self._grab_rgb({"left": int(l), "top": int(t), "width": int(r - l) + 1, "height": int(b - t) + 1})
+        cells = []
+        items, n = inv_scan_cards(arr, int(l), int(t), self.inv_templates(), cells)
+        return (items, n, cells) if want_cells else (items, n)
+
+    def inv_find_items(self):
+        """[(name, rect)] of the known items on the open inventory's cards."""
+        return [(nm, r) for nm, r, _b in self.inv_cards(self.inv_panel_rect())[0]]
+
+    def inv_have(self, name):
+        """True when the macro knows what the card of this inventory move looks like (built in, or learned)."""
+        n = _norm_name(name)
+        return any(_norm_name(k) == n for k in list(INV_BUILTIN) + list((self.cfg["settings"].get("inv_items") or {})))
+
+    def inv_templates(self):
+        """{inventory move name: signature} for the ACTIVE profile's inventory (the learned pictures are the user's own, shared by all profiles)."""
+        raw = self.cfg["settings"].get("inv_items") or {}
+        names = tuple(e["name"] for e in inv_of(self.cfg)) + tuple(BREW_PREFIX + q["id"] for q in self.brew_recipe()["seq"])
+        key = (names, tuple(sorted((k, hash(v)) for k, v in raw.items())))      # (hash: learning a card AGAIN must refresh the picture too)
+        if self._inv_sigs is None or self._inv_sigs[0] != key:
+            built = {_norm_name(k): v for k, v in INV_BUILTIN.items()}
+            learned = {_norm_name(k): v for k, v in raw.items()}
+            sigs = {}
+            for nm in names:
+                n = _norm_name(nm)
+                if n in learned:
+                    sigs[nm] = inv_sig_unpack(learned[n])
+                    if n in built:
+                        sigs[nm + "\0built"] = inv_sig_unpack(built[n])           # (a built-in picture still helps when the learned one is a bad one)
+                elif n in built:
+                    sigs[nm] = inv_sig_unpack(built[n])
+            self._inv_sigs = (key, sigs)
+        return self._inv_sigs[1]
+
+    def inv_click(self, button, t, pt):
+        """A mouse click while the inventory is open (input thread). True = the click was on the inventory (a card or its panel),
+        so it is not a move click. A left click on a card the macro knows equips that item; while learning, it learns the card."""
+        S = self.cfg["settings"]
+        learn = self.inv_learn
+        if not learn and not (self.inv_is_open(t) and (S.get("inv_hide", True) or S.get("inv_equip", True))):
+            return False
+        x, y = pt if pt else cursor_pos()
+        try:
+            rc = self.inv_panel_rect()                                  # (measured, else where it normally sits)
+        except Exception:
+            rc = None
+        inside = bool(rc and rc[0] <= x <= rc[2] and rc[1] <= y <= rc[3])
+        if not inside:
+            return False                                                # not on the inventory (a hotbar slot looks like a card too!)
+        if not learn and button == "left" and S.get("inv_equip", True) and t - self.inv_boxes_t < 3.0:
+            for nm, (bx0, by0, bx1, by1) in list(self.inv_boxes):            # a click inside a recognised item's box = equipping it
+                if nm.startswith(BREW_PREFIX):
+                    continue                                                  # (a Potion Brewer card is only for the brewer)
+                if bx0 - 3 <= x <= bx1 + 3 and by0 - 3 <= y <= by1 + 3:
+                    self.inv_boxes = [b for b in self.inv_boxes if b[0] != nm]      # (the item left the grid - the others shift into its place)
+                    self.q.put(("msg", self.tracker.equip_item(nm, t)))
+                    return True
+        if learn and button == "left":                                  # a LEFT click lifts the card (it looks different then): learning only takes a right click
+            self.q.put(("msg", f"Learn {self._ll(learn)}: RIGHT-click the card (a left click lifts it and changes how it looks)."))
+            return True
+        sig, failed = None, False
+        try:
+            with mss.mss() as sct:
+                mon = sct.monitors[1]
+            half = 90
+            left, top = max(mon["left"], int(x) - half), max(mon["top"], int(y) - half)
+            time.sleep(0.05)                                            # (the game lifts the clicked card: let it)
+            arr = self._grab_rgb({"left": left, "top": top, "width": 2 * half, "height": 2 * half})
+            box = inv_lifted_card(arr, int(x) - left, int(y) - top) or inv_card_find(arr, int(x) - left, int(y) - top)
+            if box:
+                sig = inv_card_sig(arr[box[1]:box[3], box[0]:box[2]])
+        except Exception:
+            sig, failed = None, True                                    # (the screen couldn't be read: better not to count it)
+        if sig is None:                                                 # no card under the click = the empty part of the inventory: that is a normal click
+            if learn:
+                self.q.put(("msg", f"Learn {self._ll(learn)}: that click wasn't on an item card - open the inventory (`) and RIGHT-click the card."))
+            return bool(learn) or failed
+        if button != "left" and not learn:
+            return True
+        if learn:
+            if sig.sum() < 2.0:
+                self.q.put(("msg", f"Learn {self._ll(learn)}: that card has no name text - right-click the {self._ll(learn)} card."))
+                return True
+            self.inv_learn_pending = {"name": learn, "rect": (left + box[0], top + box[1], left + box[2], top + box[3]), "t": t}
+            self.inv_learn = None
+            self.q.put(("msg", f"Learn {self._ll(learn)}: got the card - now move the mouse OFF the card (the game's cursor must not be in the picture)."))
+            self.q.put(("inv_status", None))
+            return True
+        if S.get("inv_equip", True):
+            name = inv_match(sig, self.inv_templates())
+            if name and name.startswith(BREW_PREFIX):
+                return True
+            if name:
+                self.q.put(("msg", self.tracker.equip_item(name, t)))
+            elif time.time() - self.inv_miss_t > 5:                      # (say so once in a while: helps when an item isn't recognised)
+                self.inv_miss_t = time.time()
+                self.q.put(("msg", "Inventory click: that card isn't one the macro knows (Extras > Inventory > Learn teaches it)."))
+        return True
+
+    @staticmethod
+    def _ll(name):
+        return "the ingredient" if str(name).startswith(BREW_PREFIX) else str(name)
+
+    def inv_renamed(self, old, new, entry, btn):
+        """An inventory move got a new name: the Learn / Redo button follows it (it was filed under the old name, so it stopped
+        reacting) and so does the picture the macro learned of its card (unless another move still uses the old name)."""
+        if self.inv_status.get(old) is btn:
+            self.inv_status.pop(old, None)
+        self.inv_status[new] = btn
+        if self.inv_learn is not None and _norm_name(self.inv_learn) == _norm_name(old):
+            self.inv_learn = new
+        items = self.cfg["settings"].get("inv_items")
+        if isinstance(items, dict) and _norm_name(old) != _norm_name(new):
+            used = any(e is not entry and _norm_name(e["name"]) == _norm_name(old) for e in self.inv_list())
+            k_old = next((k for k in items if _norm_name(k) == _norm_name(old)), None)
+            taken = any(_norm_name(k) == _norm_name(new) for k in items)
+            if k_old is not None and not used and not taken and k_old not in INV_BUILTIN:
+                items[new] = items.pop(k_old)
+                self._inv_sigs = None
+
+    def inv_start_learn(self, name):
+        self.inv_learn = None if self.inv_learn == name else name
+        self.inv_refresh_status()
+        if self.inv_learn:
+            nm_ = self._ll(name)
+            self.say(f"Learning {nm_}: open the inventory (`) and RIGHT-click the {nm_} card (then move the mouse off it).")
+
+    def inv_refresh_status(self):
+        for nm, btn in list(self.inv_status.items()) + list(getattr(self, "brew_status", {}).items()):
+            try:
+                btn.lbl.config(text="..." if self.inv_learn == nm else ("Redo" if self.inv_have(nm) else "Learn"))
+            except Exception:
+                pass
+        for nm in list(getattr(self, "brew_keyboxes", {})):
+            self._brew_key_look(nm)
+
+    def inv_cd_boxes(self, now):
+        """([(x, y, w, h)], [(text, fill fraction, kind)]) of the recognised cards whose inventory move is cooling down."""
+        cds = self.tracker.inv_snapshot(now)
+        tenths = self.cfg["settings"].get("tenths_under", 0)
+        rects, items = [], []
+        for nm, r in self.inv_boxes:
+            c = cds.get(_norm_name(nm))
+            if c:
+                rects.append((r[0], r[1], r[2] - r[0], r[3] - r[1]))
+                items.append((box_text(c[0], c[1], tenths), c[0] / c[1] if c[1] > 0 else 1.0, "soul" if c[2] == "soul" else ("snap" if c[2] in ("m2", "drink") else "move")))
+        return rects, items
+
+    def inv_labelled(self, now):
+        """The recognised cards as [(name, rect, cooldown text, colour)]: moves of the inventory that are cooling down show their time."""
+        cds = self.tracker.inv_snapshot(now)
+        tenths = self.cfg["settings"].get("tenths_under", 0)
+        out = []
+        for nm, r in self.inv_boxes:
+            if nm.startswith(BREW_PREFIX):
+                continue
+            c = cds.get(_norm_name(nm))
+            e = self.tracker.inv_entry(nm)
+            out.append((nm, r, box_text(c[0], c[1], tenths) if c else "", (e or {}).get("color", "")))          # (the 4th = this item's own box colour, '' = the default one)
+        return out
+
+    def _dash_tick(self, now):
+        S = self.cfg["settings"]
+        try:
+            self.sync_dash_anchor()
+        except Exception as ex:
+            if now - self.inv_err_t > 30:
+                self.inv_err_t = now
+                self.say(f"The coins couldn't follow the hotbar: {type(ex).__name__}: {ex}")
+        hidden_by_focus = (S.get("mana_only_focused", True) and self.mana_edit is None and now >= self.demo_until
+                           and not self.game_focused())
+        inv_hidden = (S.get("inv_hide", True) and self.mana_edit is None and now >= self.demo_until and (self.inv_is_open(now) or self.hp_absent))
+        items = []
+        if not self.selecting and not hidden_by_focus:
+            for k, on in (("dash", S["dash_on"]), ("pb", S["pb_on"]), ("fist", S["fist_on"]), ("mana", self.mana_dash_on()),
+                          ("jump", self.dj_on()), ("rune", self.soul_on())):
+                if k == "rune" and self.menu_hidden(now):
+                    continue                                    # (the rune coin hides in the menu, but stays with the inventory open)
+                if inv_hidden and k in INV_HIDE_COINS:
+                    continue                                    # (only Dash / PB / Fist M2 / Mana Dash / Double Jump hide - not the rune coin)
+                it = self.cfg["dashpos"][k]
+                if on and it is not self._edit_item:
+                    items.append(dict(it, opacity=1.0))
+            if (self.awk_on() or self.fisch_on()) and not inv_hidden:        # (shown the whole time; they hide with the inventory like the other coins)
+                fis_ = bool((self.dodge_state(now) or {}).get("fisch"))
+                for k in (("awk_pb", "fisch_dash") if fis_ else ("awk_pb", "awk_dash")):
+                    it = self.cfg["dashpos"][k]
+                    if it is not self._edit_item:
+                        items.append(dict(it, opacity=1.0))
+        try:
+            shown_ = self.inv_is_open(now) and not hidden_by_focus
+            self.inv_ov.sync(self.inv_labelled(now) if shown_ else [], S.get("inv_box_color"), S.get("inv_box_width"), S.get("inv_box_opacity"))
+            rects_, items_ = self.inv_cd_boxes(now) if shown_ else ([], [])
+            if items_:
+                self.inv_cd_ov.show(rects_, items_, S["opacity"], self.num_family)
+            else:
+                self.inv_cd_ov.hide()
+        except Exception as ex:
+            if now - self.inv_err_t > 30:
+                self.inv_err_t = now
+                self.say(f"Item boxes couldn't be drawn: {type(ex).__name__}: {ex}")
+        self.dash_ov.sync(items, self.dash_image)
+        try:
+            self.buff_ov.sync((self.buff_items(now) + self.bm_items(now)) if (not self.selecting and not hidden_by_focus and not self.menu_hidden(now)) else [], self.buff_image)
+        except Exception as ex:
+            if now - self.inv_err_t > 30:
+                self.inv_err_t = now
+                self.say(f"Potion effect icons couldn't be drawn: {type(ex).__name__}: {ex}")
+        if self.dash_ov.shown and now - self._dash_top > 1.0:
+            self._dash_top = now
+            self.dash_ov.raise_top()
+            if self.buff_ov.shown:
+                self.buff_ov.raise_top()
+
+    # ---------- Snap Trainer page ----------
+    # ---------- Extras > Automation > Potion Brewer / Weapon Smithing ----------
+    BREW_NOTE = ("How to set this up\n1. Press \"Add Sequence\" as many as you need\n2. Select what key, if left blank it won't Press.\n"
+                 "    Alternatively you can open your inventory and let the Assist Tool know which Card to click on.\n"
+                 "    Right Clicking the Redo/Learn box removes inventory learned stuff\n"
+                 "3. Put a number between 1-10 in Clicks, it tells the Assist Tool how many times to click before starting the next sequence\n"
+                 "4. Select where you want to put the item in (Cauldron or Anvil)\n5. Select where the Wooden Spoon/Hammer is")
+
+    def brew_recipe(self):
+        b = self.cfg.setdefault("brew", clean_brew(None))
+        if b.get("active") not in b["recipes"]:
+            b["active"] = next(iter(b["recipes"]))
+        return b["recipes"][b["active"]]
+
+    def build_brew(self, f):
+        host = self.scroll_page(f, "brew", PAGE_W - 12)
+        self.back_button(host, "auto")
+        box, p = self.panel(host, "Alchemy/Smith")
+        box.pack(fill="x", padx=6, pady=6)
+        self.brewer = None
+        self.brew_pick = None
+        self.brew_menu = None
+        self.brew_host = host
+        irow = tk.Frame(p, bg=PARCH)
+        irow.pack(fill="x", padx=8, pady=(0, 2))
+        self.brew_icon = tk.Label(irow, image=self.img_train_off, bg=PARCH, bd=0)
+        self.brew_icon.pack(side="left")
+        self.brew_state = self.label(irow, "OFF")
+        self.brew_state.pack(side="left", padx=6)
+        self._brew_icon_on = False
+        self.label(irow, "Active Profile:", font=self.fs).pack(side="left", padx=(12, 4))
+        self.brew_prof_btn = PixBtn(irow, "", self.toggle_brew_menu, self.f, 140, 24, bd=2)
+        self.brew_prof_btn.pack(side="right")
+        krow = tk.Frame(p, bg=PARCH)
+        krow.pack(fill="x", padx=8, pady=2)
+        self.label(krow, "Start / stop key", font=self.fs).pack(side="left")
+        self.btn_brew = PixBtn(krow, self.key_name("brew"), lambda: self.start_capture("brew"), self.f, 110, 24)
+        self.btn_brew.pack(side="right")
+        self.key_btns["brew"] = self.btn_brew
+        self.label(p, "Discord webhook (optional)", font=self.fs).pack(anchor="w", padx=8, pady=(4, 0))
+        wrow = tk.Frame(p, bg=PARCH)
+        wrow.pack(fill="x", padx=8, pady=2)
+        self.make_entry(wrow, "brew_webhook", str, 196, 24).pack(side="left")
+        PixBtn(wrow, "Test", lambda: self.brew_hook("test", test=True), self.f, 52, 24, bd=2).pack(side="left", padx=(6, 0))
+        self.brew_hook_lbl = self.label(p, "", font=self.fs)
+        self.brew_hook_lbl.pack(anchor="w", padx=8)
+        self.label(p, "Set up: in Discord right-click your channel > Edit Channel > Integrations > Webhooks > New Webhook > "
+                      "Copy Webhook URL, then paste it here. It posts when the ingredients run out (an inventory card that is "
+                      "learned) and when every round is made.", font=self.fs, fg=DIM, justify="left",
+                   wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(0, 4))
+        self.label(p, self.BREW_NOTE, font=self.fs, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(4, 4))
+        self.brew_body = tk.Frame(p, bg=PARCH)
+        self.brew_body.pack(fill="x")
+        self.brew_status, self.brew_seen, self.brew_keyboxes = {}, {}, {}
+        self.rebuild_brew()
+
+    def rebuild_brew(self):
+        if getattr(self, "brew_body", None) is not None:
+            self._keep_scroll("brew", self._rebuild_brew)
+
+    def _rebuild_brew(self):
+        self.close_brew_menu()
+        for w in self.brew_body.winfo_children():
+            w.destroy()
+        self.brew_status, self.brew_seen, self.brew_keyboxes = {}, {}, {}
+        b, r = self.cfg["brew"], self.brew_recipe()
+        self.brew_prof_btn.lbl.config(text=b["active"] + " v")
+        S = self.cfg["settings"]
+        p = self.brew_body
+        hdr = tk.Frame(p, bg=PARCH)
+        hdr.pack(fill="x", padx=8, pady=(2, 0))
+        for w, t in ((self.BREW_INV_W, "Inventory"), (self.BREW_KEY_W, "Key"), (self.BREW_CLK_W, "Clicks")):
+            c = tk.Frame(hdr, bg=PARCH, width=w, height=16)
+            c.pack(side="left", padx=(0 if t == "Inventory" else 4, 0))
+            c.pack_propagate(False)
+            self.label(c, t, font=self.fs, anchor="center" if t != "Inventory" else "w").pack(fill="both")
+        for q in r["seq"]:
+            self._brew_row(p, r, q)
+
+        def count_set(v):
+            try:
+                n = int(float(v.strip().replace(",", ".")))
+            except ValueError:
+                return
+            if 1 <= n <= 99999:
+                r["count"] = n
+                save_cfg(self.cfg)
+        crow = tk.Frame(p, bg=PARCH)
+        crow.pack(fill="x", padx=8, pady=(10, 2))
+        self.label(crow, "How many time it Brew/Craft", font=self.fs).pack(side="left")
+        cb, _ = self.bound_entry(crow, str(r["count"]), count_set, 96, 24)
+        cb.pack(side="right")
+        nrow = tk.Frame(p, bg=PARCH)
+        nrow.pack(fill="x", padx=8, pady=(4, 2))
+        self.brew_name_box, self.brew_name_var = self.bound_entry(nrow, "", lambda t: None, 74, 24, "left")
+        self.brew_name_box.pack(side="left")
+        PixBtn(nrow, "New", self.brew_new, self.f, 42, 24, bd=2).pack(side="left", padx=(4, 0))
+        PixBtn(nrow, "Rename", self.brew_rename, self.f, 58, 24, bd=2).pack(side="left", padx=(4, 0))
+        self.brew_del_btn = PixBtn(nrow, "Delete", self.brew_delete, self.f, 52, 24, bd=2)
+        self.brew_del_btn.pack(side="left", padx=(4, 0))
+        self._brew_del_until = 0.0
+        for which, text in (("pot", "Cauldron Water/Anvil Location"), ("spoon", "Wooden Spoon/Hammer Location")):
+            lrow = tk.Frame(p, bg=PARCH)
+            lrow.pack(fill="x", padx=8, pady=(6 if which == "pot" else 2, 0))
+            btn = PixBtn(lrow, text, lambda w=which: self.brew_pick_start(w), self.f, 196, 26, bd=2)
+            btn.pack(side="left")
+            pt = r.get(which)
+            lbl = self.label(lrow, "..." if self.brew_pick == which else (f"({pt[0]}, {pt[1]})" if pt else "NOT SET"), font=self.fs)
+            lbl.pack(side="left", padx=(8, 0))
+            if self.brew_pick == which:
+                btn.lbl.config(text="Click it in the game...")
+        PixBtn(p, "Add Sequence", self.brew_add_seq, self.f, 120, 26, bd=2).pack(anchor="w", padx=8, pady=(8, 2))
+        self.label(p, "Timing (the defaults are fine for most recipes):", font=self.fs, fg=DIM).pack(fill="x", padx=8, pady=(6, 0))
+        self.entry_row(p, "Wait between clicks (ms)", "brew_click_ms", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Wait after choosing an item (ms)", "brew_pick_ms", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Wait before the Spoon/Hammer (s)", "brew_wait_s", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Wait after the Spoon/Hammer (s)", "brew_after_s", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Wait after the cursor arrives (ms)", "brew_arrive_ms", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Hold each click for (ms)", "brew_hold_ms", float, w=64, h=22, wrap=190)
+        self.check_row(p, "Tiny mouse nudge after moving", "brew_nudge", wrap=230)
+        self.label(p, "Start / stop it with the key above while the game is in front. It only ever clicks inside the game window "
+                      "(it stops by itself if you switch away). An inventory card needs the inventory open (`).",
+                   font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(4, 2))
+        self.inv_refresh_status()
+
+    BREW_INV_W, BREW_KEY_W, BREW_CLK_W = 122, 36, 52
+
+    def _brew_row(self, parent, r, q):
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=2)
+        name = BREW_PREFIX + q["id"]
+        lb = PixBtn(row, "Learn", lambda n=name: self.inv_start_learn(n), self.f, 54, 24, bd=2)
+        lb.pack(side="left")
+        lb.lbl.bind("<Button-3>", lambda e, n=name: self.brew_forget(n))        # right-click: forget the learned card
+        self.brew_status[name] = lb
+        th = tk.Label(row, bg=PARCH, bd=0, width=3)                       # the card it learned (only shown on this page)
+        th.pack(side="left", padx=(2, 0))
+        self.brew_set_thumb(th, name)
+        sh = tk.Frame(row, bg=PARCH, width=36, height=24)
+        sh.pack(side="left", padx=(2, 0))
+        sh.pack_propagate(False)
+        seen = self.label(sh, "", font=self.fs)
+        seen.pack(fill="both")
+        self.brew_seen[name] = seen
+
+        def key_set(v, q=q):
+            v = v.strip()
+            ok = v[-1:] if v[-1:] in HOTBAR_KEYS else ""
+            if ok != v:
+                var_k.set(ok)
+                return
+            q["key"] = ok
+            save_cfg(self.cfg)
+        kb, var_k = self.bound_entry(row, q.get("key", ""), key_set, self.BREW_KEY_W, 24)
+        kb.pack(side="left", padx=(4, 0))
+        self.brew_keyboxes[name] = kb
+        self._brew_key_look(name)
+
+        def clk_set(v, q=q):
+            try:
+                n = int(float(v.strip().replace(",", ".")))
+            except ValueError:
+                return
+            if 1 <= n <= 10:
+                q["clicks"] = n
+                save_cfg(self.cfg)
+        cb, _ = self.bound_entry(row, str(q.get("clicks", 1)), clk_set, self.BREW_CLK_W, 24)
+        cb.pack(side="left", padx=(4, 0))
+        PixBtn(row, "x", lambda qq=q: self.brew_del_seq(qq), self.f, 24, 24, bd=2).pack(side="left", padx=(4, 0))
+
+    def _brew_key_look(self, name):
+        """A learned (or being learned) card is clicked instead of a key: the Key box goes white and can't be typed in."""
+        kb = (getattr(self, "brew_keyboxes", None) or {}).get(name)
+        if kb is None:
+            return
+        try:
+            if self.inv_have(name) or self.inv_learn == name:
+                kb.entry.config(state="disabled", disabledbackground="#FFFFFF", disabledforeground="#FFFFFF")
+            else:
+                kb.entry.config(state="normal")
+        except Exception:
+            pass
+
+    def brew_forget(self, name):
+        """Right-click on Learn / Redo: forget the learned card (the sequence goes back to its key)."""
+        if self.inv_learn == name:
+            self.inv_learn = None
+        self._forget_card(name)
+        save_cfg(self.cfg)
+        self.rebuild_brew()
+
+    def brew_set_thumb(self, lbl, name):
+        txt = (self.cfg["settings"].get("brew_thumbs") or {}).get(name)
+        if not txt or not self.inv_have(name):
+            return
+        try:
+            im = _img(txt)
+            sc = 26.0 / max(im.size)
+            im = im.resize((max(1, int(im.size[0] * sc)), max(1, int(im.size[1] * sc))), Image.LANCZOS)
+            lbl.photo = ImageTk.PhotoImage(im)
+            lbl.config(image=lbl.photo, width=28)
+        except Exception:
+            pass
+
+    def brew_add_seq(self):
+        r = self.brew_recipe()
+        if len(r["seq"]) >= 40:
+            return
+        r["seq"].append(new_brew_seq({q["id"] for q in r["seq"]}))
+        self._inv_sigs = None
+        save_cfg(self.cfg)
+        self.rebuild_brew()
+
+    def brew_del_seq(self, q):
+        r = self.brew_recipe()
+        r["seq"] = [x for x in r["seq"] if x is not q]
+        self._forget_card(BREW_PREFIX + q["id"])
+        save_cfg(self.cfg)
+        self.rebuild_brew()
+
+    def _forget_card(self, name):
+        old = self.cfg["settings"].get("inv_items") or {}
+        self.cfg["settings"]["inv_items"] = {k: v for k, v in old.items() if k != name}
+        (self.cfg["settings"].get("brew_thumbs") or {}).pop(name, None)
+        self._inv_sigs = None
+
+    def toggle_brew_menu(self):
+        if self.brew_menu is not None:
+            self.close_brew_menu()
+            return
+        menu = tk.Frame(self.brew_host, bg=BROWN)
+        for name in self.cfg["brew"]["recipes"]:
+            PixBtn(menu, name, lambda n=name: self.brew_set(n), self.f, 140, 21, bd=2).pack()
+        x = self.brew_prof_btn.winfo_rootx() - self.brew_host.winfo_rootx()
+        y = self.brew_prof_btn.winfo_rooty() - self.brew_host.winfo_rooty() + self.brew_prof_btn.winfo_height() - 1
+        menu.place(x=x, y=y)
+        menu.lift()
+        self.brew_menu = menu
+
+    def close_brew_menu(self):
+        if getattr(self, "brew_menu", None) is not None:
+            try:
+                self.brew_menu.destroy()
+            except Exception:
+                pass
+            self.brew_menu = None
+
+    def brew_set(self, name):
+        self.close_brew_menu()
+        if name in self.cfg["brew"]["recipes"] and name != self.cfg["brew"]["active"]:
+            if getattr(self, "brewer", None) is not None and self.brewer.running:
+                self.brewer.stop("you switched profile")
+            self.cfg["brew"]["active"] = name
+            self._inv_sigs = None
+            save_cfg(self.cfg)
+            self.rebuild_brew()
+
+    def _brew_new_name(self):
+        name = " ".join(self.brew_name_var.get().split())[:24]
+        if not name:
+            self.say("Type a name in the box first.", "Type a name")
+            return None
+        if name.lower() in (n.lower() for n in self.cfg["brew"]["recipes"]):
+            self.say(f"There is already a profile called '{name}'.", "Name taken")
+            return None
+        return name
+
+    def brew_new(self):
+        name = self._brew_new_name()
+        if name:
+            self.cfg["brew"]["recipes"][name] = new_recipe()
+            self.cfg["brew"]["active"] = name
+            self._inv_sigs = None
+            save_cfg(self.cfg)
+            self.rebuild_brew()
+            self.say(f"Potion Brewer profile '{name}' created.", "Profile created")
+
+    def brew_rename(self):
+        name = self._brew_new_name()
+        if name:
+            b, old = self.cfg["brew"], self.cfg["brew"]["active"]
+            b["recipes"] = {(name if k == old else k): v for k, v in b["recipes"].items()}
+            b["active"] = name
+            save_cfg(self.cfg)
+            self.rebuild_brew()
+            self.say(f"Renamed '{old}' to '{name}'.", "Renamed")
+
+    def brew_delete(self):
+        b = self.cfg["brew"]
+        if len(b["recipes"]) <= 1:
+            self.say("You need at least one Potion Brewer profile.", "Last profile")
+            return
+        now = time.time()
+        if now > self._brew_del_until:
+            self._brew_del_until = now + 3.0
+            self.brew_del_btn.lbl.config(text="Sure?")
+            self.say(f"Press Delete again within 3 seconds to delete '{b['active']}'.", "Press again")
+            return
+        gone = b["active"]
+        for q in b["recipes"][gone]["seq"]:
+            self._forget_card(BREW_PREFIX + q["id"])
+        del b["recipes"][gone]
+        b["active"] = next(iter(b["recipes"]))
+        save_cfg(self.cfg)
+        self.rebuild_brew()
+
+    # --- picking the Cauldron / Spoon spot: the next left click outside this window ---
+    def brew_pick_start(self, which):
+        self.brew_pick = None if self.brew_pick == which else which
+        self.rebuild_brew()
+        if self.brew_pick:
+            self.say("Click the " + ("Cauldron / Anvil" if which == "pot" else "Wooden Spoon / Hammer") + " in the game (left click).",
+                     "Click it in game")
+
+    def brew_pick_click(self, button, t, pt, over_window):
+        """Input thread: while a spot is being picked, the next left click outside the macro window is that spot."""
+        which = getattr(self, "brew_pick", None)
+        if not which or button != "left" or over_window or not pt:
+            return False
+        self.brew_pick = None
+        self.q.put(("brew_point", which, (int(pt[0]), int(pt[1]))))
+        return True
+
+    def on_brew_point(self, which, pt):
+        self.brew_recipe()[which] = [pt[0], pt[1]]
+        save_cfg(self.cfg)
+        self.rebuild_brew()
+        self.say(f"{'Cauldron / Anvil' if which == 'pot' else 'Wooden Spoon / Hammer'} set to {pt[0]}, {pt[1]}.", "Spot saved")
+
+    # --- the inventory card of a sequence ---
+    def brew_card(self, sid, probe=False):
+        """probe: is that card learned? Otherwise the card's centre on the screen (the inventory must be open), or None."""
+        name = BREW_PREFIX + sid
+        if probe:
+            return self.inv_have(name)
+        t0 = time.time()
+        while time.time() - t0 < 3.0:
+            if self.inv_boxes_t > t0 + 0.05 or (time.time() - t0 > 1.0 and time.time() - self.inv_boxes_t < 1.0):
+                for nm, r in list(self.inv_boxes):
+                    if nm == name:
+                        return ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0)
+            time.sleep(0.05)
+        return None
+
+    def brew_refresh(self):
+        """The '< Seen' marks (the card was recognised in the open inventory a moment ago) and the ON / OFF icon."""
+        on = bool(self.brewer and self.brewer.running)
+        if on != self._brew_icon_on:
+            self._brew_icon_on = on
+            self.brew_icon.config(image=self.img_train_on if on else self.img_train_off)
+            self.brew_state.config(text="ON" if on else "OFF")
+        if self.cur_tab != "extras" or getattr(self, "extra_page", "") != "brew":
+            return
+        now = time.time()
+        fresh = now - self.inv_boxes_t < 1.6
+        have = {nm for nm, _r in list(self.inv_boxes)} if fresh else set()
+        for name, lbl in list(self.brew_seen.items()):
+            txt = "< Seen" if name in have else ""
+            try:
+                if lbl.cget("text") != txt:
+                    lbl.config(text=txt)
+            except Exception:
+                pass
+
+    def toggle_brew(self):
+        if self.brewer is not None and self.brewer.running:
+            self.brewer.stop("stopped by you")
+            return
+        r = self.brew_recipe()
+        if not IS_WIN:
+            self.say("The Potion Brewer only works on Windows", "Windows only")
+            return
+        if not r.get("pot") or not r.get("spoon"):
+            self.say("Potion Brewer: set the Cauldron/Anvil and the Wooden Spoon/Hammer locations first (Extras > Automation).", "Set the spots")
+            return
+        if not r["seq"]:
+            self.say("Potion Brewer: add a sequence first.", "No sequence")
+            return
+        if not self.train_allowed():
+            self.say("Potion Brewer: click into the game first", "Game not active")
+            return
+
+        def delays():
+            S = self.cfg["settings"]
+
+            def num(k, d):
+                try:
+                    return max(0.0, float(S.get(k, d)))
+                except (TypeError, ValueError):
+                    return d
+            return (num("brew_click_ms", 100.0) / 1000.0, num("brew_pick_ms", 20.0) / 1000.0, num("brew_wait_s", 0.25),
+                    num("brew_arrive_ms", 20.0) / 1000.0, num("brew_hold_ms", 5.0) / 1000.0, num("brew_after_s", 0.3))
+        self.brewer = Brewer(allowed=self.train_allowed, find_card=self.brew_card, delays=delays, inv_open=lambda: self.inv_is_open(),
+                             move_fn=lambda x, y: move_cursor(x, y, bool(self.cfg["settings"].get("brew_nudge", False))),
+                             on_stop=lambda n, why: self.q.put(("brew_stopped", n, why)))
+        self.brewer.start(r)
+        self.say(f"Potion Brewer started ({r['count']} rounds). Press {self.key_name('brew')} to stop.", "Brewing")
+
+    def brew_hook(self, kind, n=0, test=False):
+        """Post to the Discord webhook (in the background). kind: 'out' / 'done' / 'test'."""
+        url = str(self.cfg["settings"].get("brew_webhook", "")).strip()
+        if not url:
+            if test:
+                self.q.put(("brew_hook", False, "Paste your webhook link first"))
+            return
+
+        def work():
+            ok, msg = discord_send(url, webhook_payload(kind, n))
+            if test:
+                self.q.put(("brew_hook", ok, ("Works - check your channel" if ok else msg)))
+            elif not ok:
+                self.q.put(("msg", f"Alchemy/Smith webhook: {msg}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------- Extras > Other Stuff > Checklist ----------
+    def cl_data(self):
+        return self.cfg.setdefault("checklists", default_checklists())
+
+    def cl_by_id(self, lid):
+        for l in self.cl_data()["lists"]:
+            if l["id"] == lid:
+                return l
+        return None
+
+    def cl_save(self, redraw=True):
+        save_cfg(self.cfg)
+        if redraw:
+            self._cl_sig = None
+
+    def cl_apply(self, act, arg):
+        """A click on the on-screen checklist (see the hit boxes of ChecklistOverlay.show)."""
+        C = self.cl_data()
+        if act == "toggle":
+            C["collapsed"] = not C.get("collapsed", False)
+            self.cl_save()
+            return
+        lst = self.cl_by_id(C.get("shown"))
+        it = next((i for i in lst["items"] if i["id"] == arg), None) if lst else None
+        if it is None:
+            return
+        if act == "check" and it["t"] == "check":
+            it["done"] = not it["done"]
+        elif act == "inc" and it["t"] == "count":
+            it["n"] = min(it["max"], it["n"] + 1)
+        elif act == "dec" and it["t"] == "count":
+            it["n"] = max(0, it["n"] - 1)
+        else:
+            return
+        self.cl_save()
+        self.cl_refresh_page(lst["id"])
+
+    def kda_click(self, x, y, d=1):
+        """Left click on a counter = +1, right click = -1 (never below 0)."""
+        for x0, y0, x1, y1, act, arg in list(self.kda_hits):
+            if x0 <= x < x1 and y0 <= y < y1:
+                S = self.cfg["settings"]
+                S["kda_n_" + arg] = max(0, int(S.get("kda_n_" + arg, 0)) + (1 if d > 0 else -1))
+                self._kda_sig = None
+                save_cfg(self.cfg)
+                return True
+        return False
+
+    def fixed_scale(self, now=None):
+        """(left, bottom, k) of the game window: k = its height / 1080. The Auto Bard badge and the KDA counters are placed from the
+        bottom-left corner of the game window with this, so they stay put (no mana bar / menu / HP changes move them)."""
+        L, T, Wc, Hc = self._cl_client(time.time() if now is None else now)
+        return L, T + Hc, max(0.3, Hc / 1080.0)
+
+    def bard_spot(self, now=None):
+        """Fixed place of 'Auto Bard is Active.' (x, y, scale)."""
+        L, B, k = self.fixed_scale(now)
+        return L + 12 * k, B - 168 * k, 1.33 * k
+
+    def kda_follow_rect(self):
+        """Where the counters sit until you move them: fixed, under the Auto Bard badge (x, y, w, h)."""
+        L, B, k = self.fixed_scale()
+        sc = 1.33 * k
+        return L + 8 * k, B - 108 * k, 280 * sc, int(24 * sc * 1.5) + 6
+
+    def kda_rect(self):
+        P = self.cfg["kdapos"]
+        if P.get("follow"):
+            return self.kda_follow_rect()
+        return P["x"], P["y"], P["w"], P["h"]
+
+    def is_kda_item(self, it):
+        return it is self.cfg["kdapos"]
+
+    def kda_geo(self, key, text):
+        try:
+            v = float(text.replace(",", "."))
+        except ValueError:
+            return
+        if key in ("w", "h") and v < 8:
+            return
+        P = self.cfg["kdapos"]
+        if P.get("follow"):
+            P.update(zip(("x", "y", "w", "h"), self.kda_follow_rect()))
+        P[key] = v
+        P["follow"] = False
+        self._kda_sig = None
+        save_cfg(self.cfg)
+        if self.mana_edit is not None and self._edit_item is P:
+            self._edit_render()
+
+    def kda_fill_entries(self):
+        try:
+            for k, v in zip(("x", "y", "h"), (lambda r: (r[0], r[1], r[3]))(self.kda_rect())):
+                var = self.kda_vars.get(k)
+                if var is not None and var.get() != str(round(v)):
+                    var.set(str(round(v)))
+        except Exception:
+            pass
+
+    def kda_reset_pos(self):
+        self.cfg["kdapos"]["follow"] = True
+        self._kda_sig = None
+        save_cfg(self.cfg)
+        self.kda_fill_entries()
+        if self.mana_edit is not None and self.is_kda_item(self._edit_item):
+            self.cfg["kdapos"].update(zip(("x", "y", "w", "h"), self.kda_follow_rect()))
+            self._edit_render()
+
+    def kda_reset(self):
+        for k, _ in KDA_ORDER:
+            self.cfg["settings"]["kda_n_" + k] = 0
+        self._kda_sig = None
+        save_cfg(self.cfg)
+
+    def _kda_tick(self, now):
+        """Grip / Death / Assist / Knocked counters under the Auto Bard badge (only the ones ticked in Other Stuff > KDA)."""
+        S = self.cfg["settings"]
+        items = [(k, f"{lab} {int(S.get('kda_n_' + k, 0))}") for k, lab in KDA_ORDER if S.get("kda_" + k)]
+        hidden_by_focus = (S.get("mana_only_focused", True) and self.mana_edit is None and now >= self.demo_until
+                           and not self.game_focused())
+        if not items or self.selecting or hidden_by_focus:
+            if self.kda_ov.shown:
+                self.kda_ov.hide()
+            self._kda_sig = None
+            self.kda_rects, self.kda_hits = (), []
+            return
+        if self.mana_edit is not None and self._edit_item is self.cfg["kdapos"]:
+            self.kda_ov.hide()                                   # (the editor shows its own picture)
+            self._kda_sig = None
+            self.kda_rects, self.kda_hits = (), []
+            return
+        x, y, w, h = self.kda_rect()
+        s = max(0.3, (h - 6) / 1.5 / 24.0)
+        sig = (tuple(items), round(x), round(y), round(s, 2))
+        if sig != self._kda_sig:
+            self._kda_sig = sig
+            self.kda_hits, self.kda_rects = self.kda_ov.show(x, y, [(i, t, False) for i, t in items], s, self.num_family)
+        elif now - self._kda_top > 1.0:
+            self._kda_top = now
+            self.kda_ov.raise_top()
+
+    def cl_click(self, x, y):
+        if self.kda_click(x, y):
+            return
+        for x0, y0, x1, y1, act, arg in list(self.cl_hits):
+            if x0 <= x < x1 and y0 <= y < y1:
+                self.cl_apply(act, arg)
+                return
+
+    def cl_wheel(self, delta):
+        lst = self.cl_by_id(self.cl_data().get("shown"))
+        if not lst:
+            return
+        s = cl_scale(self.cfg["mana"]["h"])
+        ph = max(180, self.cfg["mana"]["h"] + 9 * s)
+        cur = self.cl_scroll.get(lst["id"], 0)
+        step = int(CL_ROW * s) * (2 if delta > 0 else -2)
+        self.cl_scroll[lst["id"]] = max(0, min(cl_scroll_max(len(lst["items"]), ph, s), cur - step))
+        self._cl_sig = None
+
+    def _cl_client(self, now):
+        """(left, top, width, height) of the game window's client area (looked up twice a second), else the screen."""
+        c = getattr(self, "_cl_win", None)
+        if c is None or now - c[0] > 0.5:
+            r = game_window_rect(str(self.cfg["settings"].get("game_title", "Roblox")))
+            if r is None:
+                try:
+                    sw, sh = screen_size(self.root)
+                except Exception:
+                    sw, sh = 1920, 1080
+                r = (0, 0, sw, sh)
+            c = self._cl_win = (now, r)
+        return c[1]
+
+    def _check_tick(self, now):
+        """The checklist next to the mana bar (it finds the bar from the Mana Overlay's own position, so a windowed game works too)."""
+        S, C = self.cfg["settings"], self.cl_data()
+        lst = self.cl_by_id(C.get("shown"))
+        hidden_by_focus = (S.get("mana_only_focused", True) and self.mana_edit is None and now >= self.demo_until
+                           and not self.game_focused())
+        if lst is None or self.selecting or hidden_by_focus:
+            if self.check_ov.shown:
+                self.check_ov.hide()
+            self._cl_sig = None
+            self.cl_rects, self.cl_hits = (), []
+            return
+        m = self.cfg["mana"]
+        s = cl_scale(m["h"])
+        x, y = m["x"] + m["w"] + 7 * s, m["y"] - 3 * s
+        if self.mana_absent and self.mana_edit is None and now >= self.demo_until:
+            # the game's mana bar isn't on screen (menu / loading): the checklist waits at the left edge of the game window
+            L, T, Wc, Hc = self._cl_client(now)
+            x, y = L + 2 * s, T + Hc * 0.376 - 10 * s
+        pw, ph = 300 * s, max(180, m["h"] + 9 * s)
+        scroll = max(0, min(self.cl_scroll.get(lst["id"], 0), cl_scroll_max(len(lst["items"]), ph, s)))
+        self.cl_scroll[lst["id"]] = scroll
+        coll = bool(C.get("collapsed", False))
+        sig = (lst["id"], coll, scroll, round(x), round(y), round(pw), round(ph),
+               tuple((i["t"], i["name"], i["done"], i["n"], i["max"]) for i in lst["items"]))
+        if sig != self._cl_sig:
+            self._cl_sig = sig
+            self.cl_hits, self.cl_rects = self.check_ov.show(x, y, pw, ph, lst["items"], coll, scroll, s, self.num_family)
+        elif now - self._cl_top > 1.0:
+            self._cl_top = now
+            self.check_ov.raise_top()
+
+    # ---- the pages inside the tool ----
+    def cl_icon(self, key, red=False):
+        im = _img(CHECK_ICONS[key]).convert("RGBA")
+        if red:
+            a = np.array(im).astype(np.float32)
+            lum = a[..., :3].mean(axis=2)
+            a[..., 0] = np.minimum(255, 110 + lum * 0.7)
+            a[..., 1] = lum * 0.18
+            a[..., 2] = lum * 0.18
+            im = Image.fromarray(a.astype(np.uint8), "RGBA")
+        ph = ImageTk.PhotoImage(im)
+        self.cl_imgs.append(ph)
+        return ph
+
+    def build_other(self, f):
+        """Extras > Other Stuff: the menu (Gank Ping, Checklist, KDA, Instant Menu)."""
+        self.back_button(f)
+        big = (self.family, -(UI_FONT_PX + 6))
+        self.label(f, "Other Stuff", font=big).pack(fill="x", padx=12, pady=(8, 0))
+        self.other_icons = {k: ImageTk.PhotoImage(_img(v)) for k, v in CHECK_ICONS.items()}      # (kept alive here)
+        for i, (key, text, icon) in enumerate((("gank", "Gank Ping", self.other_icons["gank"]), ("check", "Checklist", self.other_icons["check"]),
+                                              ("kda", "KDA", self.other_icons["kda"]), ("imenu", "Instant Menu", self.other_icons["imenu"]))):
+            row = tk.Frame(f, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(10 if i == 0 else 6, 0))
+            tk.Label(row, image=icon, bg=PARCH, bd=0, width=62).pack(side="left")
+            PixBtn(row, text, lambda k=key: self.open_other_page(k), big, 200, 44).pack(side="left", padx=(8, 0))
+
+    def open_other_page(self, key):
+        if key == "check":
+            self.rebuild_check()
+        self.show_extra(key)
+
+    def build_check(self, f):
+        self.check_host = self.scroll_page(f, "check", PAGE_W - 12)
+        self.cl_imgs = []
+        self._cl_del = (None, 0.0)
+        self.rebuild_check()
+
+    def rebuild_check(self):
+        host = self.check_host
+        for w in host.winfo_children():
+            w.destroy()
+        self.cl_imgs = []
+        self.back_button(host, "other")
+        big = (self.family, -(UI_FONT_PX + 6))
+        now = time.time()
+        pend = self._cl_del[0] if now < self._cl_del[1] else None
+        lists = self.cl_data()["lists"]
+        fixed = [l for l in lists if l["fixed"]]
+        custom = [l for l in lists if not l["fixed"]]
+        for i, l in enumerate(fixed):
+            row = tk.Frame(host, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(12 if i == 0 else 4, 0))
+            tk.Label(row, image=self.cl_icon(l["id"]), bg=PARCH, bd=0, width=62).pack(side="left")
+            self.cl_name_btn(row, l, l["name"], big)
+        tk.Frame(host, bg=GREYT, height=3).pack(fill="x", padx=12, pady=(10, 4))
+        for l in custom:
+            row = tk.Frame(host, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(4, 0))
+            ic = tk.Label(row, image=self.cl_icon("item", red=(pend == l["id"])), bg=PARCH, bd=0, width=62)
+            ic.pack(side="left")
+            ic.bind("<Button-3>", lambda e, lid=l["id"]: self.cl_icon_rclick(lid))
+            self.cl_name_btn(row, l, l["name"] if len(l["name"]) <= 12 else l["name"][:11] + "..", big)
+        if len(custom) < CL_MAX_LISTS:
+            PixBtn(host, "+", self.cl_add_list, big, 44, 40).pack(pady=(10, 8))
+        self.label(host, "Right click a checklist's name to show it next to the Mana Bar (white = on, only one at a time). "
+                         "Right click a custom checklist's icon twice to delete it.", font=self.fs,
+                   fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=12, pady=(0, 6))
+
+    def cl_name_btn(self, row, l, text, font):
+        b = PixBtn(row, text, lambda lid=l["id"]: self.open_cview(lid), font, 200, 40)
+        b.pack(side="left", padx=(8, 0))
+        b.set_on(self.cl_data().get("shown") == l["id"])
+        b.lbl.bind("<Button-3>", lambda e, lid=l["id"]: self.cl_toggle_shown(lid))
+        return b
+
+    def cl_toggle_shown(self, lid):
+        C = self.cl_data()
+        C["shown"] = "" if C.get("shown") == lid else lid
+        self.cl_save()
+        self.rebuild_check()
+
+    def cl_add_list(self):
+        l = cl_new_list("Name")
+        self.cl_data()["lists"].append(l)
+        self.cl_save(False)
+        self.rebuild_check()
+
+    def cl_icon_rclick(self, lid):
+        now = time.time()
+        if self._cl_del[0] == lid and now < self._cl_del[1]:
+            C = self.cl_data()
+            C["lists"] = [l for l in C["lists"] if l["id"] != lid]
+            if C.get("shown") == lid:
+                C["shown"] = ""
+            self._cl_del = (None, 0.0)
+            self.cl_save()
+        else:
+            self._cl_del = (lid, now + 5.0)
+            self.root.after(5100, self.rebuild_check_if_open)
+        self.rebuild_check()
+
+    def rebuild_check_if_open(self):
+        if self._cl_del[0] is not None and time.time() >= self._cl_del[1]:
+            self._cl_del = (None, 0.0)
+            self.rebuild_check()
+
+    def open_cview(self, lid):
+        self.cview_id = lid
+        self._cl_item_del = (None, 0.0)
+        self._cl_list_del = 0.0
+        self.rebuild_cview()
+        self.show_extra("cview")
+
+    def cl_refresh_page(self, lid):
+        """The on-screen checklist changed an item: update the page in the tool if it shows that checklist."""
+        if getattr(self, "extra_page", "") == "cview" and getattr(self, "cview_id", None) == lid and self.cur_tab == "extras":
+            self.rebuild_cview()
+
+    def build_cview(self, f):
+        """One checklist: Back on top, the items (scroll) in the middle, the buttons pinned to the bottom."""
+        self.cview_id = None
+        self._cl_item_del = (None, 0.0)
+        self._cl_list_del = 0.0
+        self.back_button(f, "check")
+        self.cview_foot = tk.Frame(f, bg=PARCH)
+        self.cview_foot.pack(side="bottom", fill="x", pady=(0, 6))
+        mid = tk.Frame(f, bg=PARCH)
+        mid.pack(fill="both", expand=True)
+        self.cview_host = self.scroll_page(mid, "cview", PAGE_W - 12)
+
+    def rebuild_cview(self):
+        host, foot = self.cview_host, self.cview_foot
+        lst = self.cl_by_id(self.cview_id)
+        for w in list(host.winfo_children()) + list(foot.winfo_children()):
+            w.destroy()
+        if lst is None:
+            return
+        now = time.time()
+        pend = self._cl_item_del[0] if now < self._cl_item_del[1] else None
+        tk.Frame(host, bg=PARCH, height=6).pack()
+        for it in lst["items"]:
+            row = tk.Frame(host, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=2)
+            red = (pend == it["id"])
+            if it["t"] == "check":
+                box = tk.Frame(row, bg=BROWN, width=20, height=20)
+                box.pack(side="left", padx=(0, 8))
+                box.pack_propagate(False)
+                inner = tk.Label(box, bd=0, bg="#ffffff" if it["done"] else TAN)
+                inner.place(x=3, y=3, width=14, height=14)
+                for w in (box, inner):
+                    w.bind("<Button-1>", lambda e, i=it: self.cl_toggle_item(i))
+            else:
+                cnt = self.label(row, f"{it['n']}/{it['max']}", font=self.fs)
+                cnt.pack(side="left", padx=(0, 6))
+                cnt.bind("<Button-1>", lambda e, i=it, w=cnt: self.cl_inline(w, str(i["max"]), lambda t, i=i: self.cl_set_max(i, t), 6))
+                for sym in ("dec", "inc"):
+                    cvs = tk.Canvas(row, width=22, height=18, bg=PARCH, highlightthickness=0, bd=0, cursor="hand2")
+                    cvs.pack(side="right", padx=1)
+                    pts = [4, 6, 11, 13, 18, 6] if sym == "dec" else [4, 13, 11, 6, 18, 13]
+                    cvs.create_line(*pts, fill="#ffffff", width=3)
+                    cvs.bind("<Button-1>", lambda e, i=it, s=sym: self.cl_bump(i, 1 if s == "inc" else -1))
+            nm = self.label(row, it["name"], justify="left", wraplength=PAGE_W - 130, fg=("#b3261e" if red else BROWN))
+            nm.pack(side="left")
+            nm.bind("<Button-1>", lambda e, i=it, w=nm: self.cl_inline(w, i["name"], lambda t, i=i: self.cl_rename_item(i, t), 22))
+            nm.bind("<Button-3>", lambda e, i=it: self.cl_item_rclick(i))
+        self.label(host, "Click a name to rename it, click 0/50 to change the target, right click a name twice to delete it.",
+                   font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=12, pady=(8, 8))
+        # ---- the buttons (pinned to the bottom, all the same width) ----
+        W = 246
+        pad = (PAGE_W - W) // 2
+
+        def row_(top=3):
+            r = tk.Frame(foot, bg=PARCH, width=W)
+            r.pack(padx=pad, pady=(top, 0), anchor="w")
+            return r
+        r1 = row_(0)
+        PixBtn(r1, "Wipe", self.cl_wipe, self.f, 90, 22, bd=2).pack(side="left")
+        PixBtn(r1, "Configs", self.cl_configs, self.f, 90, 22, bd=2).pack(side="left", padx=(W - 180, 0))
+        if not lst["fixed"]:
+            r2 = row_()
+            box, var = self.bound_entry(r2, lst["name"], lambda t: None, W - 66 - 62 - 8, 22, "left")
+            box.pack(side="left")
+            PixBtn(r2, "Rename", lambda: self.cl_rename_list(var.get()), self.f, 66, 22, bd=2).pack(side="left", padx=(4, 0))
+            sure = now < self._cl_list_del
+            PixBtn(r2, "Sure?" if sure else "Delete", self.cl_delete_list, self.f, 62, 22, bd=2).pack(side="left", padx=(4, 0))
+        PixBtn(row_(6), "Add Number Counter", lambda: self.cl_add_item("count"), self.f, W, 26).pack()
+        PixBtn(row_(4), "Add Normal Checklist", lambda: self.cl_add_item("check"), self.f, W, 26).pack()
+
+    def cl_wipe(self):
+        """Every tick off, every counter back to 0."""
+        lst = self.cl_cur()
+        if lst is None:
+            return
+        for it in lst["items"]:
+            it["done"], it["n"] = False, 0
+        self.cl_save()
+        self.rebuild_cview()
+
+    def cl_inline(self, lbl, text, commit, width):
+        """Swap a label for a small text box; Enter / clicking away keeps the new text."""
+        parent = lbl.master
+        ent = tk.Entry(parent, font=self.f, width=width, bg=TAN, fg=BROWN, relief="flat", bd=0, highlightthickness=2,
+                       highlightbackground=BROWN, highlightcolor=BROWN, insertbackground=BROWN)
+        ent.insert(0, text)
+        ent.pack(side="left", before=lbl)
+        lbl.pack_forget()
+        ent.focus_set()
+        ent.select_range(0, "end")
+        done = []
+
+        def finish(_e=None, keep=True):
+            if done:
+                return
+            done.append(1)
+            if keep:
+                commit(ent.get())
+            self.rebuild_cview()
+        ent.bind("<Return>", finish)
+        ent.bind("<FocusOut>", finish)
+        ent.bind("<Escape>", lambda e: finish(keep=False))
+
+    def cl_cur(self):
+        return self.cl_by_id(self.cview_id)
+
+    def cl_toggle_item(self, it):
+        it["done"] = not it["done"]
+        self.cl_save()
+        self.rebuild_cview()
+
+    def cl_bump(self, it, d):
+        it["n"] = max(0, min(it["max"], it["n"] + d))
+        self.cl_save()
+        self.rebuild_cview()
+
+    def cl_set_max(self, it, text):
+        try:
+            it["max"] = max(1, min(99999, int(float(text.strip()))))
+        except ValueError:
+            return
+        it["n"] = min(it["n"], it["max"])
+        self.cl_save()
+
+    def cl_rename_item(self, it, text):
+        text = text.strip()
+        if text:
+            it["name"] = text[:60]
+            self.cl_save()
+
+    def cl_item_rclick(self, it):
+        now = time.time()
+        lst = self.cl_cur()
+        if self._cl_item_del[0] == it["id"] and now < self._cl_item_del[1]:
+            lst["items"] = [i for i in lst["items"] if i["id"] != it["id"]]
+            self._cl_item_del = (None, 0.0)
+            self.cl_save()
+        else:
+            self._cl_item_del = (it["id"], now + 5.0)
+            self.root.after(5100, lambda: self.rebuild_cview() if time.time() >= self._cl_item_del[1] else None)
+        self.rebuild_cview()
+
+    def cl_add_item(self, kind):
+        lst = self.cl_cur()
+        if lst is None or len(lst["items"]) >= CL_MAX_ITEMS:
+            self.say(f"That's the limit ({CL_MAX_ITEMS} items).", "Limit reached")
+            return
+        lst["items"].append(cl_new_item(kind, "Number Counter" if kind == "count" else "Checklist Placeholder"))
+        self.cl_save()
+        self.rebuild_cview()
+
+    def cl_rename_list(self, text):
+        lst = self.cl_cur()
+        text = text.strip()
+        if lst is None or lst["fixed"] or not text:
+            return
+        lst["name"] = text[:24]
+        self.cl_save(False)
+        self.rebuild_cview()
+
+    def cl_delete_list(self):
+        lst = self.cl_cur()
+        if lst is None or lst["fixed"]:
+            return
+        now = time.time()
+        if now < self._cl_list_del:
+            C = self.cl_data()
+            C["lists"] = [l for l in C["lists"] if l["id"] != lst["id"]]
+            if C.get("shown") == lst["id"]:
+                C["shown"] = ""
+            self.cl_save()
+            self.rebuild_check()
+            self.show_extra("check")
+        else:
+            self._cl_list_del = now + 4.0
+            self.root.after(4100, lambda: self.rebuild_cview() if self.cl_cur() is not None else None)
+            self.rebuild_cview()
+
+    def cl_import(self, code):
+        """Add the checklists in a code as new custom checklists. Returns a message; ValueError for a bad code."""
+        got = read_cl_code(code)
+        C = self.cl_data()
+        n = 0
+        for name, items in got:
+            if sum(1 for l in C["lists"] if not l["fixed"]) >= CL_MAX_LISTS:
+                break
+            C["lists"].append(cl_new_list(name, False, None, items))
+            n += 1
+        self.cl_save(False)
+        self.rebuild_check()
+        return f"Imported {n} checklist{'' if n == 1 else 's'}."
+
+    def cl_configs(self):
+        """Share checklists (a separate code from the profile configs)."""
+        old = getattr(self, "cl_share_win", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+        top = self.cl_share_win = tk.Toplevel(self.root)
+        top.title("Share Checklists")
+        top.configure(bg=BROWN)
+        top.attributes("-topmost", True)
+        top.geometry(f"+{self.root.winfo_rootx() + 40}+{self.root.winfo_rooty() + 120}")
+        body = tk.Frame(top, bg=PARCH)
+        body.pack(padx=3, pady=3)
+        W = 330
+        status = self.label(body, "", font=self.fs, justify="left", wraplength=W, fg=DIM)
+
+        def copy(text, what):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            status.config(text=f"{what} copied - paste it to your friend.", fg=OKGREEN)
+        lst = self.cl_cur()
+        for text, lists in ((f"Share: '{lst['name']}'" if lst else "Share this checklist", [lst] if lst else []),
+                            ("...or ALL your checklists in one code:", self.cl_data()["lists"])):
+            self.label(body, text, font=self.fs, justify="left", wraplength=W).pack(fill="x", padx=8, pady=(8, 2))
+            row = tk.Frame(body, bg=PARCH)
+            row.pack(fill="x", padx=8)
+            code = make_cl_code(lists)
+            box, _ = self.bound_entry(row, code, lambda t: None, 226, 24, "left")
+            box.pack(side="left")
+            PixBtn(row, "Copy", lambda c=code: copy(c, "Code"), self.f, 62, 24, bd=2).pack(side="left", padx=(6, 0))
+        tk.Frame(body, bg=BROWN, height=2).pack(fill="x", padx=8, pady=8)
+        self.label(body, "Import: paste a code you got, then press Import. (It is added as new checklists.)", font=self.fs,
+                   justify="left", wraplength=W).pack(fill="x", padx=8, pady=(0, 2))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8)
+        ibox, ivar = self.bound_entry(row, "", lambda t: None, 226, 24, "left")
+        ibox.pack(side="left")
+
+        def paste():
+            try:
+                ivar.set(self.root.clipboard_get().strip())
+            except Exception:
+                status.config(text="Nothing to paste - the clipboard is empty.", fg=BROWN)
+
+        def do_import():
+            try:
+                msg = self.cl_import(ivar.get())
+            except ValueError as e:
+                status.config(text=str(e), fg=BROWN)
+                return
+            status.config(text=msg, fg=OKGREEN)
+            ivar.set("")
+        PixBtn(row, "Paste", paste, self.f, 62, 24, bd=2).pack(side="left", padx=(6, 0))
+        row = tk.Frame(body, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(6, 0))
+        PixBtn(row, "Import", do_import, self.f, 90, 26).pack(side="left")
+        PixBtn(row, "Close", top.destroy, self.f, 90, 26).pack(side="left", padx=(6, 0))
+        status.pack(fill="x", padx=8, pady=(6, 8))
+
+    def gank_ping(self):
+        """The Gank Ping key: a screenshot of the game goes to the Gank Ping webhook."""
+        S = self.cfg["settings"]
+        url = str(S.get("gank_webhook", "")).strip()
+        now = time.time()
+        if now - getattr(self, "_gank_t", 0.0) < 3.0:
+            return                                           # (one press = one ping)
+        if not url:
+            self.say("Gank Ping: paste your webhook link first (Extras > Other Stuff).", "No webhook")
+            return
+        name, title = S.get("gank_name", ""), str(S.get("game_title", "Roblox"))
+        rect = game_window_rect(title)                       # (read now, on the main thread; None unless the Roblox game itself is in front)
+        if rect is None:
+            self.say("Gank Ping: Roblox isn't the window in front, nothing was sent.", "Roblox not in front")
+            return                                           # (only ever sends a picture of the game, never of anything else)
+        self._gank_t = now
+
+        def work():
+            try:
+                png = screenshot_png(rect)
+                ok, msg = discord_send_image(url, gank_payload(name), png, "gank.png")
+            except Exception as ex:
+                ok, msg = False, f"{type(ex).__name__}: {ex}"
+            self.q.put(("gank_hook", ok, "Gank ping sent" if ok else msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def instant_menu(self):
+        """The Instant Menu key: the mouse goes onto the Menu button and clicks it (Shiftlock is turned off first if it is on)."""
+        now = time.time()
+        if now - getattr(self, "_imenu_t", 0.0) < 0.8:
+            return
+        if not IS_WIN:
+            self.say("Instant Menu only works on Windows", "Windows only")
+            return
+        rect = game_window_rect(str(self.cfg["settings"].get("game_title", "Roblox")))
+        if rect is None or not self.train_allowed():
+            return                                            # (only ever clicks while the Roblox game itself is in front)
+        self._imenu_t = now
+
+        def work():
+            try:
+                msg = instant_menu_run(rect, find_menu_button, self.crosshair_visible, send_key, lambda x, y: move_cursor(x, y, True),
+                                       send_click, cursor_pos, self.train_allowed)
+            except Exception as ex:
+                msg = f"{type(ex).__name__}: {ex}"
+            if msg:
+                self.q.put(("msg", f"Instant Menu: {msg}"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def gank_test(self):
+        url = str(self.cfg["settings"].get("gank_webhook", "")).strip()
+        if not url:
+            self.q.put(("gank_hook", False, "Paste your webhook link first"))
+            return
+
+        def work():
+            ok, msg = discord_send(url, webhook_payload("test"))
+            self.q.put(("gank_hook", ok, "Works - check your channel" if ok else msg))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_gank_hook(self, ok, msg):
+        self.say(f"Gank Ping: {msg}", "Gank Ping" if ok else "Gank Ping failed")
+        lbl = getattr(self, "gank_lbl", None)
+        try:
+            if lbl is not None and lbl.winfo_exists():
+                lbl.config(text=msg, fg="#2e7d32" if ok else "#b3261e")
+        except Exception:
+            pass
+
+    def build_gank(self, f):
+        """Extras > Other Stuff > Gank Ping."""
+        host = self.scroll_page(f, "gank", PAGE_W - 12)
+        self.back_button(host, "other")
+        box, p = self.panel(host, "Gank Ping")
+        box.pack(fill="x", padx=6, pady=6)
+        self.label(p, "Discord webhook", font=self.fs).pack(anchor="w", padx=8, pady=(2, 0))
+        wrow = tk.Frame(p, bg=PARCH)
+        wrow.pack(fill="x", padx=8, pady=2)
+        self.make_entry(wrow, "gank_webhook", str, 196, 24).pack(side="left")
+        PixBtn(wrow, "Test", self.gank_test, self.f, 52, 24, bd=2).pack(side="left", padx=(6, 0))
+        self.gank_lbl = self.label(p, "", font=self.fs)
+        self.gank_lbl.pack(anchor="w", padx=8)
+        self.label(p, "Your name (shown in the message)", font=self.fs).pack(anchor="w", padx=8, pady=(4, 0))
+        nrow = tk.Frame(p, bg=PARCH)
+        nrow.pack(fill="x", padx=8, pady=2)
+        self.make_entry(nrow, "gank_name", str, 196, 24).pack(side="left")
+        krow = tk.Frame(p, bg=PARCH)
+        krow.pack(fill="x", padx=8, pady=(6, 2))
+        self.label(krow, "Gank Ping key", font=self.fs).pack(side="left")
+        self.btn_gank = PixBtn(krow, self.key_name("gank"), lambda: self.start_capture("gank"), self.f, 110, 24)
+        self.btn_gank.pack(side="right")
+        self.key_btns["gank"] = self.btn_gank
+        self.label(p, "Set up: in Discord right-click your channel > Edit Channel > Integrations > Webhooks > New Webhook > "
+                      "Copy Webhook URL, then paste it here. Press the key while you play and a screenshot of your game window "
+                      "is posted to that channel so your friends know where to come.", font=self.fs, fg=DIM, justify="left",
+                   wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(2, 4))
+
+    def on_brew_hook(self, ok, msg):
+        self.say(f"Alchemy/Smith webhook: {msg}", "Webhook")
+        lbl = getattr(self, "brew_hook_lbl", None)
+        try:
+            if lbl is not None and lbl.winfo_exists():
+                lbl.config(text=msg, fg="#2e7d32" if ok else "#b3261e")
+        except Exception:
+            pass
+
+    def on_brew_stopped(self, n, why):
+        self.brew_refresh()
+        if why == BREW_OUT:
+            self.brew_hook("out", n)
+        elif why == BREW_BOOM:
+            self.brew_hook("boom", n)
+        elif why == "finished":
+            self.brew_hook("done", n)
+        self.say(f"Potion Brewer stopped ({why}) - {n} round{'' if n == 1 else 's'} done.", "Brewer stopped")
+
+    def build_snap(self, f):
+        host = self.scroll_page(f, "extras", PAGE_W - 12)                  # (scrolls with the mouse wheel)
+        self.back_button(host, "auto")
+        box, inner = self.panel(host, "Snap Training")
+        box.pack(fill="x", padx=6, pady=6)
+        irow = tk.Frame(inner, bg=PARCH)
+        irow.pack(fill="x", padx=8, pady=(0, 2))
+        self.train_icon = tk.Label(irow, image=self.img_train_off, bg=PARCH, bd=0)
+        self.train_icon.pack(side="left")
+        self.train_state = self.label(irow, "OFF")
+        self.train_state.pack(side="left", padx=6)
+        self._train_icon_on = False
+        self.label(inner, TRAIN_DESC, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(6, 4))
+        row = tk.Frame(inner, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=2)
+        self.label(row, "Spell key to train  (1-9, 0, -, =)").pack(side="left")
+
+        def changed(text):
+            text = text.strip()
+            ok = text[-1:] if text[-1:] in HOTBAR_KEYS else ""        # only the 12 hotbar keys are accepted
+            if ok != text:
+                self.train_var.set(ok)
+                return
+            self.cfg["settings"]["train_key"] = ok
+            save_cfg(self.cfg)
+        kb, self.train_var = self.bound_entry(row, self.cfg["settings"].get("train_key", ""), changed, 60, 26)
+        kb.pack(side="right")
+        row2 = tk.Frame(inner, bg=PARCH)
+        row2.pack(fill="x", padx=8, pady=2)
+        self.label(row2, "Start / stop key").pack(side="left")
+        self.btn_train = PixBtn(row2, self.key_name("snaptrain"), lambda: self.start_capture("snaptrain"),
+                                self.f, 110, 24)
+        self.btn_train.pack(side="right")
+        self.key_btns["snaptrain"] = self.btn_train
+        self.train_lbl = self.label(inner, self.train_text(), justify="left", wraplength=PAGE_W - 40)
+        self.train_lbl.pack(fill="x", padx=8, pady=(6, 4))
+        self.ms_row(inner, "G SPAM: hold each press for (milliseconds)", "train_g_hold_ms", 200.0)
+        self.ms_row(inner, "G SPAM: wait between presses (milliseconds) - blank = no spam", "train_g_ms", 20.0)
+        self.check_row(inner, "Hold G again as soon as the mana is under the cast band", "train_mana_empty", wrap=230)
+        self.entry_row(inner, "Cast only in the middle (% of the mark's height)", "train_mid_pct", float, w=64, wrap=190)
+        self.entry_row(inner, "Wait this long (seconds) before holding G", "train_mana_wait", float, w=64, wrap=190)
+        self.entry_row(inner, "Cast sound match (0.5 loose - 0.99 strict)", "cast_match", float, w=64, wrap=190)
+        self.ding = DingDetector(on_heard=lambda n: (self.q.put(("ding", n)), self._mana_ding()))
+        self.mana_ding = DingDetector(on_heard=lambda n: self._mana_ding())       # (listens whenever the mana picture is on)
+        self.mana_listener = AudioListener(self.mana_ding)
+        self.cast = CastDetector(on_heard=lambda n: self.q.put(("cast_heard", n)),
+                                 match=lambda: min(0.99, max(0.3, float(self.cfg["settings"].get("cast_match", 0.99) or 0.99))))
+        self.listener = AudioListener(SoundMux(self.ding, self.cast))
+        self.dblood = DragonBloodDetector(on_heard=lambda n: self.q.put(("dblood_heard", n)))
+        self.dblood_listener = AudioListener(self.dblood)         # (only listens while Dragon Blood is on)
+        self._dbl_failed = False
+        self.run_heard = 0
+        self.sound_lbl = self.label(inner, "Sound: not listening yet (it starts with Snap Training)", justify="left",
+                                    wraplength=PAGE_W - 40)
+        self.sound_lbl.pack(fill="x", padx=8, pady=(0, 4))
+
+    def train_shown_marks(self):
+        """The cast band of the spell Snap Training is casting (the middle part of its highest mark), shown the whole time it
+        runs just so you can see it. The trainer reads the real mana bar right next to it."""
+        marks = [mk for mk in self.marks() if mk.get("key") == self.cfg["settings"].get("train_key")]
+        if not marks:
+            return []
+        top = max(marks, key=lambda x: x["hi"])
+        a, b = self.perfect_band(float(top["lo"]), float(top["hi"]))
+        return [dict(top, lo=a, hi=b)]
+
+    def perfect_band(self, lo, hi):
+        """The part of the cast mark the trainer really uses: the MIDDLE `train_mid_pct` % of it, so it never casts near
+        the edges of the mark (backfires there) and G never charges up to the very top."""
+        try:
+            frac = min(100.0, max(10.0, float(self.cfg["settings"].get("train_mid_pct", 60.0) or 60.0))) / 100.0
+        except (TypeError, ValueError):
+            frac = 0.6
+        trim = (hi - lo) * (1.0 - frac) / 2.0
+        a, b = lo + trim, hi - trim
+        if b - a < 3.0:                                           # (a very thin mark: at least 3 % of room)
+            mid = (lo + hi) / 2.0
+            a, b = mid - 1.5, mid + 1.5
+        return a, b
+
+    def perfect_range(self, key):
+        """(lo, hi) of the cast mark of this key (the one reaching highest), or None if the key has no mark."""
+        marks = [mk for mk in self.marks() if mk.get("key") == key]
+        if not marks:
+            return None
+        mk = max(marks, key=lambda x: x["hi"])
+        return float(mk["lo"]), float(mk["hi"])
+
+    def ms_row(self, parent, text, key, default):
+        """A millisecond box; blank is allowed (it means 'off' / 'shortest') and is saved as ''."""
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=2)
+        self.label(row, text, justify="left", wraplength=190).pack(side="left")
+
+        def changed(t):
+            t = t.strip().replace(",", ".")
+            if not t:
+                val = ""
+            else:
+                try:
+                    val = float(t)
+                except ValueError:
+                    return
+            self.cfg["settings"][key] = val
+            save_cfg(self.cfg)
+        init = self.cfg["settings"].get(key, default)
+        box, var = self.bound_entry(row, "" if init in ("", None) else f"{init:g}", changed, 64, 26)
+        box.pack(side="right")
+        return var
+
+    def mana_strip_at(self, pct, top_off, height):
+        """True if the in-game mana bar is EMPTY (the empty-bar colour) in a thin strip across it: `pct` is the height on
+        the bar, top_off / height position the strip in screen pixels relative to it. Runs on the trainer's thread."""
+        m = self.cfg["mana"]
+        inner = self._mana_img[2] if getattr(self, "_mana_img", None) else (0.1, 0.75)
+        y = pct_to_y(m, pct)
+        x0 = m["x"] + m["w"] * (inner[0] + (inner[1] - inner[0]) * 0.3)
+        x1 = m["x"] + m["w"] * (inner[0] + (inner[1] - inner[0]) * 0.7)
+        box = {"left": int(x0), "top": int(round(y)) + int(top_off), "width": max(2, int(x1 - x0)), "height": int(height)}
+        loc = self._mana_tls = getattr(self, "_mana_tls", threading.local())
+        if getattr(loc, "sct", None) is None:
+            loc.sct = mss.mss()                               # (one screen grabber per thread)
+        shot = loc.sct.grab(box)
+        arr = np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
+        return mana_strip_empty(arr)
+
+    def perfect_below_lo(self, lo):
+        """Perfect %: the mana is under the bottom of the cast mark. Looks just BELOW the mark's bottom edge, because the
+        overlay's own box covers the mark itself."""
+        if lo <= 1.0:
+            return False
+        below = self.mana_strip_at(lo, 2, 3)
+        self.mana_state = "under the mark" if below else "in range"
+        return below
+
+    def perfect_reached_hi(self, hi):
+        """Perfect %: the mana has reached the top of the cast mark (looks just ABOVE the mark's top edge)."""
+        return not self.mana_strip_at(hi, -3, 2)            # (2 pixel rows, 2-3 px above the box: about 1 % of the bar)
+
+    def update_train_icon(self):
+        on = bool(getattr(self, "train", None) and self.train.running)
+        if on != self._train_icon_on:
+            self._train_icon_on = on
+            self.train_icon.config(image=self.img_train_on if on else self.img_train_off)
+            self.train_state.config(text="ON" if on else "OFF")
+
+    def train_text(self):
+        run = bool(self.train and self.train.running)
+        return (f"{'TRAINING...  ' if run else ''}Trained {self.train_total} time"
+                f"{'' if self.train_total == 1 else 's'}")
+
+    def train_allowed(self):
+        """Never type into another window: only while the game window is in front (when that check is on)."""
+        S = self.cfg["settings"]
+        want = str(S["game_title"]).strip().lower()
+        if not S["only_in_game"] or not want:
+            return True
+        return want in foreground_title().lower()
+
+    def toggle_snap_training(self):
+        if self.train and self.train.running:
+            self.train.stop("stopped by you")
+            return
+        key = self.cfg["settings"].get("train_key", "")
+        if key not in HOTBAR_KEYS:
+            self.say("Snap Training: type the spell key (1-9, 0, -, =) in the Extras tab first", "Pick a key")
+            return
+        if not IS_WIN:
+            self.say("Snap Training only works on Windows", "Windows only")
+            return
+        if not self.train_allowed():
+            self.say("Snap Training: click into the game first", "Game not active")
+            return
+        rng = self.perfect_range(key)
+        if rng is None:
+            self.say(f"Snap Training: add a cast mark for key {key} in the Mana Overlay tab first "
+                     "(it shows how much mana the spell needs)", "No cast mark")
+            return
+        band = self.perfect_band(*rng)
+        if not self.listener.start():
+            self.sound_lbl.config(text="Sound: " + str(self.listener.error))
+            self.say("Snap Training: " + str(self.listener.error), "No sound detection")
+            if IS_WIN and pyaudio is None and not getattr(sys, "frozen", False):
+                self.install_audio_lib()
+            return
+        self.run_heard = 0
+        self.sound_text(True)
+        self.update_train_icon()
+        self.train = SnapTrainer(allowed=self.train_allowed,
+                                 on_stop=lambda n, why: self.q.put(("train_stopped", n, why)),
+                                 heard_since=self.ding.heard_since,
+                                 gap=lambda: self.cfg["settings"].get("train_g_ms", 20.0),
+                                 g_hold=lambda: self.cfg["settings"].get("train_g_hold_ms", 200.0),
+                                 mana_wait=lambda: self.cfg["settings"].get("train_mana_wait", TRAIN_MANA_WAIT),
+                                 watch_low=lambda: bool(self.cfg["settings"].get("train_mana_empty")),
+                                 below_lo=lambda: self.perfect_below_lo(band[0]),
+                                 reached_hi=(lambda: self.perfect_reached_hi(band[1])) if band[1] < 99.0 else None)
+        timer_resolution(True)
+        self.train.start(key)
+        self.say(f"Snap Training started on {key} (press {self.key_name('snaptrain')} to stop)", "Training")
+        self.train_lbl.config(text=self.train_text())
+
+    def sound_text(self, force=False):
+        run = bool(self.train and self.train.running)
+        txt = (f"Sound: listening - casts heard {self.run_heard}, mana dings {self.ding.count}, "
+               f"last cast match {self.cast.last_score:.2f}"
+               + (f", mana bar {self.mana_state}" if getattr(self, "mana_state", None) else "") if run else
+               f"Sound: not listening (mana dings heard: {self.ding.count})")
+        if force or txt != getattr(self, "_sound_txt", None):
+            self._sound_txt = txt
+            self.sound_lbl.config(text=txt)
+
+    def on_cast_heard(self, n):
+        """'Trained N times' counts ONLY casts whose sound was actually heard while the trainer is on."""
+        if not (self.train and self.train.running):
+            return
+        self.run_heard += 1
+        self.on_train_count(1)
+
+    def on_train_count(self, n):
+        self.train_total += 1
+        self.train_lbl.config(text=self.train_text())
+        if self.train_total % TRAIN_MILESTONE == 0:
+            self.say(f"Trained {self.train_total} times", f"Trained {self.train_total}")
+
+    def install_audio_lib(self):
+        """Running as a script and PyAudioWPatch is missing: install it for this Python in the background."""
+        if getattr(self, "_pip_busy", False):
+            return
+        self._pip_busy = True
+        self.sound_lbl.config(text="Sound: installing PyAudioWPatch... try again in a minute")
+
+        def work():
+            global pyaudio, pyaudio_error
+            try:
+                r = subprocess.run([sys.executable, "-m", "pip", "install", "PyAudioWPatch"], capture_output=True,
+                                   text=True, timeout=300, creationflags=0x08000000 if IS_WIN else 0)
+                if r.returncode != 0:
+                    raise RuntimeError((r.stderr or r.stdout or "pip failed").strip().splitlines()[-1])
+                import importlib
+                pyaudio = importlib.import_module("pyaudiowpatch")
+                self.q.put(("msg", "PyAudioWPatch installed - press the Snap Training key again"))
+            except Exception as ex:
+                pyaudio_error = str(ex)
+                self.q.put(("msg", f"Couldn't install PyAudioWPatch automatically ({ex}). Run: python -m pip install PyAudioWPatch"))
+            self._pip_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_ding(self, n):
+        self.sound_text()
+
+    def on_train_stopped(self, n, why):
+        timer_resolution(False)
+        self.update_train_icon()
+        self.listener.stop()
+        self.sound_text(True)
+        self.train_lbl.config(text=self.train_text())
+        self.say(f"Snap Training stopped ({why}) - {self.run_heard} cast{'' if self.run_heard == 1 else 's'} heard this run, "
+                 f"{self.train_total} in total", "Training stopped")
+
+    def build_cred(self, f):
+        self.label(f, CREDITS_TEXT, justify="left", anchor="nw", wraplength=PAGE_W - 24
+                   ).pack(fill="both", padx=12, pady=12)
+
+    def build_settings(self, f):
+        inner = self.scroll_page(f, "settings", PAGE_W - 12)
+        self.label(inner, "Settings  (scroll with the mouse wheel)", font=self.fs
+                   ).pack(fill="x", padx=8, pady=(6, 4))
+        self.label(inner, "Keybinds  (click a button, then press the new key)", font=self.fs
+                   ).pack(fill="x", padx=8, pady=(2, 2))
+        for action, text in HOTKEY_ACTIONS:
+            if action in ("snaptrain", "brew", "gank", "imenu"):
+                continue                                   # (their keys are picked in the Extras tab)
+            row = tk.Frame(inner, bg=PARCH)
+            row.pack(fill="x", padx=8, pady=1)
+            self.label(row, text).pack(side="left")
+            btn = PixBtn(row, self.key_name(action), lambda a=action: self.start_capture(a),
+                         self.f, 110, 24)
+            btn.pack(side="right")
+            self.key_btns[action] = btn
+        self.check_row(inner, "Show Cooldown Numbers On Non Hotkey/Inventory (Potions/Buffs etc)", "buff_numbers", wrap=250)
+        self.check_row(inner, "Keep this window on top", "topmost",
+                       extra=lambda v: self.root.attributes("-topmost", v))
+        self.entry_row(inner, "Game window title contains", "game_title", str, w=100, h=24, wrap=150)
+        self.check_row(inner, "Show the little Scroom while this window is hidden and the game isn't in front", "mascot_on", wrap=230)
+        for text, key, cast in (("Armed timeout (sec, 0 = never)", "arm_timeout", float),
+                                ("Click grace near the end (sec)", "grace", float),
+                                ("Red box strength (0.1 - 1)", "opacity", float),
+                                ("Show tenths under (sec, 0 = off)", "tenths_under", float),
+                                ("Box padding (px, can be negative)", "box_grow", int)):
+            self.entry_row(inner, text, key, cast, w=66, h=24, wrap=200)
+        self.label(inner, "Updates", font=self.fs).pack(fill="x", padx=8, pady=(10, 2))
+        self.check_row(inner, "Look for a new version when the program starts", "update_check")
+        self.entry_row(inner, "Update link (web folder, https://...)", "update_base", str, w=150, h=24, wrap=120)
+        self.upd_lbl = self.label(inner, "", justify="left", font=self.fs, wraplength=PAGE_W - 40)
+        self.upd_lbl.pack(fill="x", padx=8, pady=(2, 2))
+        self.upd_row = tk.Frame(inner, bg=PARCH)
+        self.upd_row.pack(fill="x", padx=8, pady=(0, 4))
+        self.upd_btns = {"check": PixBtn(self.upd_row, "Check for updates", lambda: self.start_update_check(True), self.f, 130, 26),
+                         "update": PixBtn(self.upd_row, "Update now", self.start_update_install, self.f, 100, 26),
+                         "restart": PixBtn(self.upd_row, "Restart now", self.restart_app, self.f, 100, 26)}
+        self.upd_set(f"Version {APP_VERSION}" + ("" if (self.cfg["settings"].get("update_base") or "").strip()
+                                                 else " - no update link set"))
+        self.label(inner, SETTINGS_TIPS, justify="left", font=self.fs, wraplength=PAGE_W - 40,
+                   fg="#6b5d50").pack(fill="x", padx=8, pady=(10, 6))
+
+    # ---------- updates ----------
+    def upd_set(self, text, show=("check",)):
+        """Text under the Updates settings + which of the buttons (check / update / restart) are visible."""
+        try:
+            self.upd_lbl.config(text=text)
+            for b in self.upd_btns.values():
+                b.pack_forget()
+            for k in ("check", "update", "restart"):
+                if k in show:
+                    self.upd_btns[k].pack(side="left", padx=(0, 4))
+        except Exception:
+            pass
+
+    def _upd_target(self):
+        frozen = bool(getattr(sys, "frozen", False))
+        return frozen, (sys.executable if frozen else os.path.abspath(__file__))
+
+    def start_update_check(self, manual):
+        base = str(self.cfg["settings"].get("update_base") or "").strip()
+        if self._upd_installed or self._upd_busy:
+            return
+        if not base:
+            if manual:
+                self.upd_set("No update link is set. Type the web folder link above.")
+                self.say("No update link is set (Settings > Updates).")
+            return
+        self._upd_busy = True
+        if manual:
+            self.upd_set("Checking...", show=())
+
+        def work():
+            try:
+                info, newer = check_for_update(base)
+                self.q.put(("update_checked", info, newer, manual))
+            except UpdateError as ex:
+                self.q.put(("update_checked", None, str(ex), manual))
+            except Exception as ex:
+                self.q.put(("update_checked", None, f"Update check failed ({ex.__class__.__name__}).", manual))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_checked(self, info, newer, manual):
+        self._upd_busy = False
+        if info is None:                                       # newer = the error text
+            if manual:
+                self.upd_set(newer)
+                self.say(newer)
+            else:
+                self.upd_set(f"Version {APP_VERSION}")
+            return
+        if newer:
+            self.upd_info = info
+            note = f" - {info['notes']}" if info.get("notes") else ""
+            self.upd_set(f"New version {info['version']} is available (you have {APP_VERSION}){note}", show=("check", "update"))
+            self.say(f"Update available: {info['version']} (Settings > Updates).", "Update available")
+        else:
+            self.upd_set(f"Version {APP_VERSION} - you have the newest version.")
+            if manual:
+                self.say("You have the newest version.")
+
+    def start_update_install(self):
+        base = str(self.cfg["settings"].get("update_base") or "").strip()
+        if self._upd_busy or not base:
+            return
+        self._upd_busy = True
+        self.upd_set("Downloading the update... (the program keeps working)", show=())
+        frozen, target = self._upd_target()
+
+        def work():
+            try:
+                self.q.put(("update_done", run_update(base, frozen, target), None))
+            except UpdateError as ex:
+                self.q.put(("update_done", None, str(ex)))
+            except Exception as ex:
+                self.q.put(("update_done", None, f"Update failed ({ex.__class__.__name__}: {ex})"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_update_done(self, version, err):
+        self._upd_busy = False
+        if err:
+            self.upd_set(err, show=("check", "update") if self.upd_info else ("check",))
+            self.say(err)
+            return
+        self._upd_installed = True
+        self.upd_set(f"Updated to {version}. Press Restart now to use it (your settings are kept).", show=("restart",))
+        self.say(f"Updated to {version}. Restart to use it.", "Updated!")
+
+    def restart_app(self):
+        """Start the program again and close this one. An exe made with PyInstaller unpacks itself into a temp
+        folder and deletes it on exit; a new copy started from inside it would reuse that folder (-> 'cannot
+        import name _imagingtk'). So the new copy is started a couple of seconds LATER, after this one is gone,
+        with PyInstaller's environment variables cleared."""
+        frozen, target = self._upd_target()
+        try:
+            cmd, kw = restart_command(frozen, target, os.environ)
+            subprocess.Popen(cmd, cwd=APP_DIR, **kw)
+        except Exception as ex:
+            self.say(f"Couldn't restart ({ex}). Close and open the program yourself.")
+            return
+        self.on_close()
+
+    # ---------- keybinds ----------
+    def key_name(self, action):
+        return self.cfg["settings"]["key_" + action].upper()
+
+    def set_train_scans(self, key):
+        try:
+            self.train_scans = frozenset(int(c) for c in keyboard.key_to_scan_codes(key))
+        except Exception:
+            self.train_scans = frozenset()
+
+    def set_imenu_scans(self, key):
+        try:
+            self.imenu_scans = frozenset(int(c) for c in keyboard.key_to_scan_codes(key))
+        except Exception:
+            self.imenu_scans = frozenset()
+
+    def on_train_key(self):
+        """Called from the keyboard hook thread the moment the start/stop key goes down. Stopping has the highest
+        priority: it is done right here (no queue, no waiting for the window), starting goes through the main thread."""
+        now = time.time()
+        if now - self._train_key_t < 0.3 or self.capturing:
+            return
+        self._train_key_t = now
+        tr = getattr(self, "train", None)
+        if tr is not None and tr.running:
+            tr.stop("stopped by you")
+        else:
+            self.q.put(("snaptrain",))
+
+    def hk_register(self, action):
+        if action == "snaptrain":
+            self.set_train_scans(self.cfg["settings"]["key_snaptrain"])     # (handled by the keyboard hook, see on_train_key)
+            return
+        if action == "imenu":
+            self.set_imenu_scans(self.cfg["settings"]["key_imenu"])         # (the keyboard hook sees it even with other keys held down)
+            return
+        key = self.cfg["settings"]["key_" + action]
+        try:
+            self.hk_handle[action] = keyboard.add_hotkey(key, lambda a=action: self.q.put((a,)))
+        except Exception as ex:
+            self.append_log(f"Couldn't bind '{key}' for {action}: {ex} (run as administrator?)")
+
+    def update_key_texts(self):
+        for action, btn in self.key_btns.items():
+            waiting = self.capturing and self.capturing[0] == "hotkey" and self.capturing[1] == action
+            btn.lbl.config(text="press a key..." if waiting else self.key_name(action))
+        for mv in self.moves() + self.snaps():
+            btn = self.move_key_btns.get(id(mv))
+            if btn is not None:
+                waiting = self.capturing and self.capturing[0] == "move" and self.capturing[1] is mv
+                btn.lbl.config(text="..." if waiting else mv["key"])
+        for mk in self.marks():
+            btn = self.mark_key_btns.get(id(mk))
+            if btn is not None:
+                waiting = self.capturing and self.capturing[0] == "mark" and self.capturing[1] is mk
+                btn.lbl.config(text="..." if waiting else mk["key"])
+        self.btn_mana.lbl.config(text=f"Find bar ({self.key_name('mana')})")
+        self.btn_area.lbl.config(text=f"Find hotbar ({self.key_name('area')})")
+        self.btn_test.lbl.config(text=f"Test ({self.key_name('test')})")
+        self._last_cap = None            # force the banner caption to refresh
+
+    def start_capture(self, action):
+        if self.capturing and self.capturing[0] == "hotkey" and self.capturing[1] == action:
+            self.capturing = None                                   # click again = cancel
+            self.update_key_texts()
+            return
+        self.cancel_move_capture()
+        token = ("hotkey", action, time.time())
+        self.capturing = token
+        self.update_key_texts()
+        self.say("Press the new key (Esc = cancel). Combos like ctrl+k work too.", "Press a key...")
+
+        def worker():
+            try:
+                hk = keyboard.read_hotkey(suppress=False)      # waits for the next key press
+            except Exception:
+                hk = None
+            self.q.put(("bound", action, token, hk))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_capture(self, action, token, hk):
+        if token != self.capturing:
+            return                       # cancelled or replaced by a newer pick
+        self.capturing = None
+        S = self.cfg["settings"]
+        mods = {"ctrl", "left ctrl", "right ctrl", "shift", "left shift", "right shift", "alt",
+                "left alt", "right alt", "alt gr", "windows", "left windows", "right windows"}
+        hk = (hk or "").lower()
+        taken = {S["key_" + a] for a, _ in HOTKEY_ACTIONS if a != action}
+        if not hk or hk == "esc":
+            msg = "Keybind unchanged"
+        elif all(p.strip() in mods for p in hk.split("+")):
+            msg = "Pick a normal key, not just ctrl / shift / alt"
+        elif hk in taken:
+            msg = f"{hk.upper()} is already used for something else"
+        elif hk in HOTBAR_KEYS:
+            msg = "Don't use a hotbar key (1-0, -, =) here"
+        elif hk == "g" and action == "snaptrain":
+            msg = "G is used by Snap Training - pick another key"
+        else:
+            msg = None
+        if msg:
+            self.update_key_texts()
+            self.say(msg, "Key unchanged")
+            return
+        if action in ("snaptrain", "imenu"):
+            try:
+                if "+" in hk.strip("+") or not keyboard.key_to_scan_codes(hk):
+                    raise ValueError("pick one single key, not a combo")
+            except Exception as ex:
+                self.update_key_texts()
+                self.say(f"Can't use that key: {ex}", "Key unchanged")
+                return
+            S["key_" + action] = hk
+            (self.set_train_scans if action == "snaptrain" else self.set_imenu_scans)(hk)
+            save_cfg(self.cfg)
+            self.update_key_texts()
+            self.say(f"{dict(HOTKEY_ACTIONS)[action]} key is now {hk.upper()}", f"Key: {hk.upper()}")
+            return
+        try:
+            new = keyboard.add_hotkey(hk, lambda a=action: self.q.put((a,)))
+        except Exception as ex:
+            self.update_key_texts()
+            self.say(f"Can't use that key: {ex}", "Key unchanged")
+            return
+        for ident in (self.hk_handle.get(action), S["key_" + action]):    # drop the old binding
+            if ident is None:
+                continue
+            try:
+                keyboard.remove_hotkey(ident)
+                break
+            except Exception:
+                continue
+        self.hk_handle[action] = new
+        S["key_" + action] = hk
+        save_cfg(self.cfg)
+        self.update_key_texts()
+        self.say(f"{dict(HOTKEY_ACTIONS)[action]} key is now {hk.upper()}", f"Key: {hk.upper()}")
+
+    # ---- picking the hotbar key of a move ----
+    def cancel_move_capture(self):
+        if self.capturing and self.capturing[0] in ("move", "mark"):
+            self.capturing = None
+            self.inputs.capture_cb = None
+
+    def capture_move_key(self, mv):
+        if self.capturing and self.capturing[0] == "move" and self.capturing[1] is mv:
+            self.cancel_move_capture()                              # click again = cancel
+            self.update_key_texts()
+            return
+        self.cancel_move_capture()
+        token = ("move", mv, time.time())
+        self.capturing = token
+
+        def cb(name):                    # runs in the input thread; True = key accepted
+            if name == "esc" or name in HOTBAR_KEYS:
+                self.q.put(("movekey", token, name))
+                return True
+            return False
+        self.inputs.capture_cb = cb
+        self.update_key_texts()
+        self.say("Press the hotbar key this move is on (1-0, - or =). If another move has it, they swap. "
+                 "Esc = cancel.", "Press the key...")
+
+    def finish_move_key(self, token, name):
+        if token != self.capturing:
+            return
+        self.capturing = None
+        mv = token[1]
+        if token[0] == "mark":
+            if name != "esc":
+                mv["key"] = name
+                save_cfg(self.cfg)
+                self.mana_ov.sig = None
+                self.draw_preview()
+                self.say(f"Mark is now on key {name}.", f"Key: {name}")
+            self.update_key_texts()
+            return
+        if name == "esc":
+            self.say("Key unchanged", "Key unchanged")
+        elif name == mv["key"]:
+            self.say(f"Key {name} kept.", "Key unchanged")
+        else:
+            lst, kind = self.list_of(mv)
+            other = next((m for m in lst if m is not mv and m["key"] == name), None)
+            if other:                                        # the key is taken: SWAP the two moves
+                old = mv["key"]
+                self.tracker.swap_keys(old, name, snap=(kind == "snap"))
+                mv["key"], other["key"] = name, old
+                lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+                save_cfg(self.cfg)
+                self.rebuild_moves()
+                self.say(f"'{mv['name']}' is now on key {name} and '{other['name']}' moved to key {old}.",
+                         f"Swapped {name} / {old}")
+            else:
+                self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
+                mv["key"] = name
+                lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+                save_cfg(self.cfg)
+                self.rebuild_moves()
+                self.say(f"'{mv['name']}' is now on key {name}.", f"Key: {name}")
+        self.update_key_texts()
+
+    # ---------- events ----------
+    def poll(self):
+        while True:
+            try:
+                item = self.q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self.handle(item)
+            except Exception:
+                self.append_log("UI ERROR:\n" + traceback.format_exc())
+        try:
+            self.refresh()
+        except Exception:
+            self.append_log("UI ERROR:\n" + traceback.format_exc())
+        self.root.after(60, self.poll)
+
+    def handle(self, item):
+        kind = item[0]
+        if kind == "bound":
+            self.finish_capture(item[1], item[2], item[3])
+            return
+        if kind == "movekey":
+            self.finish_move_key(item[1], item[2])
+            return
+        if kind == "msg":
+            self.say(item[1])
+            return
+        if kind == "update_checked":
+            self.on_update_checked(item[1], item[2], item[3])
+            return
+        if kind == "update_done":
+            self.on_update_done(item[1], item[2])
+            return
+        if kind == "hooks_failed":
+            self.hk_handle["snaptrain"] = keyboard.add_hotkey(self.cfg["settings"]["key_snaptrain"],
+                                                              lambda: self.q.put(("snaptrain",)))
+            return
+        if kind == "inv_status":
+            self.inv_refresh_status()
+            if getattr(self, "brew_body", None) is not None and self.cur_tab == "extras" and getattr(self, "extra_page", "") == "brew":
+                self.rebuild_brew()                                           # (a learned card's picture shows up)
+            return
+        if kind == "cast_heard":
+            self.on_cast_heard(item[1])
+            return
+        if kind == "explode_heard":
+            if getattr(self, "brewer", None) is not None and self.brewer.running:
+                self.brewer.stop(BREW_BOOM)
+            return
+        if kind == "dblood_heard":
+            msg = self.tracker.dragon_blood_heard(time.time())
+            if msg:
+                self.say(msg, "Dragon Blood off")
+            return
+        if kind == "ding":
+            self.on_ding(item[1])
+            return
+        if kind == "train_count":
+            self.on_train_count(item[1])
+            return
+        if kind == "train_stopped":
+            self.on_train_stopped(item[1], item[2])
+            return
+        if kind == "brew_stopped":
+            self.on_brew_stopped(item[1], item[2])
+            return
+        if kind == "cl_click":
+            self.cl_click(item[1], item[2])
+            return
+        if kind == "cl_rclick":
+            self.kda_click(item[1], item[2], -1)
+            return
+        if kind == "cl_wheel":
+            self.cl_wheel(item[1])
+            return
+        if kind == "gank_hook":
+            self.on_gank_hook(item[1], item[2])
+            return
+        if kind == "brew_hook":
+            self.on_brew_hook(item[1], item[2])
+            return
+        if kind == "brew_point":
+            self.on_brew_point(item[1], item[2])
+            return
+        if self.chat_open and kind in ("hide", "area", "area_manual", "test", "mana", "snaptrain", "brew", "gank", "imenu"):
+            return                       # typing in the Roblox chat: no keybind works
+        if self.capturing and kind in ("hide", "area", "area_manual", "test", "mana", "snaptrain", "brew", "gank", "imenu"):
+            return                       # ignore hotkeys while a new key is being picked
+        if kind == "area":
+            self.pick_area(manual=False)
+        elif kind == "area_manual":
+            self.pick_area(manual=True)
+        elif kind == "mana":
+            self.pick_mana()
+        elif kind == "test":
+            self.start_demo()
+        elif kind == "snaptrain":
+            self.toggle_snap_training()
+        elif kind == "brew":
+            self.toggle_brew()
+        elif kind == "gank":
+            self.gank_ping()
+        elif kind == "imenu":
+            self.instant_menu()
+        elif kind == "hide":
+            if self.root.state() == "withdrawn":
+                self.root.deiconify()
+                self.root.attributes("-topmost", bool(self.cfg["settings"]["topmost"]))
+            else:
+                self.root.withdraw()
+
+    def start_demo(self):
+        self.demo_t0 = time.time()
+        self.demo_until = self.demo_t0 + 5.0
+        self.say("Test overlay for 5 seconds: the red boxes should sit exactly on the 12 slots.",
+                 "Test overlay")
+
+    def refresh(self):
+        now = time.time()
+        armed, running = self.tracker.armed_text(), self.tracker.running_text()
+        if self.cap_until > now:
+            cap = self.cap_text
+        elif running:
+            cap = f"Running: {running}"
+        elif self.tracker.disarmed:
+            cap = "Disarmed"
+        else:
+            cap = f"Armed: {armed}" if armed else "Tracking"
+        if cap != self._last_cap:
+            self.cv.itemconfigure(self.caption, text=cap)
+            self._last_cap = cap
+        charge = self.tracker.charge_text()
+        txt = " | ".join(([f"Armed: {armed}"] if armed else []) + ([f"Running: {running}"] if running else [])
+                         + ([f"Charge: {charge.replace(' Charge', '')}"] if charge else [])
+                         + (["Azure: on"] if self.tracker.azure_text() else [])) or "Armed: Fist"
+        if getattr(self, "train", None) and self.train.running:
+            self.sound_text()
+        if hasattr(self, "train_icon"):
+            self.update_train_icon()
+        if hasattr(self, "brew_icon"):
+            self.brew_refresh()
+        if txt != self.armed_lbl.cget("text"):
+            self.armed_lbl.config(text=txt)
+        lt = "Last used: " + (self.tracker.last_text(now) or "-")
+        if lt != self.last_lbl.cget("text"):
+            self.last_lbl.config(text=lt)
+        if self.confirm_delete_until and now > self.confirm_delete_until:
+            self.confirm_delete_until = 0.0
+            self.del_btn.lbl.config(text="Delete")
+        if self.root.state() == "withdrawn":
+            self.win_rect = None
+        else:
+            bx, by, bw, bh = BODY_RECT
+            self.win_rect = (self.root.winfo_rootx() + bx, self.root.winfo_rooty() + by, bw, bh)
+
+    # ---------- the overlay ----------
+    def overlay_tick(self):
+        try:
+            self._overlay_tick()
+        except Exception:
+            self.append_log("OVERLAY ERROR:\n" + traceback.format_exc())
+        try:
+            self._mana_tick(time.time())
+        except Exception:
+            self.append_log("MANA OVERLAY ERROR:\n" + traceback.format_exc())
+        try:
+            self._decor_tick(time.time())
+        except Exception:
+            self.append_log("DECORATION ERROR:\n" + traceback.format_exc())
+        try:
+            self._dash_tick(time.time())
+        except Exception:
+            self.append_log("DASH / PB ERROR:\n" + traceback.format_exc())
+        try:
+            self._pct_tick(time.time())
+        except Exception:
+            self.append_log("MANA % ERROR:\n" + traceback.format_exc())
+        try:
+            self._check_tick(time.time())
+        except Exception:
+            self.append_log("CHECKLIST ERROR:\n" + traceback.format_exc())
+        try:
+            self._kda_tick(time.time())
+        except Exception:
+            self.append_log("KDA ERROR:\n" + traceback.format_exc())
+        try:
+            self._mascot_tick()
+        except Exception:
+            self.append_log("SCROOM ERROR:\n" + traceback.format_exc())
+        self.root.after(33, self.overlay_tick)
+
+    def _brew_listen(self):
+        """Listen to the game sound only while Alchemy/Smith runs: the Cauldron explosion stops it."""
+        want = bool(getattr(self, "brewer", None) is not None and self.brewer.running)
+        if want and self.explode_listener.stream is None and not self._exp_failed:
+            self.explode.hist, self.explode.buf = [], np.zeros(0)
+            if not self.explode_listener.start():
+                self._exp_failed = True
+                self.say("Alchemy/Smith explosion sound: " + str(self.explode_listener.error), "No sound detection")
+        elif not want:
+            self._exp_failed = False
+            if self.explode_listener.stream is not None:
+                self.explode_listener.stop()
+
+    def _shards_ensure(self, now):
+        """Adding the Hammer adds the three shards next to it: to Moves (free hotbar keys) when the Hammer is a Move, else to the
+        Inventory. Once per profile and start (delete them and they stay gone until the next start)."""
+        if now - getattr(self, "_shard_chk", 0.0) < 1.0:
+            return
+        self._shard_chk = now
+        try:
+            act = self.cfg["active"]
+            moves, lst = self.cfg["profiles"][act], inv_of(self.cfg)
+            in_moves = any(is_hammer_name(m.get("name")) and not m.get("spell") for m in moves)
+            in_inv = any(is_hammer_name(e["name"]) for e in lst)
+            done = self.__dict__.setdefault("_shards_done", set())
+            if not (in_moves or in_inv) or act in done:
+                return
+            done.add(act)
+            have = {_norm_name(m.get("name", "")) for m in moves} | {_norm_name(e["name"]) for e in lst}
+            add = [n for n in SHARDS if _norm_name(n) not in have]
+            if not add:
+                return
+            if in_moves:
+                used = {m["key"] for m in moves}
+                put = []
+                for n in add:
+                    free = next((k for k in HOTBAR_KEYS if k not in used), None)
+                    if free is None:
+                        break
+                    used.add(free)
+                    moves.append({"key": free, "name": n, "cd": 0.0, "cd2": 0.0, "split": False, "unequip": False})
+                    put.append(f"{n} ({free})")
+                moves.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+                save_cfg(self.cfg)
+                self.rebuild_moves()
+                self.say("Hammer found: added " + ", ".join(put) + " to Moves - change their keys to match your hotbar.", "Shards added")
+            else:
+                for n in add:
+                    lst.append({"name": n, "cd": 0.0, "cd2": 0.0, "split": False, "potion": False, "builtin": False})
+                save_cfg(self.cfg)
+                self.rebuild_inv()
+                self.say("Hammer found: added " + ", ".join(add) + " to the Inventory (press Learn on each card).", "Shards added")
+        except Exception:
+            pass
+
+    def _dblood_listen(self):
+        """Listen to the game sound only while Dragon Blood is on (its low-health turning-off sound)."""
+        want = bool(self.cfg["settings"].get("dblood_sound", True)) and self.tracker.dragon_blood_on()
+        if want and self.dblood_listener.stream is None and not self._dbl_failed:
+            if not self.dblood_listener.start():
+                self._dbl_failed = True
+                self.say("Dragon Blood sound: " + str(self.dblood_listener.error), "No sound detection")
+        elif not want:
+            self._dbl_failed = False
+            if self.dblood_listener.stream is not None:
+                self.dblood_listener.stop()
+
+    def area_text(self):
+        keys = [k for k in HOTBAR_KEYS if k in self.slot_cx]
+        seen = ("none found" if not keys else (keys[0] + "-" + keys[-1] if len(keys) == HOTBAR_KEYS.index(keys[-1]) - HOTBAR_KEYS.index(keys[0]) + 1 and len(keys) > 2 else ", ".join(keys)))
+        t0, n0, r = self._slot_rate
+        now = time.time()
+        if now - t0 >= 2.0:
+            r = (self.slot_scans - n0) / max(0.1, now - t0) if t0 else 0.0
+            self._slot_rate = (now, self.slot_scans, r)
+        return f"{self.fmt_bar(self.cfg['bar'])}\nSlots seen on the screen: {seen}  ({r:.0f} looks/s, last {now - self.slot_t:.1f}s ago)"
+
+    def hotbar_watchdog(self, now):
+        """The hotbar watcher normally looks ~15 times a second. If it hasn't finished a look for 2 s (a screen grab that hangs
+        while the game switches windows), start a fresh one; the old one is told to quit."""
+        n, t = self._wd
+        if self.slot_scans != n or not IS_WIN:
+            self._wd = (self.slot_scans, now)
+            return
+        if now - t > 2.0 and self.game_focused():
+            try:
+                self.hotbar.stop()
+                self.hotbar = HotbarWatcher(self)
+                self.hotbar.start()
+            except Exception:
+                pass
+            self._wd = (self.slot_scans, now)
+
+    def _bard_tick(self, now):
+        """'Auto Bard is Active.' + guitar under the mana bar for exactly as long as Auto Bard is running. Nothing else decides this:
+        not the game focus, not the mana-bar toggles, not a menu - it is drawn on top of everything else."""
+        try:
+            if not self.bard_on:
+                self.bard_badge.hide()
+                return
+            x, y, s = self.bard_spot(now)
+            self.bard_badge.show(x, y, s, self.num_family)
+            if now - getattr(self, "_bard_top", 0.0) > 0.5:
+                self._bard_top = now
+                self.bard_badge.raise_top()
+        except Exception as ex:
+            self.append_log(f"Auto Bard badge: {ex}")
+
+    def _overlay_tick(self):
+        now = time.time()
+        if self.chat_open and not self.game_focused():
+            self.chat_open = False                              # (left the game: the chat isn't being typed in)
+        self._bard_tick(now)
+        self.hotbar_watchdog(now)
+        k_ = (tuple(sorted(self.slot_cx)), int(now))
+        if k_ != getattr(self, "_slot_note", None):
+            self._slot_note = k_
+            try:
+                self.area_lbl.config(text=self.area_text())
+            except Exception:
+                pass
+        self._dblood_listen()
+        self._shards_ensure(now)
+        self._brew_listen()
+        S = self.cfg["settings"]
+        states = [None] * len(HOTBAR_KEYS)
+        if now < self.demo_until:                               # F7 test: staggered, draining boxes
+            snap_keys = {m["key"] for m in self.snaps()}        # slots with a snap spell show blue in the test
+            for i in range(len(states)):
+                frac = 1.0 - (((now - self.demo_t0) / 4.0 + i / 12.0) % 1.0)
+                states[i] = (frac * 15.0, 15.0, "snap" if HOTBAR_KEYS[i] in snap_keys else "move")
+                if i == 2:                                      # one slot shows the split look (both clicks cooling down)
+                    f2 = 1.0 - (((now - self.demo_t0) / 3.0 + 0.5) % 1.0)
+                    states[i] = ("split", (frac * 15.0, 15.0, "move"), (f2 * 12.0, 12.0, "snap"))
+        elif not self.selecting:
+            mv_now, sp_now, m2_now = (self.tracker.snapshot(now), self.tracker.snap_snapshot(now),
+                                      self.tracker.m2_snapshot(now))
+            for k_, c_ in self.tracker.dive_snapshot(now).items():          # Rift Dive: the time left underground (blue)
+                if k_ not in sp_now or sp_now[k_][0] < c_[0]:
+                    sp_now[k_] = c_
+            soul_now = self.tracker.soul_snapshot(now)                                   # Soul Berserk: the buff time left (black)
+            awk_now = self.tracker.awk_snapshot(now)                                     # Awakened: the time left (black)
+            bm_now = self.tracker.bm_snapshot(now)                                       # the buff moves: the time left (black)
+            for i, k in enumerate(HOTBAR_KEYS):
+                # a slot can have several running at once (left-click cooldown, snap spell, M2): show the
+                # one with the most time left. Snap spells and M2 are both blue.
+                cands = [c + (kind,) for c, kind in ((mv_now.get(k), "move"), (sp_now.get(k), "snap"),
+                                                     (m2_now.get(k), "snap")) if c]
+                if cands:
+                    states[i] = max(cands, key=lambda c: c[0])
+                # left AND right click cooling down at the same time (M1 / M2 that DON'T share, or a normal move
+                # plus a snap spell on the same key): show both, side by side - red left half, blue right half.
+                left, right = mv_now.get(k), [c for c in (sp_now.get(k), m2_now.get(k)) if c]
+                if left and right:
+                    best = max(right, key=lambda c: c[0])
+                    mv = self.tracker.move_for(k)
+                    shared_m2 = best is m2_now.get(k) and mv is not None and Tracker._shared(mv)
+                    if not shared_m2:                           # (M1 / M2 that share one cooldown stay one box)
+                        states[i] = ("split", left + ("move",), best + ("snap",))
+                if k in soul_now:
+                    states[i] = soul_now[k] + ("soul",)
+                if k in bm_now:
+                    states[i] = bm_now[k] + ("soul",)
+                if k in awk_now:
+                    states[i] = awk_now[k] + ("soul",)                                      # Awakened: black while it lasts, like Soul Berserk
+        if S.get("mana_only_focused", True) and now >= self.demo_until and not self.game_focused():
+            states = [None] * len(HOTBAR_KEYS)                  # game not in front: boxes hidden (the cooldowns keep running)
+        elif self.menu_hidden(now):
+            states = [None] * len(HOTBAR_KEYS)                  # in the menu (no HP bar): hidden too
+        if not any(states):
+            if self._sig is not None:
+                self.ov.hide()
+                self._sig = None
+            return
+        self.boxes_t = now                                      # (boxes are on the hotbar: see HotbarWatcher.feed)
+        items = []
+        for st in states:
+            if st is None:
+                items.append(None)
+                continue
+            if st[0] == "split":
+                items.append(tuple((box_text(l, t, S["tenths_under"]), l / t if t > 0 else 1.0, kd) for l, t, kd in st[1:]))
+                continue
+            left, total, kind = st
+            items.append((box_text(left, total, S["tenths_under"]), left / total if total > 0 else 1.0, kind))
+        bar = self.cfg["bar"]
+        rects = slot_rects(bar, S["box_grow"])
+        live = ()
+        if self.live_slots(now):
+            # not every slot is filled (or disarmed): the game re-centres the slots that are left, so put the boxes where they really are
+            live = tuple(sorted(self.slot_cx.items()))
+            for k, cx in live:
+                i = HOTBAR_KEYS.index(k)
+                rects[i] = (cx - rects[i][2] / 2.0, rects[i][1], rects[i][2], rects[i][3])
+        sig = (tuple(items), tuple(sorted(bar.items())), S["box_grow"], S["opacity"], live)
+        if sig != self._sig:
+            if self._sig is not None and self._sig[-1] != live:     # the slots moved: start the windows over, like a refocus does
+                self.ov.hide()
+            self._sig = sig
+            self.ov.show(rects, items, S["opacity"], self.num_family)
+        elif now - self._top_t > 1.0:                           # stay above the game
+            self._top_t = now
+            self.ov.raise_top()
+
+    # ---------- finding the hotbar ----------
+    def _restore_root(self):
+        self.selecting = False
+        self.root.deiconify()
+        self.root.attributes("-topmost", bool(self.cfg["settings"]["topmost"]))
+
+    def give_focus_back(self):
+        """Finding the hotbar brings the macro window to the front: hand the focus back to the game window it came from."""
+        h, self._prev_fg = getattr(self, "_prev_fg", None), None
+        if h and IS_WIN:
+            try:
+                self.root.update_idletasks()
+                u32.SetForegroundWindow(h)
+            except Exception:
+                pass
+
+    def pick_area(self, manual=False):
+        if self.selecting:
+            return
+        self._prev_fg = None
+        if IS_WIN:
+            try:
+                if self.game_focused() and str(self.cfg["settings"]["game_title"]).strip():
+                    self._prev_fg = u32.GetForegroundWindow()
+            except Exception:
+                pass
+        self.selecting = True
+        self.ov.hide()
+        self._sig = None
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.25)                                         # let the windows disappear
+        shots = []
+        with mss.mss() as s:
+            for mon in s.monitors[1:]:
+                shot = s.grab(mon)
+                shots.append((mon, shot, np.asarray(Image.frombytes("RGB", shot.size, shot.rgb))))
+        if not manual:
+            for mon, _, rgb in shots:
+                bar = detect_hotbar(rgb)
+                if bar:
+                    bar["x"] += mon["left"]
+                    bar["y"] += mon["top"]
+                    self._restore_root()
+                    self.set_bar(bar, "Hotbar found")
+                    return
+        mon, shot, _ = shots[0]
+        if IS_WIN and len(shots) > 1:                            # the monitor the mouse is on
+            cx, cy = cursor_pos()
+            for m, sh, _ in shots:
+                if m["left"] <= cx < m["left"] + m["width"] and m["top"] <= cy < m["top"] + m["height"]:
+                    mon, shot = m, sh
+                    break
+        self.say("Couldn't find the hotbar by itself - click its slots instead." if not manual
+                 else "Click the centre of slot 1, then the centre of the last slot.", "Click the slots")
+        self.click_calibrate(mon, shot)
+
+    def click_calibrate(self, mon, shot):
+        img = Image.frombytes("RGB", shot.size, shot.rgb)
+        W, H = mon["width"], mon["height"]
+        top = tk.Toplevel(self.root)
+        top.overrideredirect(True)
+        top.geometry(f"{W}x{H}+{mon['left']}+{mon['top']}")
+        top.attributes("-topmost", True)
+        cv = tk.Canvas(top, width=W, height=H, highlightthickness=0, cursor="crosshair", bg="black")
+        cv.pack()
+        cv.photo = ImageTk.PhotoImage(img)
+        cv.create_image(0, 0, image=cv.photo, anchor="nw")
+        cv.create_rectangle(0, 0, W, 64, fill="black", stipple="gray50", outline="")
+        title = cv.create_text(W // 2, 32, fill="white", font=("Segoe UI", 16, "bold"),
+                               text="Click the CENTRE of the FIRST slot (1)  |  right-click / Esc = cancel")
+        pts = []
+
+        def close():
+            top.destroy()
+            self._restore_root()
+
+        def click(e):
+            pts.append((e.x, e.y))
+            cv.create_oval(e.x - 5, e.y - 5, e.x + 5, e.y + 5, outline="#ff3b30", width=2)
+            if len(pts) == 1:
+                cv.itemconfigure(title, text="Now click the CENTRE of the LAST slot (=)  |  right-click / Esc = cancel")
+                return
+            bar = bar_from_clicks(pts[0], pts[1])
+            if not bar:
+                pts.clear()
+                cv.delete("all")
+                cv.create_image(0, 0, image=cv.photo, anchor="nw")
+                cv.create_rectangle(0, 0, W, 64, fill="black", stipple="gray50", outline="")
+                cv.create_text(W // 2, 32, fill="#ff9d9d", font=("Segoe UI", 16, "bold"),
+                               text="Slot 1 must be on the LEFT and the last slot (=) on the RIGHT - start again")
+                return
+            bar["x"] += mon["left"]
+            bar["y"] += mon["top"]
+            close()
+            self.set_bar(bar, "Hotbar set")
+
+        cv.bind("<ButtonPress-1>", click)
+        cv.bind("<Button-3>", lambda e: close())
+        top.bind("<Escape>", lambda e: close())
+        top.focus_force()
+
+    def set_bar(self, bar, cap):
+        self.cfg["bar"] = bar
+        save_cfg(self.cfg)
+        self._cl_t = 0.0                                        # (the window's edge is read again now)
+        try:
+            self.sync_dash_anchor()                             # the coins move to the new hotbar right away
+            self.dash_ov.hide()
+        except Exception:
+            pass
+        self.give_focus_back()
+        self.area_lbl.config(text=self.area_text())
+        self._sig = None
+        self.start_demo()                                       # show the test boxes right away
+        self.say(f"{cap}: {self.fmt_bar(bar)}. Check the red test boxes.", cap)
+
+    def on_close(self):
+        self.tracker.on = False
+        try:
+            if self.train:
+                self.train.stop("closed")
+            if getattr(self, "brewer", None) is not None:
+                self.brewer.stop("closed")
+            self.listener.stop()
+            self.mana_listener.stop()
+            self.dblood_listener.stop()
+        except Exception:
+            pass
+        self.inputs.stop()
+        self.hotbar.stop()
+        try:
+            self.autobard.stop()
+            self.bard_badge.hide()
+        except Exception:
+            pass
+        try:
+            keyboard.unhook_all()
+        except Exception:
+            pass
+        try:
+            self.root.withdraw()                 # gone from the screen at once; Windows removes the overlay windows
+        except Exception:                        # (and everything else) when the process ends a moment later
+            pass
+        self._finish()                           # NOT root.destroy(): tearing Tk down is what made Tcl crash on exit
+
+    def _finish(self):
+        """End the process right away. Tearing Tk down (root.destroy, or Python's own clean-up) frees Tk's
+        picture objects after - or while - their windows are gone, which makes Tcl show
+        'Fatal Error: alloc: invalid block' on exit. Saving the config and quitting skips all of that."""
+        try:
+            save_cfg(self.cfg)
+        except Exception:
+            pass
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
+
+    def run(self):
+        try:
+            self.root.mainloop()
+        finally:
+            self._finish()
+
+
+if __name__ == "__main__":
+    App().run()
