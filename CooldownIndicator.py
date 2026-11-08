@@ -29,6 +29,7 @@ Hotkeys:  F2 = find the hotbar (rebindable)   F7 = test overlay (rebindable)   F
 Needs:    pip install mss numpy pillow keyboard      (Windows - run as administrator for the hotkeys)
 Files:    scroom_assets.py must sit next to this file. Put Manufaktur.ttf next to it too (optional).
 """
+import uuid
 import collections, ast, subprocess, base64, ctypes, hashlib, urllib.request, zlib, glob, io, json, math, os, queue, re, sys, threading, time, traceback
 import urllib.error
 import tkinter as tk
@@ -74,7 +75,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -84,6 +85,14 @@ KEY_ALIASES = {"minus": "-", "equal": "=", "equals": "="}
 VK_NAME = {0x31: "1", 0x32: "2", 0x33: "3", 0x34: "4", 0x35: "5", 0x36: "6", 0x37: "7", 0x38: "8",
            0x39: "9", 0x30: "0", 0xBD: "-", 0xBB: "=", 0x1B: "esc"}
 VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
+# The hotbar's last two slots are found by their PLACE on the keyboard (scan codes 0x0C / 0x0D, the keys right of 0), not by what they type:
+# on a Turkish (and other non-US) layout the key at that place is not "-" / "=" (a Turkish keyboard has "?" there), so its virtual key differs.
+SCAN_HOTBAR = {0x0C: "-", 0x0D: "="}
+
+
+def hotbar_scan_name(scan, flags=0):
+    """'-' / '=' for the two physical keys right of 0 (never the numpad, which is an 'extended' key with other scan codes)."""
+    return None if (int(flags) & 1) else SCAN_HOTBAR.get(int(scan))
 
 # Where the hotbar is on a 1920x1080 screen: the parchment inside slot 1 (x, y, w, h) and the
 # distance from one slot to the next (pitch). Press F2 and the program finds the real values itself.
@@ -145,6 +154,11 @@ DEFAULT_SETTINGS = {
     "update_check": True,    # look for a new version when the program starts (only if an update link is set)
     "update_base": UPDATE_BASE_URL,   # the web folder the updates come from
     "inv_hide": True,        # hide the coins while the inventory is open
+    "cast_run": True,        # Cast Run: casting a held spell (left click) while running does W up, W down, W up, click, W down so the run is not lost
+    "cast_run_lock": 1.0,    # seconds after a Cast Run in which clicks on the same spell are dismissed (0 = no lock)
+    "autoclick": False,      # Autoclicker (AutoClick.ahk): holding the left mouse button in the game clicks every 30 ms; off while a spell is held
+    "block_run": True,       # Block Run: while W is held, pressing F does W up, W down, W up, F down, W down (like the AutoHotkey script)
+    "always_show": False,    # never hide the cooldown boxes / coins just because the game's HP bar isn't recognised (menus / loading included)
     "inv_equip": True,       # clicking a known item (Fire Protection, ...) in the inventory = equipping it
     "potion_cd": 6.0,             # every potion: this long a cooldown for ALL potions, from the moment a drink is finished
     "fire_dur": 120.0,            # Fire Protection (potion) lasts this many seconds
@@ -405,15 +419,18 @@ def clean_moves(moves, m2=False):
                 cd2 = 0.0                                  # a Normal Spell has no M2 (its right click is a snap spell)
         except Exception:
             continue
-        if key in HOTBAR_KEYS and key not in used:
-            used.add(key)
+        if key in HOTBAR_KEYS and (key not in used or m.get("ininv")):      # (a spell kept in the inventory holds no hotbar slot: its key may repeat)
+            if not m.get("ininv"):
+                used.add(key)
             ue = bool(m.get("unequip", False))                # right-click the name box: unequips after use
             d = ({"key": key, "name": nm, "cd": cd, "cd2": cd2, "split": bool(m.get("split", False)), "unequip": ue}
                  if m2 else {"key": key, "name": nm, "cd": cd, "unequip": ue})
             if m2 and m.get("spell"):
                 d["spell"] = True                          # listed under "Normal Spells" (hovering one removes Charge / Azure)
             if m.get("ininv"):
-                d["ininv"] = True                          # right-clicked key box: this spell is not on the hotbar, it is in the inventory
+                d["ininv"] = True
+                if m.get("iid"):
+                    d["iid"] = str(m["iid"])                   # (its identity: the hotbar key may repeat for spells kept in the inventory)                          # right-clicked key box: this spell is not on the hotbar, it is in the inventory
             if m2 and is_soul_name(nm) and not d.get("spell"):
                 d["soul"] = True                           # Wraith Knight's Soul Rip: found by its name (a weapon-like move, blank cooldowns)
                 d["cd"], d["cd2"] = 0.0, 0.0
@@ -1252,7 +1269,7 @@ def clean_inv(data):
                         "color": clean_hex(e.get("color"))})
             lk = e.get("link")
             if isinstance(lk, dict) and lk.get("kind") in ("move", "snap") and str(lk.get("key")) in HOTBAR_KEYS:
-                out[-1]["link"] = {"kind": lk["kind"], "key": str(lk["key"])}       # (a spell whose key box was right-clicked: its numbers come from the Main tab)
+                out[-1]["link"] = {"kind": lk["kind"], "key": str(lk["key"]), **({"id": str(lk["id"])} if lk.get("id") else {})}       # (a spell whose key box was right-clicked: its numbers come from the Main tab)
                 out[-1].update(potion=False)
             if soul:
                 out[-1]["soul"] = True
@@ -1305,22 +1322,33 @@ def sync_inv_links(cfg):
             if not flagged:
                 continue
             lst = invd[prof] = clean_inv(None)
-        want = {(k, m["key"]) for k, m in flagged}
+        for kind, m in flagged:
+            if not m.get("iid"):                                   # (every inventory spell gets an identity: hotbar keys may repeat among them)
+                m["iid"] = uuid.uuid4().hex[:8]
+                changed = True
+        for e in lst:                                              # (an entry saved before identities existed adopts the one of its spell)
+            lk = e.get("link")
+            if lk and not lk.get("id"):
+                src = next((m for k, m in flagged if k == lk["kind"] and m["key"] == lk["key"]), None)
+                if src is not None:
+                    lk["id"] = src["iid"]
+                    changed = True
+        want = {(k, m["iid"]) for k, m in flagged}
         for e in list(lst):
             lk = e.get("link")
-            if lk and (lk["kind"], lk["key"]) not in want:
+            if lk and (lk["kind"], lk.get("id")) not in want:
                 lst.remove(e)
                 changed = True
         marks = cfg.get("marks", {}).get(prof, [])
         for kind, m in flagged:
             nm = " ".join(str(m.get("name", "")).split())[:40]
-            e = next((x for x in lst if x.get("link") and x["link"]["kind"] == kind and x["link"]["key"] == m["key"]), None)
+            e = next((x for x in lst if x.get("link") and x["link"]["kind"] == kind and x["link"].get("id") == m["iid"]), None)
             if e is None:
                 if not nm or not can_be_in_inventory(m) or any(_norm_name(x["name"]) == _norm_name(nm) for x in lst):
                     continue
                 cd, cd2, split = link_values(kind, m)
                 lst.append({"name": nm, "cd": cd, "cd2": cd2, "split": split, "potion": False, "builtin": False, "color": "",
-                            "link": {"kind": kind, "key": m["key"]}})
+                            "link": {"kind": kind, "key": m["key"], "id": m["iid"]}})
                 changed = True
                 continue
             if nm and nm != e["name"] and not any(x is not e and _norm_name(x["name"]) == _norm_name(nm) for x in lst):
@@ -1331,6 +1359,7 @@ def sync_inv_links(cfg):
                 e["name"] = nm
                 changed = True
             cd, cd2, split = link_values(kind, m)
+            e["link"]["key"] = m["key"]
             if (e["cd"], e["cd2"], bool(e.get("split"))) != (cd, cd2, split):
                 e["cd"], e["cd2"], e["split"] = cd, cd2, split
                 changed = True
@@ -1430,6 +1459,7 @@ def mana_fill_boundary(arr, boxes=(), alpha=0.6, tol=24, tints=()):
 
 
 MANA_BAR_EMPTY, MANA_PRESENT_TOL = (82, 64, 73), 0     # the empty mana bar's colour, and how far off it may be to count as "the bar is on screen"
+MANA_G_KEEP = 2.0    # seconds the mana overlay stays on after G was pressed / held AND the mana % went up (even when the empty bar isn't seen)
 MANA_KEEP = 10.0     # seconds the mana overlay stays on after a charge / the mana ding even when the empty bar isn't seen
 
 
@@ -1555,6 +1585,46 @@ def letter_key(text, default):
     return t if t.isalpha() and t.isascii() else default
 
 
+class RunDetector:
+    """Running = W tapped, then pressed again within RUN_DOUBLE seconds and HELD (RUN_HOLD seconds). Letting go of W = stopped running."""
+    RUN_DOUBLE, RUN_TAP, RUN_HOLD = 0.45, 0.30, 0.15
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.first = None          # when the first W went down
+        self.second = None         # when the second W went down (candidate for a run)
+        self.running = False
+
+    def down(self, t):
+        """A W press (not a key repeat)."""
+        if self.first is not None and self.second is None and t - self.first <= self.RUN_DOUBLE:
+            self.second = t
+        else:
+            self.first, self.second, self.running = t, None, False
+
+    def up(self, t):
+        """W let go. True when that ends a run."""
+        if self.second is not None:
+            was = self.running
+            self.reset()
+            return was
+        if self.first is not None and t - self.first > self.RUN_TAP:
+            self.first = None                      # the first press was held, not a tap
+        return False
+
+    def is_running(self, t):
+        return self.second is not None and (self.running or t - self.second >= self.RUN_HOLD)
+
+    def tick(self, t):
+        """True the moment the second press has been held long enough = running."""
+        if self.second is not None and not self.running and t - self.second >= self.RUN_HOLD:
+            self.running = True
+            return True
+        return False
+
+
 class DashCD:
     """The cooldown state of the Dash coin, the PB coin and the 5 mana dash coins (no screen / Windows needed).
     Pressing a key that is on cooldown does nothing (the cooldown never restarts)."""
@@ -1636,11 +1706,10 @@ class DashCD:
         return self._take_coin(t, mana_cd, timeout)
 
     def press_pb(self, t, cd):
-        if self.pb_until <= t:
-            self.pb_until = t + cd
-            self.pb_len = cd
-            return True
-        return False
+        was_ready = self.pb_until <= t
+        self.pb_until = t + cd                  # (every press restarts the cooldown, even while it is still running)
+        self.pb_len = cd
+        return was_ready
 
     @staticmethod
     def _fill(until, ln, t):
@@ -3928,6 +3997,21 @@ def foreground_title(title_hint="roblox"):
         return ""
 
 
+def foreground_is_game(want):
+    """Is the window in front the game? `want` = the text from Settings (the title must contain it). The Roblox client is also found by
+    what it IS (its window class / RobloxPlayerBeta.exe): Voidstrap, Bloxstrap and the like rename the window ('Voidstrap: Rogue
+    Lineage Battlegrounds'), and then 'Roblox' is nowhere in the title."""
+    want = str(want or "").strip().lower()
+    if not want:
+        return True
+    try:
+        if want in foreground_title().lower():
+            return True
+        return "roblox" in want and is_roblox_window(u32.GetForegroundWindow())
+    except Exception:
+        return False
+
+
 def foreground_center():
     """Screen position of the middle of the active window's client area (None if it can't be told)."""
     if not IS_WIN:
@@ -3951,7 +4035,7 @@ def game_client_left(title="Roblox"):
         h = u32.FindWindowW(None, str(title).strip() or "Roblox")
         if not h:
             fg = u32.GetForegroundWindow()
-            if str(title).strip().lower() not in foreground_title().lower():
+            if not foreground_is_game(title):
                 return None
             h = fg
         pt = wintypes.POINT(0, 0)
@@ -4079,6 +4163,8 @@ TRAIN_G_MAX = 12.0                           # ...but never longer than this (sa
 TRAIN_MILESTONE = 10                         # "Trained N times" is announced every 10 casts
 SEND_VK = {name: vk for vk, name in VK_NAME.items() if name != "esc"}
 SEND_VK["g"] = 0x47
+SEND_VK["w"] = 0x57                           # (Block Run)
+SEND_VK["f"] = 0x46
 SEND_VK["shift"] = 0xA0                        # (left Shift: the Shiftlock key)
 
 
@@ -4551,6 +4637,10 @@ if IS_WIN:
         u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
     def send_key(name, up=False):
+        sc = next((c for c, n in SCAN_HOTBAR.items() if n == name), None)
+        if sc is not None:                                   # "-" / "=": sent by PLACE (scan code), so every keyboard layout presses the right slot
+            _send_input(_INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(0, sc, 8 | (2 if up else 0), 0, TRAIN_TAG))))
+            return
         vk = SEND_VK[name]
         inp = _INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(vk, u32.MapVirtualKeyW(vk, 0), 2 if up else 0, 0, TRAIN_TAG)))
         _send_input(inp)
@@ -6049,9 +6139,22 @@ def hp_bar_visible(rgb):
         return False
     sh = H / (HP_BAR_FRAC[3] - HP_BAR_FRAC[1])                      # (screen height)
 
-    def rows(col, tol):
-        return (np.abs(a - np.array(col, dtype=np.int16)).sum(axis=2) <= tol).mean(axis=1) >= 0.8
-    light, dark = rows(HP_FRAME, 40), rows(HP_DARK, 30)
+    def longest(m):
+        """Per row: the longest unbroken run of matching pixels."""
+        out = np.zeros(m.shape[0], dtype=int)
+        for y in range(m.shape[0]):
+            d = np.diff(np.concatenate(([0], m[y].astype(np.int8), [0])))
+            st, en = np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]
+            if len(st):
+                out[y] = int((en - st).max())
+        return out
+    # The bar's LENGTH is not fixed: it grows with the player's health (about 0.16 of the screen's width on a 2560x1440 screen, 0.21 for
+    # others), so a line counts when a good stretch of the grab is unbroken light colour - not a share of the whole grab's width.
+    need = 0.30 * W
+    light = longest(np.abs(a - np.array(HP_FRAME, dtype=np.int16)).sum(axis=2) <= 70) >= need
+    # (the dark outline is only a pixel or two thick and gets blended with the red / the frame when the screen isn't 1080p: any DARK
+    # row - every channel low - counts, not only the exact outline colour)
+    dark = (longest(np.abs(a - np.array(HP_DARK, dtype=np.int16)).sum(axis=2) <= 30) >= need * 0.8) | (longest(a.max(axis=2) <= 125) >= need * 0.8)
     lines = []                                                        # centres of the groups of frame-line rows
     for y0, y1 in _runs(light, 1):
         if y1 - y0 + 1 <= 0.012 * sh:
@@ -6261,6 +6364,13 @@ class InputWatcher(threading.Thread):
         self._next = lambda n, w, l: 0          # replaced by CallNextHookEx on Windows
         self._procs = ()
         self._imenu_held = False
+        self._phys = {0x57: False, 0x46: False}   # W / F as the USER holds them (the tool's own key presses are not counted)
+        self._br_thread = None
+        self._cr_thread = None
+        self._lheld = False                        # the left mouse button as the USER holds it
+        self._ac_thread = None
+        self._cr_block_until, self._cr_block_key, self._cr_drop_up = 0.0, None, False     # after a Cast Run: clicks on the same spell are dropped for the lock time
+        self._cr_hold = False                      # the left button went down as a Cast Run (its button-up is handled too)
         self._cl_swallow = set()                 # mouse-up messages still to be swallowed (the click started on the checklist)
 
     # ----- hook side (must be fast) -----
@@ -6270,6 +6380,12 @@ class InputWatcher(threading.Thread):
                 info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 is_down = w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
                 if info.dwExtraInfo != TRAIN_TAG:
+                    if info.vkCode in self._phys:
+                        was_f = self._phys[0x46]
+                        self._phys[info.vkCode] = is_down
+                        if (info.vkCode == 0x46 and is_down and not was_f and self._phys[0x57]
+                                and getattr(self.app, "chat_open", False) is not True):
+                            self.block_run()                             # W held + F pressed (not a key repeat)
                     if is_down and (info.vkCode in (0xBF, 0x6F) or info.scanCode == 0x35) and getattr(self.app, "chat_open", False) is not True:
                         self.app.chat_open = True                       # "/" = the Roblox chat opens: no keybind works until Enter / Esc / a click
                     elif is_down and info.vkCode in (0x0D, 0x1B):
@@ -6287,7 +6403,7 @@ class InputWatcher(threading.Thread):
                 if (w_param in (WM_KEYDOWN, WM_SYSKEYDOWN) and info.dwExtraInfo != TRAIN_TAG
                         and info.scanCode in getattr(self.app, "train_scans", ())):
                     self.app.on_train_key()          # start / stop key: acted on IMMEDIATELY, before anything else
-                name = VK_NAME.get(info.vkCode) or LETTER_VK.get(info.vkCode) or ("inv" if info.vkCode == 0xC0 else None)
+                name = hotbar_scan_name(info.scanCode, info.flags) or VK_NAME.get(info.vkCode) or LETTER_VK.get(info.vkCode) or ("inv" if info.vkCode == 0xC0 else None)
                 if name is not None and info.dwExtraInfo != TRAIN_TAG:         # (Snap Training's own keys are ignored)
                     kind = "down" if w_param in (WM_KEYDOWN, WM_SYSKEYDOWN) else "up"
                     self.events.put((kind, name, time.time(), None))
@@ -6295,8 +6411,172 @@ class InputWatcher(threading.Thread):
             pass
         return self._next(n_code, w_param, l_param)
 
+    @staticmethod
+    def _spin(ms):
+        end = time.perf_counter() + ms / 1000.0
+        while time.perf_counter() < end:
+            pass
+
+    def block_run(self):
+        """Block Run (the AutoHotkey script ~W & F): W up, W down, 1 ms, W up, 1 ms, F down, 10 ms, W down; then wait until F is let go,
+        F up, 10 ms, and W up unless W is still held. Runs in its own thread; a held F doesn't repeat it."""
+        try:
+            if not self.app.cfg["settings"].get("block_run"):
+                return
+            if self._br_thread is not None and self._br_thread.is_alive():
+                return
+            self._br_thread = threading.Thread(target=self._block_run_seq, daemon=True)
+            self._br_thread.start()
+        except Exception:
+            pass
+
+    def _block_run_seq(self):
+        try:
+            if not self.game_active():
+                return
+            send_key("w", True)
+            send_key("w")
+            self._spin(1)
+            send_key("w", True)
+            self._spin(1)
+            send_key("f")
+            self._spin(10)
+            send_key("w")
+            t0 = time.perf_counter()
+            while self._phys[0x46] and not self.quit.is_set() and time.perf_counter() - t0 < 30:
+                time.sleep(0)
+            send_key("f", True)
+            self._spin(10)
+            if not self._phys[0x57]:
+                send_key("w", True)
+        except Exception:
+            pass
+
+    def cast_run_wanted(self, pt, t=None):
+        """Cast Run applies to a left click that CASTS a held spell while W is held (the run does not have to be detected)."""
+        S = self.app.cfg["settings"]
+        if not S.get("cast_run") or getattr(self.app, "chat_open", False) is True or not self._phys[0x57]:
+            return False
+        T = self.app.tracker
+        a = T.armed
+        if not a or not T.is_spell(a[0]) or not T.on or not self.game_active():
+            return False
+        if self.over_window(pt) or self.slot_at(pt):
+            return False
+        return True
+
+    def _cr_lock_s(self):
+        try:
+            v = float(self.app.cfg["settings"].get("cast_run_lock", 1.0))
+            return v if v >= 0 else 1.0
+        except (TypeError, ValueError):
+            return 1.0
+
+    def cast_run_blocked(self, pt, t=None):
+        """True for a left click on the spell that was just cast-run, within the 'cast_run_lock' setting (seconds) of it."""
+        try:
+            t = time.time() if t is None else t
+            if t >= self._cr_block_until:
+                return False
+            a = self.app.tracker.armed
+            if not a or a[0] != self._cr_block_key or self.over_window(pt) or self.slot_at(pt):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def cast_run(self, pt):
+        try:
+            if self._cr_thread is not None and self._cr_thread.is_alive():
+                return False
+            if not self.cast_run_wanted(pt):
+                return False
+            self._cr_hold = True
+            self._cr_block_until = time.time() + self._cr_lock_s()
+            self._cr_block_key = self.app.tracker.armed[0]
+            self._cr_thread = threading.Thread(target=self._cast_run_seq, daemon=True)
+            self._cr_thread.start()
+            return True
+        except Exception:
+            self._cr_hold = False
+            return False
+
+    def _cast_run_seq(self):
+        clicked = False
+        try:
+            send_key("w", True)
+            send_key("w")
+            self._spin(1)
+            send_key("w", True)
+            self._spin(1)
+            send_click(False)
+            clicked = True
+            self._spin(10)
+            send_key("w")
+            if not self._phys[0x57]:
+                send_key("w", True)
+        except Exception:
+            pass
+        finally:
+            if not clicked:
+                try:
+                    send_click(False)                  # (the click must never get lost)
+                except Exception:
+                    pass
+
+    def _cast_run_up(self):
+        t = self._cr_thread
+        if t is not None:
+            t.join(0.5)
+        try:
+            send_click(True)
+        except Exception:
+            pass
+
+    def autoclick_wanted(self, pt):
+        S = self.app.cfg["settings"]
+        if not S.get("autoclick") or getattr(self.app, "chat_open", False) is True:
+            return False
+        T = self.app.tracker
+        a = T.armed
+        if a and T.is_spell(a[0]):
+            return False                              # holding a spell: the autoclicker is off
+        if self.over_window(pt) or self.slot_at(pt):
+            return False
+        return bool(self.game_active())
+
+    def autoclick(self, pt):
+        try:
+            if self._ac_thread is not None and self._ac_thread.is_alive():
+                return
+            if self.autoclick_wanted(pt):
+                self._ac_thread = threading.Thread(target=self._autoclick_loop, daemon=True)
+                self._ac_thread.start()
+        except Exception:
+            pass
+
+    def _autoclick_loop(self):
+        """AutoClick.ahk: the real click already went through; while the button stays held, click every 30 ms."""
+        try:
+            T = self.app.tracker
+            while self._lheld and not self.quit.is_set():
+                time.sleep(0.03)
+                if not self._lheld or getattr(self.app, "chat_open", False) is True or not self.game_active():
+                    break
+                a = T.armed
+                if a and T.is_spell(a[0]):
+                    break                             # a spell is held now: stop, and stay off until the button is pressed again
+                send_click(False)
+                send_click(True)
+        except Exception:
+            pass
+
     def _ms(self, n_code, w_param, l_param):
         try:
+            if n_code >= 0 and w_param in (WM_LBUTTONDOWN, WM_LBUTTONUP):
+                _inf = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if _inf.dwExtraInfo != TRAIN_TAG:
+                    self._lheld = (w_param == WM_LBUTTONDOWN)
             if n_code >= 0 and w_param in (WM_LBUTTONUP, WM_RBUTTONUP) and w_param in self._cl_swallow:
                 self._cl_swallow.discard(w_param)                # (the button that went down on the checklist doesn't come up in the game)
                 return 1
@@ -6317,7 +6597,25 @@ class InputWatcher(threading.Thread):
                     self.app.chat_open = False                                # a click closes the chat box
                 button = "left" if w_param == WM_LBUTTONDOWN else "right"
                 if info.dwExtraInfo != TRAIN_TAG:                              # (Snap Training's own click is ignored)
+                    if w_param == WM_LBUTTONDOWN and self.cast_run_blocked((info.pt.x, info.pt.y)):
+                        self._cr_drop_up = True
+                        return 1                                              # (a click right after a Cast Run is dismissed: not seen by the game or the tool)
                     self.events.put(("click", button, time.time(), (info.pt.x, info.pt.y)))
+                    if w_param == WM_LBUTTONDOWN and self.cast_run((info.pt.x, info.pt.y)):
+                        return 1                                              # (this click is sent by the Cast Run itself, between the W presses)
+                    if w_param == WM_LBUTTONDOWN:
+                        self.autoclick((info.pt.x, info.pt.y))
+            if n_code >= 0 and w_param == WM_LBUTTONUP and self._cr_drop_up:
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if info.dwExtraInfo != TRAIN_TAG:
+                    self._cr_drop_up = False
+                    return 1
+            if n_code >= 0 and w_param == WM_LBUTTONUP and self._cr_hold:
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if info.dwExtraInfo != TRAIN_TAG:
+                    self._cr_hold = False
+                    threading.Thread(target=self._cast_run_up, daemon=True).start()
+                    return 1
         except Exception:
             pass
         return self._next(n_code, w_param, l_param)
@@ -6351,6 +6649,13 @@ class InputWatcher(threading.Thread):
         """Only used if the hooks can't be installed: poll every 2 ms, also catching taps shorter than that."""
         self.mode = "poll"
         watch = [(vk, n) for vk, n in list(VK_NAME.items()) + list(LETTER_VK.items()) + [(0xC0, "inv")]] + [(VK_LBUTTON, "left"), (VK_RBUTTON, "right")]
+        for sc, n in SCAN_HOTBAR.items():                       # (the keys at the "-" / "=" places of THIS keyboard layout)
+            try:
+                vk = u32.MapVirtualKeyW(sc, 1)
+                if vk and all(vk != w[0] for w in watch):
+                    watch.append((vk, n))
+            except Exception:
+                pass
         prev = {}
         while not self.quit.is_set():
             for vk, name in watch:
@@ -6383,8 +6688,8 @@ class InputWatcher(threading.Thread):
             return True
         now = time.time()
         if now - self._title_t > 0.1:                         # asking Windows 100x a second is pointless
-            self._title, self._title_t = foreground_title().lower(), now
-        return want in self._title
+            self._title, self._title_t = foreground_is_game(want), now
+        return bool(self._title)
 
     def slot_at(self, pt):
         """The hotbar key of the slot under the click (None = not on the hotbar)."""
@@ -6410,6 +6715,9 @@ class InputWatcher(threading.Thread):
             self._down.pop(name, None)
             if name == "g":
                 self.app.g_t = t                                    # (a G tap or hold just ended: the mana dash failsafe)
+                self.app.g_held = False
+            if name == "w" and self.app.run_det.up(t):
+                self.app.q.put(("msg", "Stopped running."))
             return
         if name == "inv":                                   # the ` key: opens / closes the inventory
             if kind == "down" and not (name in self._down and t - self._down[name] < 2.0):
@@ -6425,6 +6733,8 @@ class InputWatcher(threading.Thread):
                 if not repeat and cb(name):
                     self.capture_cb = None
                 return
+            if name == "w" and not repeat and self.capture_cb is None and self.game_active():
+                self.app.run_det.down(t)
             if not repeat and self.game_active():
                 self.app.dash_press(name, t)
             return
@@ -6821,7 +7131,12 @@ def pick_family(root):
 # under the mana bar, always on top and never hidden by any setting. Needs opencv-python (the rest of the tool doesn't).
 # ----------------------------------------------------------------------------
 BARD_ICON_PNG = "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"
-BV_GAP_PX = 1.5           # "closed" = ring centre this many px outside the border
+BV_GAP_PX = 1.5           # "closed" = ring centre this many px outside the border (at 1080p; all the pixel sizes below scale with BV_K)
+BV_K = [1.0]              # screen height / 1080: set by Auto Bard when it starts, so it works on every resolution
+
+
+def bvk():
+    return BV_K[0]
 BV_IGNORE_TOP, BV_IGNORE_BOTTOM = 0.12, 0.17      # fractions of the screen height not looked at (top bar / hotbar)
 _bv_cv = [None, False]
 
@@ -6870,10 +7185,13 @@ def bv_prep(img):
     return mx, mn
 
 
-def bv_discover(img, known=(), min_r=15, max_r=120):
+def bv_discover(img, known=(), min_r=None, max_r=None):
     """Fast search for NEW circles: works on a half-size copy, skips spots in `known`
     (list of (x, y, radius) already being tracked), then measures candidates at full size."""
     cv2 = _bv_cv2()
+    k = bvk()
+    min_r = 15 * k if min_r is None else min_r
+    max_r = 120 * k if max_r is None else max_r
     small = cv2.resize(img, (img.shape[1] // 2, img.shape[0] // 2), interpolation=cv2.INTER_AREA)
     mx, mn = bv_prep(small)
     spread = cv2.subtract(mx, mn)
@@ -6927,7 +7245,7 @@ def bv_measure_bgr(img, cx, cy, r):
         dx, dy = res["off"]
         if dx * dx + dy * dy > (r * 0.5) ** 2:
             return res            # fit is nonsense (something covering the circle) - keep as is
-        if dx * dx + dy * dy < 0.25:
+        if dx * dx + dy * dy < 0.25 * bvk() ** 2:
             return res            # centred to within half a pixel
         cx, cy = cx + dx, cy + dy
     return res
@@ -6946,10 +7264,12 @@ def bv_measure_at(img, cx, cy, r):
     return res
 
 
-def bv_find_circles(img, min_r=15, max_r=120):
+def bv_find_circles(img, min_r=None, max_r=None):
     """Full-screen search. Returns list of dicts:
     x, y, r_fill, r_border (outer edge of dark border), ring (ring centre-line radius or None), merged."""
     cv2 = _bv_cv2()
+    min_r = 15 * bvk() if min_r is None else min_r
+    max_r = 120 * bvk() if max_r is None else max_r
     mx, mn = bv_prep(img)
     spread = cv2.subtract(mx, mn)
     fill = cv2.bitwise_and(cv2.inRange(spread, 0, BV_FILL_SPREAD), cv2.inRange(mx, 126, 255))
@@ -7035,7 +7355,7 @@ def bv_measure(mx, mn, cx, cy, r):
     r_border = r_edge * BV_BORDER_RATIO
 
     # 2) the ring: first bright band from just inside the border's outer edge outwards
-    start = max(0, int((r_border - 2.5 - radii[0]) / BV_STEP))
+    start = max(0, int((r_border - 2.5 * bvk() - radii[0]) / BV_STEP))
     rings = []
     nr = len(radii)
     for a in range(BV_RAYS):
@@ -7057,7 +7377,7 @@ def bv_measure(mx, mn, cx, cy, r):
     if len(rings) >= BV_RAYS * 0.3:
         rs = np.array(rings)
         med = np.median(rs)
-        good = rs[np.abs(rs - med) < 3]          # drop rays that hit something else
+        good = rs[np.abs(rs - med) < 3 * bvk()]          # drop rays that hit something else
         if good.size >= BV_RAYS * 0.25:
             ring = float(good.mean())
     return dict(x=float(cx), y=float(cy), r_fill=float(r), r_edge=r_edge, r_border=r_border, ring=ring,
@@ -7095,13 +7415,13 @@ class BardTrack:
             self.seen_ring = True
             self.last_ring = t
             # the game only redraws ~60 times a second: keep only frames where the ring actually moved
-            if self.samples and abs(self.samples[-1][1] - d["ring"]) < 0.08:
+            if self.samples and abs(self.samples[-1][1] - d["ring"]) < 0.08 * bvk():
                 return
             self.samples.append((t, d["ring"]))
             self.samples = self.samples[-60:]
 
     def gap(self):
-        return self.samples[-1][1] - self.border - BV_GAP_PX if self.samples else None
+        return self.samples[-1][1] - self.border - BV_GAP_PX * bvk() if self.samples else None
 
     def confirmed(self):
         """True once the ring has actually been seen shrinking. Anything round and white on screen
@@ -7110,7 +7430,8 @@ class BardTrack:
             return False
         shrink = self.samples[0][1] - self.samples[-1][1]
         span = self.samples[-1][0] - self.samples[0][0]
-        return shrink >= 2.0 and span > 0 and 3.0 <= shrink / span <= 600.0
+        k = bvk()
+        return shrink >= 2.0 * k and span > 0 and 3.0 * k <= shrink / span <= 600.0 * k
 
     def gap_at(self, t):
         """Ring-to-border gap now, moving the last measurement forward by the ring's speed
@@ -7145,9 +7466,9 @@ class BardTrack:
         if ts[-1] - ts[0] < 0.012:
             return None
         slope, icept = np.polyfit(ts, rs, 1)
-        if slope > -1.0:      # px/s - not shrinking
+        if slope > -1.0 * bvk():      # px/s - not shrinking
             return None
-        target = self.border + BV_GAP_PX
+        target = self.border + BV_GAP_PX * bvk()
         dt = (target - icept) / slope
         # lots of fresh samples: also allow for the ring speeding up / slowing down
         q = [s for s in self.samples if t_last - s[0] <= 0.25]
@@ -7209,7 +7530,7 @@ class BardBot:
             if near_done:
                 # same spot as a circle we just finished: only count it if it has a fresh, big ring
                 # (otherwise it's the old circle still fading out - clicking it again would be wrong)
-                if d["ring"] is None or d["ring"] - d["r_border"] < 12:
+                if d["ring"] is None or d["ring"] - d["r_border"] < 12 * bvk():
                     continue
                 for tr in near_done:
                     self.tracks.remove(tr)
@@ -7240,11 +7561,11 @@ class BardBot:
                 continue
             if t - tr.last_ring > 0.25 and not tr.merged:
                 g = tr.gap()
-                if g is not None and g < 6:
+                if g is not None and g < 6 * bvk():
                     cands.append(tr)     # ring vanished into the border: click it straight away
                     continue
                 tr.finish("skipped", t)   # ring lost while still far out - don't let it block the rest
-                bard_log(f"  skipped #{tr.id}: lost sight of its ring (gap was {g + BV_GAP_PX:.0f}px)")
+                bard_log(f"  skipped #{tr.id}: lost sight of its ring (gap was {g + BV_GAP_PX * bvk():.0f}px)")
                 continue
             cands.append(tr)
         if not cands:
@@ -7256,9 +7577,9 @@ class BardBot:
         bg = best.gap_at(t)
         for tr in cands[1:]:
             g = tr.gap_at(t)
-            if g is not None and bg is not None and g < bg - 8:
+            if g is not None and bg is not None and g < bg - 8 * bvk():
                 best, bg = tr, g
-        if bg is not None and bg < 15:
+        if bg is not None and bg < 15 * bvk():
             self.locked = best
         return best
 
@@ -7267,7 +7588,7 @@ class BardBot:
         """'now', a time to click at, or None if not predictable yet."""
         g = tr.gap()
         if tr.merged or (tr.ring_now and g is not None and g <= 0) or \
-                (not tr.ring_now and g is not None and g < 6):
+                (not tr.ring_now and g is not None and g < 6 * bvk()):
             return "now" if offset_s <= 0 else (tr.last_ring or t) + offset_s
         due = tr.predict()
         return None if due is None else due + offset_s
@@ -7332,6 +7653,7 @@ class AutoBard(threading.Thread):
                     top = int(m0["height"] * BV_IGNORE_TOP)
                     bottom = int(m0["height"] * (1 - BV_IGNORE_BOTTOM))
                     mon = dict(left=m0["left"], top=m0["top"] + top, width=m0["width"], height=bottom - top)
+                    BV_K[0] = self._screen_k(m0["height"])
                     ox, oy = mon["left"], mon["top"]
                     st = dict(ox=ox, oy=oy, W=mon["width"], H=mon["height"])
                 if bot is None:
@@ -7346,6 +7668,17 @@ class AutoBard(threading.Thread):
                     self._warned = True
                     self.app.q.put(("msg", f"Auto Bard error: {type(ex).__name__}: {ex}"))
                 time.sleep(0.2)
+
+    def _screen_k(self, mon_h):
+        """Screen height / 1080 (the game window's height when it is smaller than the screen): the circles' size and speed scale with it."""
+        h = float(mon_h or 1080)
+        try:
+            L, T, Wc, Hc = self.app._cl_client(time.time())
+            if 200 < Hc <= h * 1.02:
+                h = float(Hc)
+        except Exception:
+            pass
+        return max(0.4, min(4.0, h / 1080.0))
 
     def _grab(self, sct, box):
         t0 = time.perf_counter()
@@ -7666,9 +7999,11 @@ class App:
         self._edit_item = None                     # the decoration being moved / resized on screen (None = the mana picture)
         self._decor_imgs, self._decor_top = {}, 0.0
         self.decor_vars, self.decor_btns, self.decor_onbtns = {}, {}, {}
+        self.run_det = RunDetector()
         self.dashcd, self.dash_lock = DashCD(), threading.Lock()       # Dash / PB CD state (worked on by the key hook thread)
         self.dash_btns, self.dash_vars, self._dash_top, self._dash_cache = {}, {}, 0.0, {}
         self.g_dn = self.q_t = -1e9; self.last_q = None
+        self.g_held, self._last_pct = False, None
         self.g_t = -1e9                                                # when G was last pressed / let go
         self.inv_key_open, self.inv_key_t = False, -1e9                # the ` key's idea of "inventory open" / when it was pressed
         self.inv_learn_pending = None
@@ -8434,6 +8769,9 @@ class App:
             self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
             msg = f"'{nm}' is in your inventory now (white key box). Teach it under Extras > Inventory > Learn; its cast marks are under Mana Overlay > Inventory."
         else:
+            if any(m is not mv and m["key"] == mv["key"] and not m.get("ininv") for m in lst):
+                self.say(f"Key {mv['key']} is used by another {kind} now: free it (or give this one another key) first - the inventory spell can't go back onto a taken slot.", "Slot taken")
+                return "break"
             vk = inv_vkey(mv["name"])
             for mk in marks:
                 if mk["key"] == vk:
@@ -8780,17 +9118,30 @@ class App:
 
     def add_move(self, snap=False, spell=False):
         lst, what = (self.snaps(), "snap spell") if snap else (self.moves(), "spell" if spell else "move")
-        used = {m["key"] for m in lst}              # (Moves and Normal Spells share one list: a key holds one of them)
+        used = {m["key"] for m in lst if not m.get("ininv")}      # (Moves and Normal Spells share one list: a key holds one of them; spells kept in the inventory hold no hotbar slot)
         free = next((k for k in HOTBAR_KEYS if k not in used), None)
-        if free is None:
-            self.say(f"All 12 hotbar slots already have a {what}.", "Hotbar is full")
-            return
-        lst.append({"key": free, "name": "New snap", "cd": 10.0, "unequip": False} if snap
-                   else {"key": free, "name": "New spell" if spell else "New move", "cd": 10.0, "cd2": 0.0, "split": False,
-                         "unequip": False, **({"spell": True} if spell else {})})
+        base = "New snap" if snap else ("New spell" if spell else "New move")
+        d = ({"key": free or HOTBAR_KEYS[0], "name": base, "cd": 10.0, "unequip": False} if snap
+             else {"key": free or HOTBAR_KEYS[0], "name": base, "cd": 10.0, "cd2": 0.0, "split": False,
+                   "unequip": False, **({"spell": True} if spell else {})})
+        if free is None:                                          # all 12 slots are taken: this one goes straight into the inventory (white key box)
+            taken = {_norm_name(e["name"]) for e in inv_of(self.cfg)}
+            n = 1
+            while _norm_name(d["name"]) in taken:
+                n += 1
+                d["name"] = f"{base} {n}"
+            d["ininv"] = True
+        lst.append(d)
         lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+        if d.get("ininv"):
+            sync_inv_links(self.cfg)
         save_cfg(self.cfg)
         self.rebuild_moves()
+        if d.get("ininv"):
+            self.rebuild_marks()
+            self.say(f"All 12 hotbar slots are taken, so this {what} went straight to your inventory (white key box). Name it, then teach it under Extras > Inventory.",
+                     "Added to the inventory")
+            return
         self.say(f"Added a {what} on key {free}. Click its Key button to change the key.",
                  "Snap spell added" if snap else ("Spell added" if spell else "Move added"))
 
@@ -8923,8 +9274,12 @@ class App:
             return True
         now = time.time()
         if now - getattr(self, "_fg_t", 0.0) > 0.1:
-            self._fg_title, self._fg_t = foreground_title().lower(), now
-        return want in self._fg_title
+            self._fg_title, self._fg_t = foreground_is_game(want), now
+            if self._fg_title:
+                self._fg_true_t = now
+        # a look that says "not the game" for a moment (the focus flicks to one of our own overlay windows, a fullscreen game
+        # re-activating itself ...) must not make every box blink off: it takes 0.4 s of "no" to count
+        return bool(self._fg_title) or now - getattr(self, "_fg_true_t", -9.0) < 0.4
 
     def _mana_tick(self, now):
         S, m = self.cfg["settings"], self.cfg["mana"]
@@ -10340,7 +10695,7 @@ class App:
     def unlink_inv(self, e):
         """x on a linked entry: the spell goes back to the hotbar (the entry itself is rebuilt from the Main tab as long as it is in the inventory)."""
         lk = e.get("link") or {}
-        src = next((m for m in (self.snaps() if lk.get("kind") == "snap" else self.moves()) if m["key"] == lk.get("key") and m.get("ininv")), None)
+        src = next((m for m in (self.snaps() if lk.get("kind") == "snap" else self.moves()) if m.get("ininv") and m.get("iid") == lk.get("id")), None)
         if src is not None:
             self.toggle_in_inventory(src)
 
@@ -10696,6 +11051,7 @@ class App:
         if name == "g":
             self.g_t = t                                       # (for the mana dash failsafe below)
             self.g_dn = t
+            self.g_held = True
         if name == dkey:
             normal = ctrl_down()                              # Ctrl + Q: a normal dash, whatever the mana says
             use = self.mana_dash_on() and not normal
@@ -10811,7 +11167,15 @@ class App:
         a mana charge / the mana ding, and the whole time Soul Berserk / Flood Infinite runs."""
         if not self.mana_absent or self.mana_edit is not None or now < self.demo_until:
             return False
-        return not (now < self.mana_keep_until or self.tracker.soul_active(now) or self.tracker.flood_active(now))
+        return not (now < self.mana_keep_until or self.tracker.soul_active(now) or self.tracker.flood_active(now) or self.holding_spell(now))
+
+    def holding_spell(self, now):
+        """A spell (a snap spell, a Normal Spell or anything with a cast mark - also one kept in the inventory) is in your hand."""
+        try:
+            k = self.tracker.armed_key(now)
+            return bool(k) and bool(self.tracker.is_spell(k))
+        except Exception:
+            return False
 
     def mana_listen(self, now):
         """Listens for the mana ding (charge / full) while the mana picture is on: it keeps the picture on for MANA_KEEP s."""
@@ -10839,6 +11203,10 @@ class App:
             return
         self._mana_seen_now = True
         v = self.read_mana_pct()
+        if v is not None:
+            prev, self._last_pct = self._last_pct, v
+            if prev is not None and v > prev + 0.3 and (self.g_held or now - self.g_t <= MANA_G_KEEP):
+                self.mana_keep_until = max(self.mana_keep_until, now + MANA_G_KEEP)      # G charged the mana: the overlay stays on for 2 more seconds
         if self._mana_seen_now:                       # (the game's bar is on screen: both pictures show at once)
             self._mana_gone, self.mana_absent = 0, False
         else:                                         # (not there: the menus / loading; three looks in a row hide the pictures)
@@ -11125,6 +11493,8 @@ class App:
             frac = hp_fill_fraction(self._grab_rgb({"left": mon["left"] + int(mon["width"] * g[0]), "top": mon["top"] + int(mon["height"] * g[1]),
                                                     "width": max(1, int(mon["width"] * (g[2] - g[0]))), "height": max(1, int(mon["height"] * (g[3] - g[1])))}))
             self.tracker.hp_frac = (frac, now)
+            if frac is not None:
+                seen = True                                          # (the wide look found the bar's red / empty strip WITH its frame: it is there)
             if seen and self.tracker.bloodline_passive(frac, now):
                 self.q.put(("msg", f"Bloodline: below {BLOODLINE_PASSIVE_HP * 100:g}% HP - {BM_TITLE['bloodline']} for {BLOODLINE_PASSIVE_SECS:g}s (passive)."))
         except Exception:
@@ -11136,7 +11506,9 @@ class App:
                 self.inv_key_open = False
         else:
             self._hp_seen, self._hp_gone = 0, self._hp_gone + 1
-            if self._hp_gone >= 4:
+            if self._hp_gone >= 4 and self.cfg["settings"].get("always_show"):
+                self.hp_absent = False                               # ("Always show the coins and cooldowns": a missing HP bar hides nothing)
+            elif self._hp_gone >= 4:
                 if not self.hp_absent:
                     self._hp_absent_t = now                          # (since when: the cooldown boxes wait a moment more, see menu_hidden)
                 self.hp_absent = True
@@ -12930,7 +13302,7 @@ class App:
         want = str(S["game_title"]).strip().lower()
         if not S["only_in_game"] or not want:
             return True
-        return want in foreground_title().lower()
+        return foreground_is_game(want)
 
     def toggle_snap_training(self):
         if self.train and self.train.running:
@@ -13056,6 +13428,12 @@ class App:
         self.check_row(inner, "Show Cooldown Numbers On Non Hotkey/Inventory (Potions/Buffs etc)", "buff_numbers", wrap=250)
         self.check_row(inner, "Keep this window on top", "topmost",
                        extra=lambda v: self.root.attributes("-topmost", v))
+        self.check_row(inner, "Block Run: hold W and press F to block-run (W, F, W, super fast; holding F doesn't repeat it)", "block_run", wrap=230)
+        self.check_row(inner, "Only show the cooldown boxes, Mana Overlay, Decorations and Dash / PB coins while the game window is in front", "mana_only_focused", wrap=230)
+        self.check_row(inner, "Cast Run: casting a held spell (left click) while holding W keeps you running (W, click, W, super fast)", "cast_run", wrap=230)
+        self.check_row(inner, "Always show the cooldown boxes and coins (don't hide them when the HP bar isn't recognised)", "always_show", wrap=230)
+        self.check_row(inner, "Autoclicker: hold the left mouse button in the game to click every 30 ms (off while you hold a spell)", "autoclick", wrap=230)
+        self.entry_row(inner, "Cast Run: seconds the same spell can't be clicked again after a Cast Run (0 = no lock)", "cast_run_lock", float, w=56, h=24, wrap=230)
         self.entry_row(inner, "Game window title contains", "game_title", str, w=100, h=24, wrap=150)
         self.check_row(inner, "Show the little Scroom while this window is hidden and the game isn't in front", "mascot_on", wrap=230)
         for text, key, cast in (("Armed timeout (sec, 0 = never)", "arm_timeout", float),
@@ -13370,7 +13748,7 @@ class App:
             self.say(f"Key {name} kept.", "Key unchanged")
         else:
             lst, kind = self.list_of(mv)
-            other = next((m for m in lst if m is not mv and m["key"] == name), None)
+            other = next((m for m in lst if m is not mv and m["key"] == name and not m.get("ininv")), None)
             if other:                                        # the key is taken: SWAP the two moves
                 old = mv["key"]
                 self.tracker.swap_keys(old, name, snap=(kind == "snap"))
@@ -13522,6 +13900,8 @@ class App:
 
     def refresh(self):
         now = time.time()
+        if self.run_det.tick(now):
+            self.q.put(("msg", "Running."))
         if now - getattr(self, "_inv_sync_t", 0) > 1.0:            # spells kept in the inventory: their Extras entries follow the Main tab
             self._inv_sync_t = now
             try:
@@ -13776,9 +14156,14 @@ class App:
             states = [None] * len(HOTBAR_KEYS)                  # in the menu (no HP bar): hidden too
         if not any(states):
             if self._sig is not None:
-                self.ov.hide()
-                self._sig = None
+                if getattr(self, "_empty_t0", None) is None:
+                    self._empty_t0 = now
+                if now - self._empty_t0 >= 0.35:                # (a blink of "nothing to show" - a focus flick, a bad look - leaves the boxes alone)
+                    self.ov.hide()
+                    self._sig = None
+                    self._empty_t0 = None
             return
+        self._empty_t0 = None
         self.boxes_t = now                                      # (boxes are on the hotbar: see HotbarWatcher.feed)
         items = []
         for st in states:
@@ -13801,8 +14186,6 @@ class App:
                 rects[i] = (cx - rects[i][2] / 2.0, rects[i][1], rects[i][2], rects[i][3])
         sig = (tuple(items), tuple(sorted(bar.items())), S["box_grow"], S["opacity"], live)
         if sig != self._sig:
-            if self._sig is not None and self._sig[-1] != live:     # the slots moved: start the windows over, like a refocus does
-                self.ov.hide()
             self._sig = sig
             self.ov.show(rects, items, S["opacity"], self.num_family)
         elif now - self._top_t > 1.0:                           # stay above the game
