@@ -1,4 +1,4 @@
-version=1.3.0
-script_sha256=cc9e21b04691602f738af2eb66a0474b2c322f4e6b211eab24eeb7b835d1ad11
-exe_sha256=ee181c449e0e9b1b0552c3c1e87983f8d1c8be4c2b26bb7cf045fd24e63bf4f1
+version=1.3.1
+script_sha256=c48366587c4d690a9f380fe87c444c62424542cc2f4041e995fba1cd114f07b4
+exe_sha256=8e70d527addcbfaf62da0527b82e6d09d358ccb3921e72946cea295f415a5cf5
 exe_url=https://github.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/releases/latest/download/Rogue.Lineage.Assist.Tool.exe

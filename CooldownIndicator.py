@@ -58,10 +58,16 @@ try:
 except Exception as _ex:
     pyaudio, pyaudio_error = None, f"{type(_ex).__name__}: {_ex}"
 
-# ---- where files live: the script's folder, or the .exe's folder when built with PyInstaller ----
-if getattr(sys, "frozen", False):
-    APP_DIR = os.path.dirname(sys.executable)
-    RES_DIR = getattr(sys, "_MEIPASS", APP_DIR)
+# ---- where files live: the script's folder, or the .exe's folder when built (PyInstaller or Nuitka) ----
+IS_COMPILED = "__compiled__" in globals()                       # (Nuitka sets this; PyInstaller sets sys.frozen)
+IS_FROZEN = bool(getattr(sys, "frozen", False)) or IS_COMPILED
+if IS_COMPILED:                                                  # a Nuitka one-file exe runs from a temp folder: the real exe is where it was started from
+    EXE_PATH = os.path.abspath(getattr(globals()["__compiled__"], "original_argv0", None) or sys.argv[0])
+else:
+    EXE_PATH = sys.executable
+if IS_FROZEN:
+    APP_DIR = os.path.dirname(EXE_PATH)
+    RES_DIR = os.path.dirname(os.path.abspath(__file__)) if IS_COMPILED else getattr(sys, "_MEIPASS", APP_DIR)
 else:
     APP_DIR = RES_DIR = os.path.dirname(os.path.abspath(__file__))
 try:
@@ -76,7 +82,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -136,6 +142,7 @@ DEFAULT_SETTINGS = {
     "hyper_dur": 90.0, "hyper_cd": 30.0,        # Hyper Body
     "vind_dur": 5.0, "vind_cd": 10.0,            # Tempest Soul (Vind Soul)
     "flock_dur": 2.0, "flock_cd": 25.0,          # Flock (Flocked)
+    "psurge_dur": 2.5, "psurge_cd": 15.0,        # Power Surge
     "stand_dur": 30.0, "stand_cd": 6000.0,       # Bloodline (Last Stand, then a 5 s Red Veil debuff; the cooldown starts after it)
     "pto_dur": 60.0, "pto_cd": 6000.0,           # Galvanize (Potions Timeout: starts 1.8 s after the click)
     "song_switch_cd": 3.0,   # Songs: leaving a song before its Error Meter is empty puts the other songs on this cooldown (placeholder)
@@ -275,6 +282,12 @@ CHARGE_LIFETIME = 30.0      # a Charge is forgotten this many seconds after it w
 # the same 5 s limit. For both, the cooldown starts DIVE_CD_DELAY seconds after you come back down / up.
 BLADE_CRASH_NAME = "blade crash"
 DIVE_CD_DELAY = 1.0
+# WITHSTAND works like Rift Dive: the first click puts you in a stance for 3 s (a click ends it early), then the move goes on cooldown (8 s unless a
+# cooldown is typed in its box). The autoclicker stays off while it is in your hand.
+WITHSTAND_NAME = "withstand"
+WITHSTAND_MAX = 3.0         # seconds the stance lasts when you don't end it
+WITHSTAND_CD = 8.0          # its cooldown when the move's box is blank
+WITHSTAND_LOCK = 0.25       # a click in the first moments of the stance can't end it (spam failsafe, shorter than Rift Dive's)
 # VANGUARD: "Azure Ignition" (a left click, like a Charge) turns on the Azure variants of Brandish, Puncture and
 # Blade Crash. While it is on, using one of those moves puts the typed Azure cooldown on the move's slot in the blue
 # (M2) box - it shares its cooldown with the normal move. Only the names are built in; the cooldowns are typed.
@@ -342,6 +355,7 @@ BMOVES = {"agility": ("Agility", "agi_dur", "agi_cd", "Agility Duration"),
           "flood": ("Flood", "flood_dur", "flood_cd", "Flood Infinite Duration"),
           "tempest": ("Tempest Soul", "vind_dur", "vind_cd", "Vind Soul Duration"),
           "flock": ("Flock", "flock_dur", "flock_cd", "Flocked Duration"),
+          "powersurge": ("Power Surge", "psurge_dur", "psurge_cd", "Power Surge Duration"),
           "bloodline": ("Bloodline", "stand_dur", "stand_cd", "Last Stand Duration"),
           "galvanize": ("Galvanize", "pto_dur", "pto_cd", "Potions Timeout Duration"),
           "silverguard": ("Silverguard", None, None, ""),          # these two last until they are turned off (no duration / cooldown)
@@ -353,7 +367,6 @@ BM_TITLE = {"flood": "Flood Infinite", "floodfinite": "Flood Finite", "tempest":
 # buffs that are followed by a debuff (kind -> (debuff icon, seconds)): their cooldown starts when the debuff ends
 BM_DEBUFF = {"flood": ("floodfinite", FLOOD_DEBUFF), "bloodline": ("redveil", 5.0)}
 GALVANIZE_DELAY = 1.8              # Galvanize: the Potions Timeout debuff starts this long after the click
-BM_NO_RESET = ("bloodline", "galvanize", "flock")        # (only Flood is reset when the hotbar disappears)
 TOGGLE_LOCK = 1.0                  # seconds after turning one on in which it can't be turned off
 DBLOOD_DEAF = 2.5                  # seconds after turning Dragon Blood on in which its sound is ignored (that is the turning-on sound)
 BMOVE_BY_NAME = {_norm_name(v[0]): k for k, v in BMOVES.items()}
@@ -447,9 +460,18 @@ def is_blade_crash(name):
     return _norm_name(name) == BLADE_CRASH_NAME
 
 
+def is_axe_name(name):
+    """A weapon called Axe / Battle Axe / Greataxe ... (the word ends with 'axe')."""
+    return bool(re.search(r"axe\b", _norm_name(name)))
+
+
+def is_withstand(name):
+    return _norm_name(name) == WITHSTAND_NAME
+
+
 def is_dive_move(name):
     n = _norm_name(name)
-    return n == RIFT_DIVE_NAME or n == BLADE_CRASH_NAME
+    return n == RIFT_DIVE_NAME or n == BLADE_CRASH_NAME or n == WITHSTAND_NAME
 
 
 def clean_charged(d):
@@ -888,7 +910,7 @@ DASH_CD_DEFAULT = {"dash_cd": 1.5, "pb_cd": 3.0, "fist_cd": 2.8, "mana_dash_cd":
                    "dj_cd": 4.1, "dj_window": 0.5, "soul_dur": 25.0, "soul_cd": 35.0, "awk_dur": 25.5, "awk_cd": 60.0, "fisch_cd": 60.0,
                    "agi_dur": 10.0, "agi_cd": 30.0, "bane_dur": 10.0, "bane_dur_mana": 20.0, "bane_cd": 25.0,
                    "levi_dur": 35.0, "levi_cd": 40.0, "hyper_dur": 90.0, "hyper_cd": 30.0,
-                   "song_switch_cd": 3.0, "song_fail_cd": 10.0, "shard_cd": 15.0, "flood_dur": 30.0, "flood_cd": 6000.0, "vind_dur": 5.0, "vind_cd": 10.0, "flock_dur": 2.0, "flock_cd": 25.0,
+                   "song_switch_cd": 3.0, "song_fail_cd": 10.0, "shard_cd": 15.0, "flood_dur": 30.0, "flood_cd": 6000.0, "vind_dur": 5.0, "vind_cd": 10.0, "flock_dur": 2.0, "flock_cd": 25.0, "psurge_dur": 2.5, "psurge_cd": 15.0,
                    "stand_dur": 30.0, "stand_cd": 6000.0, "pto_dur": 60.0, "pto_cd": 6000.0}
 # where the in-game coins are on a 1920x1080 screen (x, y, w, h): they are scaled to your screen on the first start
 DASH_POS_1080 = {"dash": (1101, 928, 18, 18), "pb": (1129, 928, 18, 18), "fist": (1072, 928, 18, 18), "mana": (1171, 954, 105, 21),
@@ -1032,6 +1054,7 @@ def buff_art(kind, frac, size, text=""):
 
 BMOVE_PNG = {
     "tempest": "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",
+    "powersurge": "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",
     "flock": "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",
     "bloodline": "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",
     "redveil": "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",
@@ -1206,13 +1229,13 @@ def read_dodge_screen(arr, scale=1.0):
     ink = int(m.sum())
     if ink > T.sum() * 6:
         return None, None
-    best, bx, by = 0.0, 0, 0
     tsum = float(T.sum())
-    for dy in range(0, H - th + 1):
-        for dx in range(0, W - tw + 1):
-            sc = float((m[dy:dy + th, dx:dx + tw] & T).sum()) / tsum
-            if sc > best:
-                best, bx, by = sc, dx, dy
+    # how many of the label's pixels sit on ink at every position (a correlation: all positions at once, not one by one)
+    cor = np.fft.irfft2(np.fft.rfft2(m.astype(np.float32), s=(H, W)) * np.conj(np.fft.rfft2(T.astype(np.float32), s=(H, W))), s=(H, W))
+    cor = np.rint(cor[:H - th + 1, :W - tw + 1]).astype(np.int32)
+    by, bx = np.unravel_index(int(np.argmax(cor)), cor.shape)            # (the first best position, row by row)
+    by, bx = int(by), int(bx)
+    best = float(cor[by, bx]) / tsum if cor[by, bx] > 0 else 0.0
     if best < 0.55:
         return False, None
     x0 = bx + DODGE_NUM_DX
@@ -1558,6 +1581,8 @@ def mana_fill_boundary(arr, boxes=(), alpha=0.6, tol=24, tints=()):
 
 
 MANA_BAR_EMPTY, MANA_PRESENT_TOL = (82, 64, 73), 0     # the empty mana bar's colour, and how far off it may be to count as "the bar is on screen"
+# The game's whole UI is brighter in some scenes / lighting (about 1.85 times as bright, the light colours clip): the same bar then has these colours.
+MANA_BAR_EMPTY_BRIGHT = (151, 120, 136)
 MANA_G_KEEP = 2.0    # seconds the mana overlay stays on after G was pressed / held AND the mana % went up (even when the empty bar isn't seen)
 MANA_KEEP = 10.0     # seconds the mana overlay stays on after a charge / the mana ding even when the empty bar isn't seen
 
@@ -1576,7 +1601,8 @@ def mana_bar_present(arr, boxes=(), tints=(), alpha=0.6):
     if keep.sum() < 8:
         return True
     a = a[keep]
-    best = np.abs(a - np.array(MANA_BAR_EMPTY, dtype=np.int16)).sum(axis=2)        # (EXACTLY that colour: near colours don't count)
+    best = np.minimum(np.abs(a - np.array(MANA_BAR_EMPTY, dtype=np.int16)).sum(axis=2),
+                      np.abs(a - np.array(MANA_BAR_EMPTY_BRIGHT, dtype=np.int16)).sum(axis=2))        # (EXACTLY that colour: near colours don't count)
     tc = tinted_empty_colors(tints, alpha)
     if tc:                                                         # (empty bar under an overlay box: its blended colour counts as the empty bar)
         best = np.minimum(best, np.maximum(0, _near_any(a, tc) - 6))
@@ -1590,7 +1616,7 @@ def mana_frame_present(arr):
     a = np.asarray(arr)[..., :3].astype(np.int16)
     if a.shape[0] < 40 or a.shape[1] < 12:
         return False
-    return find_rails(np.abs(a - np.array(RAIL)).sum(axis=2) <= 30, max(30, int(a.shape[0] * 0.6))) is not None
+    return find_rails(_rail_mask(a, 30), max(30, int(a.shape[0] * 0.6))) is not None
 
 
 def pct_edit_picture(w, h):
@@ -1713,9 +1739,6 @@ class RunDetector:
             self.first = None                      # the first press was held, not a tap
         return False
 
-    def is_running(self, t):
-        return self.second is not None and (self.running or t - self.second >= self.RUN_HOLD)
-
     def tick(self, t):
         """True the moment the second press has been held long enough = running."""
         if self.second is not None and not self.running and t - self.second >= self.RUN_HOLD:
@@ -1799,10 +1822,6 @@ class DashCD:
             self.dash_len = cd
             return "dash"
         return None
-
-    def add_mana(self, t, mana_cd, timeout=0.0):
-        """G came just AFTER the dash: the blue coin is added to the normal dash that was already counted."""
-        return self._take_coin(t, mana_cd, timeout)
 
     def press_pb(self, t, cd):
         was_ready = self.pb_until <= t
@@ -2181,11 +2200,51 @@ def update_urls(base, info):
             "exe": info.get("exe_url") or base + UPDATE_EXE_NAME}
 
 
+def github_repo_of(base):
+    """'https://raw.githubusercontent.com/OWNER/REPO/BRANCH/' -> ('OWNER', 'REPO'); None for any other link."""
+    m = re.match(r"^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/", str(base or "").strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
+def parse_release_info(text):
+    """The answer of GitHub's  /repos/OWNER/REPO/releases/latest  -> the same dict version.txt gives (version, notes, exe_url, exe_sha256,
+    script_url, script_sha256). Raises UpdateError when it isn't a usable release."""
+    try:
+        rel = json.loads(text)
+        tag = str(rel["tag_name"])
+    except Exception:
+        raise UpdateError("GitHub's answer isn't a release.")
+    if parse_version(tag) is None:
+        raise UpdateError(f"The latest release is called '{tag}': that isn't a version number.")
+    info = {"version": tag.strip().lstrip("vV")}
+    notes = next((ln.strip() for ln in str(rel.get("body") or "").splitlines() if ln.strip()), "")
+    if notes:
+        info["notes"] = notes[:200]
+    for asset in rel.get("assets") or []:
+        name, url = str(asset.get("name") or ""), str(asset.get("browser_download_url") or "")
+        digest = str(asset.get("digest") or "")
+        kind = "exe" if name.lower().endswith(".exe") and "exe_url" not in info else ("script" if name == UPDATE_SCRIPT_NAME else None)
+        if kind and url.startswith("https://"):
+            info[kind + "_url"] = url
+            if digest.lower().startswith("sha256:"):
+                info[kind + "_sha256"] = digest[7:].strip().lower()
+    return info
+
+
 def check_for_update(base, current=APP_VERSION, fetch=None):
-    """-> (info dict, True when it is newer than `current`). Raises UpdateError."""
+    """-> (info dict, True when it is newer than `current`). Raises UpdateError.
+    A GitHub link asks GitHub's API for the latest release (one small call: version, notes, the exe and its checksum); when that isn't
+    possible (no release yet, the API is busy) the version.txt of the folder is used."""
     fetch = fetch or fetch_url
     if not str(base or "").strip():
         raise UpdateError("No update link is set (Settings > Update link).")
+    repo = github_repo_of(base)
+    if repo:
+        try:
+            info = parse_release_info(fetch(f"https://api.github.com/repos/{repo[0]}/{repo[1]}/releases/latest", 400000).decode("utf-8", "replace"))
+            return info, newer_version(info["version"], current)
+        except UpdateError:
+            pass
     raw = fetch(update_urls(base, {})["info"], 40000)
     info = parse_update_info(raw.decode("utf-8", "replace"))
     return info, newer_version(info["version"], current)
@@ -2284,7 +2343,7 @@ def run_update(base, frozen, target, fetch=None):
 
 def restart_command(frozen, target, environ):
     """-> (command, Popen keyword arguments) for starting the program again after an update."""
-    env = {k: v for k, v in environ.items() if k != "_MEIPASS2" and not k.startswith("_PYI")}
+    env = {k: v for k, v in environ.items() if k != "_MEIPASS2" and not k.startswith(("_PYI", "NUITKA_ONEFILE"))}
     env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"         # (PyInstaller 6.9+: the new copy unpacks itself fresh)
     if frozen:
         cmd = f'cmd /c ping -n 4 127.0.0.1 >nul & start "" "{target}"'      # wait ~3 s: the old copy (and its temp folder) is gone by then
@@ -2301,9 +2360,9 @@ def restart_command(frozen, target, environ):
 
 def cleanup_old_exe():
     """After an exe update the previous exe is parked as .old: remove it."""
-    if getattr(sys, "frozen", False):
+    if IS_FROZEN:
         try:
-            os.remove(sys.executable + ".old")
+            os.remove(EXE_PATH + ".old")
         except Exception:
             pass
 
@@ -2492,6 +2551,13 @@ class Tracker:
                 and not is_azure_ignition(mv.get("name")) and azure_kind(mv.get("name")) is None and not is_the_soul(mv.get("name")) and not is_decompose(mv.get("name"))
                 and not mv.get("zero")                                  # (a cooldown typed as 0 = a real move that simply has no cooldown; only a BLANK box is a weapon)
                 and not mv.get("spell") and not mv.get("soul") and not mv.get("awk") and not mv.get("bmove") and not mv.get("pick"))      # (the Pickaxe is no weapon either) # (Soul Rip / Awakened / the buff moves have a blank cooldown but are no weapons)
+
+    def no_autoclick(self, key):
+        """The autoclicker stays off while this key's move is in your hand: a spell, or Withstand (also while its stance lasts)."""
+        if self.is_spell(key):
+            return True
+        mv = self.move_for(key)
+        return bool(mv) and is_withstand(mv.get("name"))
 
     def is_spell(self, key):
         """A key is a SPELL when it has a snap spell or a cast mark on the mana bar (spells need no weapon).
@@ -2746,7 +2812,7 @@ class Tracker:
                 self._dive_tick(now)                        # (after 5 s you came up by yourself)
                 if self.dive:
                     key, t0 = self.dive[0], self.dive[1]
-                    if now - t0 < DIVE_LOCK:
+                    if now - t0 < self._dive_lock(key):
                         return None                         # failsafe: clicks in the first second do nothing
                     m = self._surface(now)                  # ANY left click brings you up
                     self._note(key, "stop", True, now)
@@ -2923,6 +2989,11 @@ class Tracker:
         if kind == "galvanize":
             return f"{BM_TITLE[kind]} ({key}): starts in {GALVANIZE_DELAY:g}s, lasts {dur:g}s ({cd:g}s cooldown after it)"
         return f"{BMOVES[kind][0]} ({key}): {dur:g}s, then {cd:g}s cooldown{back}"
+
+    def power_surge_on(self, now):
+        """The Power Surge buff is on right now (lock held)."""
+        st = self.bm.get("powersurge")
+        return bool(st) and st["t0"] <= now < st["t1"]
 
     def dragon_blood_on(self, now=None):
         with self.lock:
@@ -3195,7 +3266,13 @@ class Tracker:
     def _dive_len(self, key):
         """How long Rift Dive (DIVE_MAX) / Blade Crash (BLADE_MAX) lasts when you don't click again."""
         mv = self.move_for(key)
+        if mv and is_withstand(mv.get("name")):
+            return WITHSTAND_MAX
         return BLADE_MAX if (mv and is_blade_crash(mv.get("name"))) else DIVE_MAX
+
+    def _dive_lock(self, key):
+        mv = self.move_for(key)
+        return WITHSTAND_LOCK if (mv and is_withstand(mv.get("name"))) else DIVE_LOCK
 
     def _dive_tick(self, now):
         """Rift Dive / Blade Crash: after its length you come back by yourself (the cooldown starts then). Lock held."""
@@ -3208,7 +3285,10 @@ class Tracker:
         mv = self.move_for(key)
         akind = azure_kind(mv.get("name")) if mv else None
         cd = (self._azure_cd(akind) if variant else float(mv.get("cd") or 0.0)) if mv else 0.0
-        start = at + DIVE_CD_DELAY                      # the cooldown starts a moment after you are back
+        ws = bool(mv) and is_withstand(mv.get("name"))
+        if ws and cd <= 0:
+            cd = WITHSTAND_CD
+        start = at + (0.0 if ws else DIVE_CD_DELAY)     # the cooldown starts a moment after you are back (Withstand: at once)
         if cd > 0:
             if variant:
                 self.m2_ready[key], self.m2_total[key] = start + cd, cd
@@ -3219,8 +3299,14 @@ class Tracker:
                 if akind:
                     self.m2_ready.pop(key, None)
                     self.m2_total.pop(key, None)
-        what = "back down" if is_blade_crash(mv.get("name") if mv else "") else "back up"
+        what = "stance over" if ws else ("back down" if is_blade_crash(mv.get("name") if mv else "") else "back up")
         return f"{(mv['name'] if mv else '') or 'Dive'} ({key}): {what}" + (f" - cooldown {cd:g}s started" if cd > 0 else "")
+
+    def dive_is_withstand(self):
+        """The Withstand stance is on right now."""
+        d = self.dive
+        mv = self.move_for(d[0]) if d else None
+        return bool(mv) and is_withstand(mv.get("name"))
 
     def dive_snapshot(self, now):
         """{key: (seconds left under the ground / in the air, DIVE_MAX)} while Rift Dive / Blade Crash is active."""
@@ -3240,9 +3326,9 @@ class Tracker:
             return None                      # still cooling down
         self.dive = (key, now, variant)
         self._unequip_after(key)
-        where = "in the air" if is_blade_crash(mv.get("name")) else "underground"
+        where = "in the stance" if is_withstand(mv.get("name")) else ("in the air" if is_blade_crash(mv.get("name")) else "underground")
         return (f"{'Azure ' if variant else ''}{mv['name'] or key} ({key}): {where} - left click to end it "
-                f"(not in the first {DIVE_LOCK:g}s), or wait {self._dive_len(key):g}s")
+                f"(not in the first {self._dive_lock(key):g}s), or wait {self._dive_len(key):g}s")
 
     def _azure_active(self, now):
         if self.azure_on and now - self.azure_at > AZURE_LIFETIME:
@@ -3609,6 +3695,8 @@ class Tracker:
             cd = DECOMPOSE_M2                # (hardcoded; the state stays on: only the next left click ends it)
         if cd <= 0:
             return None                      # M2 left blank: a right click does nothing for this move
+        if mv and is_axe_name(mv.get("name")) and not mv.get("spell") and self.power_surge_on(now):
+            return f"{mv['name'] or key} ({key}) M2: no cooldown during Power Surge"     # an axe's M2 is free while Power Surge lasts
         shared = self._shared(mv)
         busy = max(self.m2_ready.get(key, 0.0), self.ready_at.get(key, 0.0)) if shared else self.m2_ready.get(key, 0.0)
         if busy - now > S["grace"]:
@@ -3873,7 +3961,7 @@ class Tracker:
             self._dive_tick(time.time() if now is None else now)
             if self.dive and self.move_for(self.dive[0]):
                 nm = self.move_for(self.dive[0])["name"] or "Rift Dive"
-                return f"{nm} ({self.dive[0]}) - {'in the air' if is_blade_crash(nm) else 'underground'}"
+                return f"{nm} ({self.dive[0]}) - {'in the stance' if is_withstand(nm) else ('in the air' if is_blade_crash(nm) else 'underground')}"
             key = self.running
         sp = (self.snap_for(key) or self.inv_snap(key)) if key else None
         return f"{(sp['name'] if sp else '') or key} ({key})" if key and sp else None
@@ -4106,6 +4194,17 @@ def _identify_exact(tabs, templates):
 RAIL = (230, 171, 113)               # the orange side rails of the in-game mana bar frame (and of the picture)
 
 
+def _bright_cream(a):
+    """Light cream pixels: the bright UI's frame (255,255,201), also its soft edges (222,216,170)."""
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    return (r >= 215) & (g >= 205) & (b >= 150) & (b <= r - 28) & (np.abs(r - g) <= 40)
+
+
+def _rail_mask(a, tol):
+    """Pixels that have the colour of the mana bar's side rails (normal or bright UI)."""
+    return (np.abs(a - np.array(RAIL)).sum(axis=2) <= tol) | _bright_cream(a)
+
+
 def find_rails(mask, min_len):
     """Two long vertical orange rails side by side -> ((xa, xb, ya, yb), (xa, xb, ya, yb)) or None.
     Each rail is a group of neighbouring columns (the frame's rail is 2 px wide)."""
@@ -4137,7 +4236,7 @@ def find_mana_bar(rgb):
     """Screenshot -> the two rails of the mana bar frame (left part of the screen), or None."""
     H, W = rgb.shape[:2]
     a = rgb[:, : int(W * 0.4)].astype(np.int16)
-    return find_rails(np.abs(a - np.array(RAIL)).sum(axis=2) <= 24, max(60, int(H * 0.12)))
+    return find_rails(_rail_mask(a, 24), max(60, int(H * 0.12)))
 
 
 def image_rails(img):
@@ -4602,7 +4701,7 @@ SEND_VK["f"] = 0x46
 SEND_VK["shift"] = 0xA0                        # (left Shift: the Shiftlock key)
 
 
-MANA_EMPTY_COLORS = ((82, 64, 73), (91, 72, 79), (65, 51, 58))    # the in-game mana bar when nothing fills it
+MANA_EMPTY_COLORS = ((82, 64, 73), (91, 72, 79), (65, 51, 58), (151, 120, 136), (167, 132, 145), (120, 94, 107))    # the in-game mana bar when nothing fills it
 
 
 def mana_strip_empty(arr, need=0.5, tol=24, tints=(), alpha=0.6):
@@ -4990,7 +5089,7 @@ class AudioListener:
         if not self.available():
             if not IS_WIN:
                 self.error = "Sound detection only works on Windows"
-            elif getattr(sys, "frozen", False):
+            elif IS_FROZEN:
                 self.error = "This .exe was built without sound detection - rebuild it with the newest build kit"
             else:
                 self.error = f"PyAudioWPatch isn't installed for this Python ({pyaudio_error})"
@@ -5260,17 +5359,12 @@ GATE_BASE = ("Sigil", "Skycastle", "Snail")                                    #
 GATE_AREAS = (("Forest", 5), ("Desert", 5), ("Deepforest", 5), ("Shore", 4), ("Tundra", 7), ("Canyon", 9))     # the boxes on the right, in this order
 GATE_PAGE_ORDER = ("Desert", "Forest", "Shore", "Tundra", "Deepforest", "Canyon")                          # the order of the "Unpinned Gates Location" list
 GATE_RANDOM = ("Sigil", "Skycastle", "Snail", "Deepforest", "Forest", "Tundra", "Shore", "Desert", "Canyon")     # the random gate picks one of these
-def gate_icon(size=48):
-    """A little stone gate (an arch), for Extras > Other Stuff."""
-    im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    b, t = (66, 53, 41, 255), (216, 188, 161, 255)
-    d.rectangle([6, 8, size - 7, size - 4], fill=b)
-    d.rectangle([9, 11, size - 10, size - 6], fill=t)
-    d.ellipse([14, 14, size - 15, size + 10], fill=b)
-    d.ellipse([17, 17, size - 18, size + 7], fill=(30, 24, 20, 255))
-    d.rectangle([17, size // 2 + 4, size - 18, size - 6], fill=(30, 24, 20, 255))
-    return im
+GATE_ICON_PNG = "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"
+
+
+def gate_icon():
+    """The picture for Extras > Other Stuff > Gate."""
+    return Image.open(io.BytesIO(base64.b64decode(GATE_ICON_PNG))).convert("RGBA")
 
 
 GATE_ROWS = 6                                                                  # boxes shown at once in a column (more: scroll)
@@ -5610,6 +5704,8 @@ class Brewer:
                     if self._select(q, pick):
                         held = q
                     for _i in range(max(1, int(q.get("clicks", 1)))):
+                        if _i and self.recipe.get("weapons"):
+                            self._select(q, pick)            # Weapons: the anvil takes the item out of your hand, so it is picked again before every click
                         self._click_at(self.recipe["pot"])
                         self._wait(gap)
                 gap, pick, spoon = tuple(self.delays())[:3]
@@ -6700,7 +6796,6 @@ INV_REF_W = 961.0                        # width of the panel (border to border)
 INV_CARD0, INV_PITCH, INV_CARD = (14.0, 15.0), 70.0, 60.0     # first card's corner, card pitch, card size (at INV_REF_W)
 INV_FRAC = (0.2495, 0.425, 0.7505, 0.926)   # where the panel sits on the screen (fractions) - used when it can't be measured
 INV_HIDE_COINS = ("dash", "pb", "fist", "mana", "jump")   # the coins that hide while the inventory is open
-INV_ITEMS = ("Fire Protection", "Feather Feet")   # the items the macro learns / knows (Settings > Inventory)
 INV_SIG_W, INV_SIG_H = 40, 16
 INV_BUILTIN = {"Fire Protection": "AAAAAAAAAAAAAAAIXZbGrHQ9QEA+AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABVp2jlc7KExSZTlEJxEZNjwjBgAAAAAAAAAAAAAAAAAAAAAAAAAAAAJXZXEnGRVSWohXYCguRnN5TyMAAAAAAAAAAAAAAAAAAAAAAAAAAAACV2VxJBYSX2izdH0oSmKPeU8jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAldlcSQWDFldrllVAFVzhGRFNQAAAAAAAAAAAAAAAAAAAAAAAAAAAANKS0gBAAdOVJVRSwQ5VmRRNScAAAAAAAAAAAAAAAAAAAAAAAAAAAADLS4sAQAFMDVbNC4EHTlIUTUnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhARDwEABBIWIRYSBAEPHSscDgAAAAAAAAAAAAAqHA0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAYGBgAAAAAAAAAAND8xGQAAAAAAAAAAAAMDAwAAAAAAAAAAAAABAQUYGBQAAAAAAAAAADZeTzkQHh4RChUjHBgqOC8QDhseEQMNGx8cJCUiJyMcDRsbDgMQHScXX19MIC4tEhslRjw6VFVLLC88Py48MT8rIzo0MjAtQC5GQzEeHy02WmtPNC89PBIqNFlOTX1wZUlokZRmdU1bKyRIQzwuKl1KZGFPPC89RFhNMRYvLywBMC9PSEuAWFVVfZmJYZpfXxIMNy4vLy+AXm5oX1MvLytPMhQLOjovAC9LcFxCcm9vVHuzvX5/WXZCJUA8RDg2Z119d1ZAODgtBQMAEkREMgAwaaJ+RmKGiFRimL1+ZFuTf0ROSVpCPE1gmY9SK0JCMA==", "Health Potion": "fW9iDQYZbnBXAgAAAAAAAAAAAAAAAAAAD15eTxAfHxAQZWVVAAAAAG1kWwYDDmNkVgEAABk2Uj8pDSE3VEIvEhJbW2dBbXRPLWZxgkhTQjFdZ3ErKy51Z1UAABxGcYN8dEVCPmRqcUspWVlrX6etbCdga4JIV2NuXWdxKysudWdVAAA5Yo2DfHRFX3CjqbeERllZbW3CxngnYGuCSFmAqF1ncSsrLnVnVQAAVXOCP1V8anJVcYjGqllZWVhYrapVBFlZVQAHXLFUTkgCAQhPT0cAADlWZDlDXE1saYWHqo5OTk5ISI+aVBVPUEkCCVCXNTEsAgEGMTErAAAdOUg5Q1xNUDdGSGVVMDAwKypVYTgTMjMtAggyXRYTEAIBBRMTDgAAAQ8dKysrHBsbJScnHRMTEg4OHCgcEhQVEQIGFSMXISsrKRsNAAAAAAAAAAAAAAAAAAAMGBgMAAAAAAAAAAAAAAAAAAAANj9HKz5JOxkAAAAAAAAAAAADAwMELFRQKAAAAAAAAAAAAAAAAAAAAFVcYytCals2AAAOHCkcDgsVNDgxGUF0bTYADRwpKhsOAxIcJiYpIRhdWVUAL3Z2Rx05SzxASTolGFNVTRtTl45HHS48QFBbOh4vOkMmMUVYXXWOU15wVS45coNZRWlbQxpvcGcYUZSORzlKWUVYgFs8TVdfJjJikl11jlNaTzUSVaqzXilvb1IHXFhVBFmuqlVVXl4pQI9vU1lZVQAKX7RqfZBWRSgNADx4mXljd1o3BFlvcCZitapVPF15Y2eAWkBgZVoFD2S5dmhaBQMAAAAiRYOYr4pSGgFWhotIbLuqVSJgmK+ri1IrZ3FfChtwxQ=="}   # from a 1080p screenshot; Learn replaces it
 INV_MATCH = 0.62
@@ -6818,6 +6913,7 @@ def hp_fill_box(W, H):
 
 HP_FRAME = (230, 171, 113)                   # the light frame lines of the HP bar
 HP_DARK = (66, 53, 41)                       # its dark outline
+HP_FRAME_BRIGHT, HP_DARK_BRIGHT = (255, 255, 201), (131, 105, 85)      # the same when the game's UI is bright
 
 
 BLOODLINE_PASSIVE_HP = 0.20                  # Bloodline's passive starts below this HP...
@@ -6830,15 +6926,19 @@ def hp_fill_fraction(rgb):
     """rgb = a wide grab of the screen's lower middle (HP_FILL_AREA). How full the HP bar is (0.0 - 1.0): the red part of the bar
     against the bar's empty (dark purple-grey) part, found by colour in the long horizontal strip they make together.
     None when no bar is found (the grass, menus ...)."""
-    a = np.asarray(rgb)[..., :3].astype(np.int16)
+    a = np.asarray(rgb)[..., :3]
     H, W = a.shape[:2]
     if H < 8 or W < 80:
         return None
-    r, g, b = a[..., 0], a[..., 1], a[..., 2]
-    red = (r >= 140) & (g <= 95) & (b <= 85) & (r - g >= 90)
-    emp = (r >= 50) & (r <= 110) & (r - g >= 8) & (r - g <= 32) & (b - g >= 2) & (b - g <= 18)
+    r, g, b = (np.ascontiguousarray(a[..., i]).astype(np.int16) for i in range(3))
+    rg = r - g
+    red = (r >= 140) & (g <= 95) & (b <= 85) & (rg >= 90)
+    bg = b - g
+    emp = (r >= 50) & (r <= 110) & (rg >= 8) & (rg <= 32) & (bg >= 2) & (bg <= 18)
     m = red | emp
-    m = m | np.roll(m, 1, axis=1) | np.roll(m, -1, axis=1) | np.roll(m, 2, axis=1) | np.roll(m, -2, axis=1)   # (the thin edge between red and empty)
+    n = m.copy()                                                # (the thin edge between red and empty: every pixel up to 2 away counts too)
+    n[:, 1:] |= m[:, :-1]; n[:, :-1] |= m[:, 1:]; n[:, 2:] |= m[:, :-2]; n[:, :-2] |= m[:, 2:]
+    m = n
     cand = []                                                   # (start, end, red share) of the long strips, row by row
     for y in range(H):
         row = m[y]
@@ -6861,10 +6961,14 @@ def hp_fill_fraction(rgb):
         return None
     # only the bar counts: its light frame must run along the strip's top and bottom edge (the same colours on iron bars, lamps,
     # scenery ... without that frame are NOT the HP bar; a hidden frame = no reading)
-    tan = (r >= 170) & (r <= 245) & (g >= 120) & (g <= 190) & (b >= 70) & (b <= 135) & (r - g >= 35) & (r - g <= 80) & (g - b >= 30)
     lo, hi = int(np.median([c[0] for c in best])), int(np.median([c[1] for c in best]))
     y0, y1 = min(c[3] for c in best), max(c[3] for c in best)
     wid = max(1, hi - lo)
+    ya, yb = max(0, y0 - 8), min(H, y1 + 9)                     # (only the rows around the strip are looked at)
+    tan = np.zeros((H, W), dtype=bool)
+    sl = (slice(ya, yb), slice(None))
+    tr, tg, tb = r[sl], g[sl], b[sl]
+    tan[sl] = (tr >= 170) & (tr <= 245) & (tg >= 120) & (tg <= 190) & (tb >= 70) & (tb <= 135) & (tr - tg >= 35) & (tr - tg <= 80) & (tg - tb >= 30)
 
     def edge(rows):
         return any(0 <= yy < H and tan[yy, lo:hi].sum() >= 0.6 * wid for yy in rows)
@@ -6927,33 +7031,45 @@ def error_meter_read(rgb, sh=1080.0):
     return None
 
 
+def _longest_runs(m):
+    """Per row of a boolean picture: the longest unbroken run of True (all rows at once)."""
+    H, W = m.shape
+    pad = np.zeros((H, W + 2), dtype=np.int8)
+    pad[:, 1:-1] = m
+    d = np.diff(pad, axis=1)
+    sr, sc = np.nonzero(d == 1)
+    _, ec = np.nonzero(d == -1)
+    out = np.zeros(H, dtype=int)
+    if len(sr):
+        np.maximum.at(out, sr, ec - sc)
+    return out
+
+
+def _near(pr, pg, pb, color, tol):
+    """Boolean picture: the pixel's colour is within `tol` (sum of the channel differences) of `color`; pr/pg/pb = the int16 channel planes."""
+    return (np.abs(pr - color[0]) + np.abs(pg - color[1]) + np.abs(pb - color[2])) <= tol
+
+
 def hp_bar_visible(rgb):
     """rgb = the HP bar area of a screenshot (HP_BAR_FRAC). True when the bar's FRAME is there: two long, straight, light
     frame lines about a bar apart (top and bottom edge) with the dark outline right inside them. Grass or other scenery
     can be the same red as the bar, but it never has these exact straight lines. (The game hides the whole bar while the
     inventory is open.) The red fill, the numbers and the small bars don't matter."""
-    a = rgb.astype(np.int16)
-    H, W = a.shape[:2]
+    H, W = rgb.shape[:2]
     if H < 8 or W < 40:
         return False
+    pr, pg, pb = (np.ascontiguousarray(rgb[..., i]).astype(np.int16) for i in range(3))
     sh = 1080.0                                                      # (the bar keeps its pixel size on every resolution: sizes below are those of a 1080p screen)
 
-    def longest(m):
-        """Per row: the longest unbroken run of matching pixels."""
-        out = np.zeros(m.shape[0], dtype=int)
-        for y in range(m.shape[0]):
-            d = np.diff(np.concatenate(([0], m[y].astype(np.int8), [0])))
-            st, en = np.nonzero(d == 1)[0], np.nonzero(d == -1)[0]
-            if len(st):
-                out[y] = int((en - st).max())
-        return out
+    longest = _longest_runs
     # The bar's LENGTH is not fixed: it grows with the player's health (about 0.16 of the screen's width on a 2560x1440 screen, 0.21 for
     # others), so a line counts when a good stretch of the grab is unbroken light colour - not a share of the whole grab's width.
     need = min(0.30 * W, 120.0)                                      # (pixels: the bar is ~400 px long when full)
-    light = longest(np.abs(a - np.array(HP_FRAME, dtype=np.int16)).sum(axis=2) <= 70) >= need
+    light = (longest(_near(pr, pg, pb, HP_FRAME, 70)) >= need) | (longest(_near(pr, pg, pb, HP_FRAME_BRIGHT, 40)) >= need)
     # (the dark outline is only a pixel or two thick and gets blended with the red / the frame when the screen isn't 1080p: any DARK
     # row - every channel low - counts, not only the exact outline colour)
-    dark = (longest(np.abs(a - np.array(HP_DARK, dtype=np.int16)).sum(axis=2) <= 30) >= need * 0.8) | (longest(a.max(axis=2) <= 125) >= need * 0.8)
+    dark = (longest(_near(pr, pg, pb, HP_DARK, 30)) >= need * 0.8) | (longest(np.maximum(np.maximum(pr, pg), pb) <= 125) >= need * 0.8) \
+        | (longest(_near(pr, pg, pb, HP_DARK_BRIGHT, 60)) >= need * 0.8)
     lines = []                                                        # centres of the groups of frame-line rows
     for y0, y1 in _runs(light, 1):
         if y1 - y0 + 1 <= 0.012 * sh:
@@ -7435,10 +7551,11 @@ class InputWatcher(threading.Thread):
                     if real and not self._chat_typing() and self._gate_filter(info, is_down):
                         return 1                                       # (the gate shortcut boxes / a gate keybind took this key - also while the climb check
                                                                        # thinks the mana drains slowly: casting a Gate drains it too)
+                    if real and (not is_down or not self._chat_typing()) and self._kb_filter(info, is_down):
+                        return 1                                       # (a keybind took this key - also while climbing: the climb check only pauses Block Run / AutoHotkey,
+                                                                       # not the keybinds. A release always gets here, so a held keybind never sticks.)
                     if keys_off(self.app):
-                        return self._next(n_code, w_param, l_param)    # (chat: nothing else is looked at)
-                if real and self._kb_filter(info, is_down):
-                    return 1                                           # (a keybind took this key)
+                        return self._next(n_code, w_param, l_param)    # (chat / climbing: nothing else is looked at)
                 if physical:
                     if is_down:
                         if info.vkCode not in self._ac_kheld or self.ac_capture is not None or self.vir_capture is not None:
@@ -7898,9 +8015,6 @@ class InputWatcher(threading.Thread):
         except Exception as e:
             return f"error {e!r}"
 
-    def gf_wanted(self, pt, t=None):
-        return self.gf_why(pt, t) == "ok"
-
     GF_SCAN = {"g": 0x22, "f": 0x21}                           # the keys of the snap Ignis sequence, by scan code
 
     @staticmethod
@@ -8136,8 +8250,8 @@ class InputWatcher(threading.Thread):
             return False                              # no health bar (inventory / menu): the autoclicker waits
         T = self.app.tracker
         a = T.armed
-        if a and T.is_spell(a[0]):
-            return False                              # holding a spell: the autoclicker is off
+        if a and T.no_autoclick(a[0]):
+            return False                              # holding a spell (or Withstand): the autoclicker is off
         if self.over_window(pt) or self.slot_at(pt):
             return False
         return bool(self.game_active())
@@ -8165,8 +8279,8 @@ class InputWatcher(threading.Thread):
                     continue                          # a hotbar key was just pressed: no click until the tool has seen what is in hand now
                                                       # (a click with a spell in hand while running = the run stops: that is what Cast Run is for)
                 a = T.armed
-                if a and T.is_spell(a[0]):
-                    break                             # a spell is held now: stop, and stay off until the button is pressed again
+                if (a and T.no_autoclick(a[0])) or T.dive_is_withstand():
+                    break                             # a spell / Withstand is held now: stop, and stay off until the button is pressed again
                 try:
                     if self.autoclick_hits():
                         self.events.put(("click", "left", time.time(), cursor_pos()))     # (the click that casts the move you just armed: its cooldown starts)
@@ -8537,9 +8651,6 @@ class RunBlock:
             else:
                 self.vdown[name] = True
         self._send(name, up)
-
-    def dirty(self):
-        return bool(self.vdown or self.trick or self.upHeld or self.downHeld or self.blockMode or self.dashing or self.fDown)
 
     def reset(self, hand_back=True):
         """Block Run goes off (slow mana drain / climbing): EVERY key the tool is still holding down for the game is let go (no leftover
@@ -9387,33 +9498,6 @@ def bv_measure_at(img, cx, cy, r):
         res["x"], res["y"] = float(cx), float(cy)
     return res
 
-
-def bv_find_circles(img, min_r=None, max_r=None):
-    """Full-screen search. Returns list of dicts:
-    x, y, r_fill, r_border (outer edge of dark border), ring (ring centre-line radius or None), merged."""
-    cv2 = _bv_cv2()
-    min_r = 15 * bvk() if min_r is None else min_r
-    max_r = 120 * bvk() if max_r is None else max_r
-    mx, mn = bv_prep(img)
-    spread = cv2.subtract(mx, mn)
-    fill = cv2.bitwise_and(cv2.inRange(spread, 0, BV_FILL_SPREAD), cv2.inRange(mx, 126, 255))
-    fill = cv2.morphologyEx(fill, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))  # close digit holes
-    n, _, stats, _ = cv2.connectedComponentsWithStats(fill, 8)
-
-    out = []
-    for i in range(1, n):
-        bx, by, bw, bh, area = stats[i]
-        if bw < 2 * min_r or bh < 2 * min_r or bw > 2 * max_r or bh > 2 * max_r:
-            continue
-        if not 0.8 < bw / bh < 1.25:
-            continue
-        r = (bw + bh) / 4.0
-        if area < 0.55 * math.pi * r * r:
-            continue
-        res = bv_measure(mx, mn, bx + bw / 2.0, by + bh / 2.0, r)
-        if res:
-            out.append(res)
-    return out
 
 
 def bv_measure(mx, mn, cx, cy, r):
@@ -13504,8 +13588,11 @@ class App:
         self._mana_seen_now = seen
         b = mana_fill_boundary(arr, boxes, alpha, tints=tints)
         if len(arr) - b <= 2:                                                   # (a few filled rows at the very bottom = a tick line)
-            return 0.0
-        return min(100.0, max(0.0, y_to_pct(m, y0 + b)))
+            pct = 0.0
+        else:
+            pct = min(100.0, max(0.0, y_to_pct(m, y0 + b)))
+        self._mana_dbg = {"crop": arr, "seen": bool(seen), "pct": pct, "t": time.time(), "box": (int(x0), y0, max(2, int(x1 - x0)), y1 - y0)}
+        return pct
 
     def _mana_ding(self):
         self.mana_keep_until = time.time() + MANA_KEEP
@@ -15390,6 +15477,50 @@ class App:
         except Exception:
             pass
 
+    def mana_status_tick(self, now):
+        """Settings tab: what the mana bar look sees right now (so a user can tell whether the Tool finds the bar)."""
+        try:
+            if getattr(self, "_mn_st_t", 0.0) + 0.5 > now or getattr(self, "mana_st_lbl", None) is None:
+                return
+            self._mn_st_t = now
+            d = getattr(self, "_mana_dbg", None)
+            if not d or now - d["t"] > 3.0:
+                txt = "Mana bar: not looking (the game isn't the window in front, or the mana % reading is off)"
+            else:
+                h, w = np.asarray(d["crop"]).shape[:2]
+                txt = (f"Mana bar: SEEN, reads {d['pct']:.0f}% ({w}x{h})" if d["seen"] else f"Mana bar: NOT seen ({w}x{h})")
+            if txt != getattr(self, "_mn_st_txt", None):
+                self._mn_st_txt = txt
+                self.mana_st_lbl.config(text=txt)
+        except Exception:
+            pass
+
+    def mana_debug_save(self):
+        """Saves what the mana bar look is made from (the strip it reads, and a fresh grab of the whole bar area with its frame) next to the program."""
+        try:
+            names = []
+            d = getattr(self, "_mana_dbg", None)
+            if d and d.get("crop") is not None:
+                fn = os.path.join(APP_DIR, "mana_bar_crop.png")
+                Image.fromarray(np.asarray(d["crop"])[..., :3].astype(np.uint8)).save(fn)
+                names.append(fn)
+            m = self.cfg["mana"]
+            pad = 24
+            x, y = int(m["x"]) - pad, int(m["y"]) - pad
+            w, h = int(m["w"]) + 2 * pad, int(m["h"]) + 2 * pad
+            if w > 8 and h > 8 and IS_WIN:
+                area = self._grab_rgb({"left": x, "top": y, "width": w, "height": h})
+                fn = os.path.join(APP_DIR, "mana_bar_area.png")
+                Image.fromarray(np.asarray(area)[..., :3].astype(np.uint8)).save(fn)
+                names.append(fn)
+            if not names:
+                self.say("Nothing to save yet: click into the game, wait a second, then press the button again.", "No picture yet")
+                return
+            seen = d["seen"] if d else "unknown"
+            self.say(f"Saved {len(names)} pictures (bar seen: {seen}): " + ", ".join(names), "Saved")
+        except Exception as ex:
+            self.say(f"Couldn't save: {ex}", "Not saved")
+
     def hp_debug_save(self):
         """Saves the two pictures the health bar look is made from (the last ones it took) next to the program, to show what it sees."""
         d = getattr(self, "_hp_dbg", None)
@@ -16398,7 +16529,7 @@ class App:
         if not self.listener.start():
             self.sound_lbl.config(text="Sound: " + str(self.listener.error))
             self.say("Snap Training: " + str(self.listener.error), "No sound detection")
-            if IS_WIN and pyaudio is None and not getattr(sys, "frozen", False):
+            if IS_WIN and pyaudio is None and not IS_FROZEN:
                 self.install_audio_lib()
             return
         self.run_heard = 0
@@ -16507,6 +16638,9 @@ class App:
         self.hp_status_lbl = self.label(inner, "Health bar: -", font=self.fs, justify="left", wraplength=PAGE_W - 40)
         self.hp_status_lbl.pack(fill="x", padx=8, pady=(4, 0))
         PixBtn(inner, "Save health bar picture", self.hp_debug_save, self.f, 190, 24, bd=2).pack(anchor="w", padx=8, pady=(2, 2))
+        self.mana_st_lbl = self.label(inner, "Mana bar: -", font=self.fs, justify="left", wraplength=PAGE_W - 40)
+        self.mana_st_lbl.pack(fill="x", padx=8, pady=(4, 0))
+        PixBtn(inner, "Save mana bar picture", self.mana_debug_save, self.f, 190, 24, bd=2).pack(anchor="w", padx=8, pady=(2, 2))
         self.check_row(inner, "Always show the cooldown boxes and coins (don't hide them when the HP bar isn't recognised)", "always_show", wrap=230)
         self.check_row(inner, "Autoclicker: hold the left mouse button in the game to click every 30 ms (off while you hold a spell)", "autoclick", wrap=230)
         row = tk.Frame(inner, bg=PARCH)
@@ -16565,8 +16699,7 @@ class App:
             pass
 
     def _upd_target(self):
-        frozen = bool(getattr(sys, "frozen", False))
-        return frozen, (sys.executable if frozen else os.path.abspath(__file__))
+        return IS_FROZEN, (EXE_PATH if IS_FROZEN else os.path.abspath(__file__))
 
     def start_update_check(self, manual):
         base = str(self.cfg["settings"].get("update_base") or "").strip()
@@ -17117,6 +17250,7 @@ class App:
         self.dayfarm_hook_tick(time.time())
         self.disconnect_tick(time.time())
         self.hp_status_tick(time.time())
+        self.mana_status_tick(time.time())
         if txt != self.armed_lbl.cget("text"):
             self.armed_lbl.config(text=txt)
         lt = "Last used: " + (self.tracker.last_text(now) or "-")
