@@ -11,7 +11,7 @@ How it knows a move was used (the game never tells us, so we copy what you do):
 SNAP SPELLS work the same way but on RIGHT click, with their own list per profile, one shared cooldown
 for the whole list (use one and ALL snap spells go on the cooldown of the one you used) and blue boxes.
 A move with a BLANK main cooldown is a WEAPON: its left click has no cooldown and it stays armed (equipped)
-while you attack - clicks and the armed timeout never un-arm it - and its M2 (the weapon's special attack)
+while you attack - clicks never un-arm it - and its M2 (the weapon's special attack)
 works normally.
 Snap Gelidus is special: right click starts it RUNNING, the cooldown only starts when you LEFT click
 (which stops it).
@@ -32,6 +32,7 @@ Files:    scroom_assets.py must sit next to this file. Put Manufaktur.ttf next t
 import uuid
 import collections, ast, subprocess, base64, ctypes, hashlib, urllib.request, zlib, glob, io, json, math, os, queue, re, sys, threading, time, traceback
 import urllib.error
+import http.client
 import tkinter as tk
 import tkinter.font as tkfont
 from ctypes import wintypes
@@ -75,7 +76,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -102,7 +103,6 @@ DEFAULT_SETTINGS = {
     "topmost": True,         # keep this window above the game
     "only_in_game": True,    # only react to keys / clicks while the game window is the active window
     "game_title": "Roblox",  # ...a window whose title contains this text
-    "arm_timeout": 30.0,     # seconds a pressed key stays armed waiting for the click (0 = forever)
     "cancel_on_repeat": True,    # pressing the armed key again UN-ARMS it (press 1 = armed, press 1 again = not armed)
     "grace": 0.25,           # a click this close to the end of a cooldown already counts as ready
     "opacity": 0.3,          # strength of the red box, 0.1 - 1
@@ -156,8 +156,22 @@ DEFAULT_SETTINGS = {
     "inv_hide": True,        # hide the coins while the inventory is open
     "cast_run": True,        # Cast Run: casting a held spell (left click) while running does W up, W down, W up, click, W down so the run is not lost
     "cast_run_lock": 1.0,    # seconds after a Cast Run in which clicks on the same spell are dismissed (0 = no lock)
+    "ahk_chat_suspend": True,   # while the Roblox chat is typed in, your own AutoHotkey scripts are paused (File > Suspend Hotkeys)
+    "gate_cd": 6.5,          # Snap Gate: the cooldown (seconds) that starts when Enter is pressed
+    "vir_key": "m2",         # Viribus (a Normal Spell with the blue name box): this key / mouse button casts it (left click), waits, then holds F ("m2" = right click)
+    "vir_key_label": "Right click",
+    "vir_wait_ms": 450.0,    # ...milliseconds between the left click and F
+    "vir_hold_ms": 700.0,    # ...milliseconds F is held
+    "climb_rate_lo": 3.5,    # slow mana drain (climbing falls about 6.5 % per second): the mana falls at least this many % per second ...
+    "climb_rate_hi": 10.0,   # ... and at most this many (a cast / sprint falls 20+ % per second)
+    "climb_rate_win": 0.6,  # ... steadily for at least this long
+    "snarv_snap_cd": 4.5,    # Snarvindur (left click): every snap spell goes on this cooldown (seconds)
+    "unequip_wait": True,    # a move that unequips itself (green name box): its cooldown starts when its hotbar slot turns normal again (not white)
     "autoclick": False,      # Autoclicker (AutoClick.ahk): holding the left mouse button in the game clicks every 30 ms; off while a spell is held
-    "block_run": True,       # Block Run: while W is held, pressing F does W up, W down, W up, F down, W down (like the AutoHotkey script)
+    "autoclick_key": "m3",   # the key / mouse button that pauses and resumes the Autoclicker ("m3" = middle mouse, "m4" / "m5" = side buttons, "vk:n" = a keyboard key)
+    "autoclick_key_label": "M3",
+    "block_run": True,       # Block Run (all-directional, from the AutoHotkey script): double-tap / hold-W run with W A S D, dash, G and F blocking
+    "climb_window": 0.5,     # two Space presses this close together AND a climbing-speed mana drain = climbing (Block Run is off until Space is pressed again)
     "always_show": False,    # never hide the cooldown boxes / coins just because the game's HP bar isn't recognised (menus / loading included)
     "inv_equip": True,       # clicking a known item (Fire Protection, ...) in the inventory = equipping it
     "potion_cd": 6.0,             # every potion: this long a cooldown for ALL potions, from the moment a drink is finished
@@ -191,7 +205,14 @@ DEFAULT_SETTINGS = {
     "brew_arrive_ms": 20.0,  # ... after the cursor arrives on a spot, before the click (the game needs a moment to see it)
     "brew_hold_ms": 5.0,    # ... how long each click is held down
     "brew_webhook": "",       # ... Discord webhook link: Alchemy/Smith posts "Ran out of Ingredient!" / "Made x Potion/Weapons!" there
-    "key_imenu": "[",          # Instant Menu: moves the mouse onto the game's Menu button and clicks it (Extras > Other Stuff > Instant Menu)
+    "key_dayfarm": "f5",       # Day Farm on / off (Extras > Automation > Day Farm)
+    "dayfarm_play_wait": 1.0,  # Day Farm: seconds after the Play button before the chair is equipped
+    "dayfarm_chair_wait": 0.5, # ... seconds after the chair key before the click
+    "dayfarm_wait": 110.0,     # ... seconds it waits before going back to the menu
+    "dayfarm_menu_wait": 15.0,  # ... seconds after \\ Enter \\ before it presses Play again
+    "snap_webhook": "",        # Snap Training: a Discord webhook, posts every SNAP_HOOK_EVERY casts trained (it does not stop the trainer)
+    "dayfarm_webhook": "",     # Day Farm: a Discord webhook, posts a screenshot of the game every 30 minutes (only while the HP bar is on screen)
+    "key_imenu": "[",          # Instant Menu: presses \\, Enter, \\ (Extras > Other Stuff > Instant Menu)
     "key_gank": "]",           # sends a screenshot of the game to the Gank Ping webhook (Extras > Other Stuff)
     "gank_webhook": "",       # ... the Discord webhook link for it
     "gank_name": "",          # ... the name shown in the message
@@ -212,14 +233,14 @@ MARK_COLORS = {"move": "#abe9ed", "snap": "#7aa8ff"}       # default colour of a
 HOTKEY_ACTIONS = (("area", "Find the hotbar"), ("mana", "Find the mana bar"), ("test", "Test overlay"),
                   ("hide", "Hide / show window"), ("snaptrain", "Snap Training on / off"),
                   ("brew", "Potion Brewer / Weapon Crafter on / off"), ("sell", "Appraise Sell on / off"),
-                  ("gank", "Gank Ping screenshot"), ("imenu", "Instant Menu"))
+                  ("gank", "Gank Ping screenshot"), ("imenu", "Instant Menu"), ("dayfarm", "Day Farm on / off"))
 
 # RUNNING snap spells (hardcoded). A snap spell whose NAME contains one of these words does not start its
 # cooldown when you right click it: it just starts RUNNING (as long as you like). The cooldown starts at
 # your next LEFT click, which stops it. Works in every profile. Add more words here if needed.
 RUNNING_SNAPS = ("gelidus",)
-GATE_SNAPS = ("gate",)                 # Gate: its cooldown (8 s) starts when Enter is pressed, or GATE_WAIT seconds after the cast if it never is
-GATE_CD, GATE_WAIT = 8.0, 5.0
+GATE_SNAPS = ("gate",)                 # Gate: its cooldown (6.5 s) starts when Enter is pressed, or GATE_WAIT seconds after the cast if it never is
+GATE_CD, GATE_WAIT = 6.5, 5.0
 
 # first start only: the default profile is Solan. Weapon (blank cooldown = a weapon), the four Charges (5 s
 # activation cooldown) and Charged Blow. The Charged Blow cooldowns below are the starting values - edit them!
@@ -239,7 +260,7 @@ CHARGES = (("thunder", "Thunder Charge"), ("white fire", "White Fire Charge"),
 WK_CHARGES = (("fallen lightning", "Fallen Lightning"), ("darkflame burst", "Darkflame Burst"),
               ("impure crystal", "Impure Crystal"))
 WK_ALIASES = {"dark flame burst": "darkflame burst", "impure crystals": "impure crystal"}   # other ways to write them
-SEED_DARK = {"fallen lightning": 10.5, "darkflame burst": 16.5, "impure crystal": 11.0}
+SEED_DARK = {"fallen lightning": 10.5, "darkflame burst": 16.5, "impure crystal": 11.0, "threading needle": 11.5}
 SOLAN_KINDS = tuple(k for k, _ in CHARGES)
 WK_KINDS = tuple(k for k, _ in WK_CHARGES)
 CHARGE_LABEL = dict(CHARGES + WK_CHARGES)
@@ -261,6 +282,12 @@ AZURE_IGNITION_NAME = "azure ignition"
 AZURES = (("brandish", "Azure Brandish"), ("puncture", "Azure Puncture"), ("blade crash", "Azure Blade Crash"))
 AZURE_LABEL = dict(AZURES)
 AZURE_BASE = {"brandish": "Brandish", "puncture": "Puncture", "blade crash": "Blade Crash"}
+# THE SOUL: a move (hotbar or inventory) with a 30 s cooldown (the move's own box overrides it). Clicking it turns Soul Mode on: Elegant Slash
+# becomes Violent Slash (same cooldown) and Needle's Eye becomes Threading Needle (its own cooldown, shared with Needle's Eye). Using either
+# one ends Soul Mode and The Soul is gone.
+THE_SOUL_NAME, THE_SOUL_CD = "the soul", 30.0
+SOUL_MODES = (("threading needle", "Threading Needle"),)
+SNARVINDUR_NAME = "snarvindur"
 AZURE_LIFETIME = 30.0       # Azure Ignition is forgotten this many seconds after it was activated
 
 
@@ -295,8 +322,8 @@ def is_hammer_name(name):
 
 
 def is_pick_name(name):
-    """The Pickaxe (hotbar): right click with it armed = Auto Mining (click > its key > click > its key ... until the next right click)."""
-    return _norm_name(name) == "pickaxe"
+    """The Pickaxe / Frying Pan (hotbar): right click with it armed = Auto Mining (click > its key > click > its key ... until the next right click)."""
+    return _norm_name(name) in ("pickaxe", "frying pan", "fryingpan")
 
 
 PICK_GAP = 0.05                          # Auto Mining: seconds between the tool's clicks / key presses (50 ms)
@@ -356,6 +383,53 @@ def is_dark_charged_blow(name):
     return _norm_name(name) == "dark charged blow"
 
 
+DECOMPOSE_LOCK = 1.5    # seconds after going in that a left click can't get you out again
+DECOMPOSE_M2 = 31.0     # Metascroom / Scroom: Decompose's M2 cooldown (hardcoded). M1 (left click) goes in / out of the Decompose state, M2 only works inside it
+
+
+TENEBRIS_LOOK = 1.0       # the longest the mana is watched after a Tenebris right click
+TENEBRIS_BELOW = 20.0     # a Tenebris right click counts the moment the mana (charged when you clicked) falls below this %
+TENEBRIS_CLICKS = 4     # Snap Tenebris: the first right click casts it; 2 s later 4 orbs are around you and each right click sends one out.
+TENEBRIS_WAIT = 2.0     # The cooldown starts after the 4th orb; it never shares the cooldown of the other snap spells
+
+
+def is_tenebris(name):
+    return "tenebris" in str(name or "").lower()
+
+
+def is_decompose(name):
+    return _norm_name(name) == "decompose"
+
+
+def is_the_soul(name):
+    return _norm_name(name) == THE_SOUL_NAME
+
+
+def is_elegant_slash(name):
+    return _norm_name(name) == "elegant slash"
+
+
+def is_needles_eye(name):
+    return _norm_name(name).replace("\u2019", "'") in ("needle's eye", "needles eye")
+
+
+def is_snarvindur(name):
+    return _norm_name(name) == SNARVINDUR_NAME
+
+
+def ensure_snarv_pair(cfg, snap):
+    """A SNAP spell called Snarvindur also gets the normal Snarvindur (a Normal Spell) on the same key - unless that key already holds a
+    move. True when one was added."""
+    if snap.get("ininv") or not is_snarvindur(snap.get("name")):
+        return False
+    lst = cfg["profiles"][cfg["active"]]
+    if any(m["key"] == snap["key"] and not m.get("ininv") for m in lst):
+        return False
+    lst.append({"key": snap["key"], "name": "Snarvindur", "cd": 0.0, "cd2": 0.0, "split": False, "unequip": False, "spell": True})
+    lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+    return True
+
+
 def is_azure_ignition(name):
     return _norm_name(name) == AZURE_IGNITION_NAME
 
@@ -383,7 +457,7 @@ def clean_charged(d):
     and the three Dark Charged Blow cooldowns (Wraith Knight - they start at SEED_DARK when nothing was saved)."""
     out = {}
     d = d if isinstance(d, dict) else {}
-    for kind, _ in CHARGES + AZURES + WK_CHARGES:
+    for kind, _ in CHARGES + AZURES + WK_CHARGES + SOUL_MODES:
         try:
             out[kind] = max(0.0, float(d[kind] or 0.0)) if kind in d else float(SEED_DARK.get(kind, 0.0))
         except Exception:
@@ -425,12 +499,22 @@ def clean_moves(moves, m2=False):
             ue = bool(m.get("unequip", False))                # right-click the name box: unequips after use
             d = ({"key": key, "name": nm, "cd": cd, "cd2": cd2, "split": bool(m.get("split", False)), "unequip": ue}
                  if m2 else {"key": key, "name": nm, "cd": cd, "unequip": ue})
+            if not m2 and m.get("gf"):
+                d["gf"] = "hold" if m.get("gf") == "hold" else True      # snap Ignis: green = after the cast G is pressed, F held; white ("hold") = the same, and it also works while the user holds G
             if m2 and m.get("spell"):
                 d["spell"] = True                          # listed under "Normal Spells" (hovering one removes Charge / Azure)
+                if m.get("vir") and "viribus" in nm.lower():
+                    d["vir"] = True                        # Viribus: right-click the name box (blue) = the Viribus key casts it and holds F
             if m.get("ininv"):
                 d["ininv"] = True
                 if m.get("iid"):
                     d["iid"] = str(m["iid"])                   # (its identity: the hotbar key may repeat for spells kept in the inventory)                          # right-clicked key box: this spell is not on the hotbar, it is in the inventory
+            if m2 and m.get("zero") and d["cd"] <= 0 and not d.get("spell"):
+                d["zero"] = True                           # the cooldown box says 0 (not blank): a move without a cooldown, no weapon
+            if m2 and is_decompose(nm) and not d.get("spell"):
+                d["cd2"], d["split"] = DECOMPOSE_M2, True     # Decompose: M2 is always 31 s, and M1 / M2 never share a cooldown
+            if m2 and is_the_soul(nm) and not d.get("spell") and d["cd"] <= 0:
+                d["cd"] = THE_SOUL_CD                      # The Soul: 30 s unless the user typed another number
             if m2 and is_soul_name(nm) and not d.get("spell"):
                 d["soul"] = True                           # Wraith Knight's Soul Rip: found by its name (a weapon-like move, blank cooldowns)
                 d["cd"], d["cd2"] = 0.0, 0.0
@@ -1172,6 +1256,21 @@ def new_recipe():
     return {"seq": [new_brew_seq()], "count": 50, "pot": None, "spoon": None, "weapons": False}
 
 
+DAYFARM_CHAIR_KEYS = tuple("1234567890") + ("-", "=")
+
+
+def clean_dayfarm(data):
+    """Day Farm: {play: [x, y] or None (the Play button), chair: the hotbar key of the chair}."""
+    d = data if isinstance(data, dict) else {}
+    v = d.get("play")
+    try:
+        play = [int(v[0]), int(v[1])] if isinstance(v, (list, tuple)) and len(v) == 2 else None
+    except (TypeError, ValueError):
+        play = None
+    chair = str(d.get("chair", "1"))
+    return {"play": play, "chair": chair if chair in DAYFARM_CHAIR_KEYS else "1"}
+
+
 def clean_sell(data):
     """Appraise Sell: {count, merchant, appraise, confirm} (the three spots as [x, y] or None)."""
     d = data if isinstance(data, dict) else {}
@@ -1880,7 +1979,7 @@ def cl_scroll_max(n, ph, s):
 def load_cfg():
     cfg = {"version": 5, "bar": dict(DEFAULT_BAR), "active": DEFAULT_PROFILE,
            "profiles": seed_profiles(), "snaps": {}, "settings": dict(DEFAULT_SETTINGS),
-           "mana": dict(DEFAULT_MANA, zone=list(DEFAULT_MANA["zone"])), "marks": {}, "decor": [], "dashpos": default_dashpos(), "pctpos": default_pctpos(), "kdapos": default_kdapos(), "popts": {}, "inv": {}, "brew": clean_brew(None), "checklists": default_checklists(), "sell": clean_sell(None), "mascot": None, "_dash_fresh": True, "charged": {DEFAULT_PROFILE: clean_charged(SEED_CHARGED)}}
+           "mana": dict(DEFAULT_MANA, zone=list(DEFAULT_MANA["zone"])), "marks": {}, "decor": [], "dashpos": default_dashpos(), "pctpos": default_pctpos(), "kdapos": default_kdapos(), "popts": {}, "inv": {}, "brew": clean_brew(None), "checklists": default_checklists(), "sell": clean_sell(None), "dayfarm": clean_dayfarm(None), "keybinds": clean_keybinds(None), "gates": clean_gates(None), "pinned": [], "mascot": None, "_dash_fresh": True, "charged": {DEFAULT_PROFILE: clean_charged(SEED_CHARGED)}}
     data = {}
     try:
         if os.path.exists(CONFIG_FILE):
@@ -1902,6 +2001,9 @@ def load_cfg():
             cfg["decor"] = clean_decor(data.get("decor"))
             cfg["brew"] = clean_brew(data.get("brew"))
             cfg["sell"] = clean_sell(data.get("sell"))
+            cfg["dayfarm"] = clean_dayfarm(data.get("dayfarm"))
+            cfg["keybinds"] = clean_keybinds(data.get("keybinds"))
+            cfg["gates"] = clean_gates(data.get("gates"))
             cfg["checklists"] = clean_checklists(data.get("checklists"))
             cfg["mascot"] = clean_mascot(data.get("mascot"))
             if isinstance(data.get("win_h"), (int, float)) and not isinstance(data.get("win_h"), bool):
@@ -1947,6 +2049,8 @@ def load_cfg():
         cfg["snaps"].setdefault(name, [])                 # every profile has its own snap spell list
         cfg["marks"].setdefault(name, [])                 # ...and its own cast marks on the mana bar
         cfg["charged"].setdefault(name, clean_charged(None))   # ...and its own Charged Blow cooldowns (Solan)
+    pin = data.get("pinned") if isinstance(data, dict) else None
+    cfg["pinned"] = [n for n in dict.fromkeys(str(x) for x in pin) if n in cfg["profiles"]] if isinstance(pin, list) else []   # pinned profiles (top of the dropdown)
     cfg["pack"] = str(data.get("pack") or "") if isinstance(data, dict) else ""
     first_run = cfg["pack"] != DEFAULT_PACK_VERSION        # the first start of this version
     added = merge_default_pack(cfg)                        # the default profiles of this version, once
@@ -2019,24 +2123,53 @@ def _https(url):
     return url
 
 
-def fetch_url(url, limit, timeout=15):
-    """Download up to `limit` bytes from an https link."""
-    req = urllib.request.Request(_https(url), headers={"User-Agent": "CooldownIndicator-updater"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            buf = bytearray()
-            while True:
-                chunk = r.read(1 << 16)
-                if not chunk:
-                    break
-                buf += chunk
-                if len(buf) > limit:
-                    raise UpdateError("The download is far bigger than expected - cancelled.")
-            return bytes(buf)
-    except UpdateError:
-        raise
-    except Exception as ex:
-        raise UpdateError(f"Couldn't download it ({ex.__class__.__name__}: {ex}).")
+def _alt_github_url(url):
+    """raw.githubusercontent.com/OWNER/REPO/BRANCH/path -> github.com/OWNER/REPO/raw/BRANCH/path (the same file, another server)."""
+    m = re.match(r"^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)$", str(url))
+    return f"https://github.com/{m.group(1)}/{m.group(2)}/raw/{m.group(3)}/{m.group(4)}" if m else None
+
+
+def _fetch_once(url, limit, timeout):
+    req = urllib.request.Request(_https(url), headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                                                        "Accept": "*/*", "Accept-Encoding": "identity"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        buf = bytearray()
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) > limit:
+                raise UpdateError("The download is far bigger than expected - cancelled.")
+        return bytes(buf)
+
+
+def _transient(ex):
+    """A hiccup worth trying again (the server was busy / timed out / the connection dropped), not a 404 or a blocked link."""
+    code = getattr(ex, "code", None)
+    if code is not None:
+        return code in (408, 425, 429) or code >= 500
+    return isinstance(ex, (OSError, TimeoutError, http.client.HTTPException))
+
+
+def fetch_url(url, limit, timeout=30, tries=4, sleep=time.sleep):
+    """Download up to `limit` bytes from an https link. A busy server (HTTP 5xx like '504 Gateway Time-out', 429), a timeout or a
+    dropped connection is tried again (waits 3, 6, 12 s) and then once more from GitHub's other address of the same file."""
+    urls = [url] + ([_alt_github_url(url)] if _alt_github_url(url) else [])
+    last = None
+    for u in urls:
+        for n in range(tries):
+            try:
+                return _fetch_once(u, limit, timeout)
+            except UpdateError:
+                raise
+            except Exception as ex:
+                last = ex
+                if not _transient(ex):
+                    raise UpdateError(f"Couldn't download it ({ex.__class__.__name__}: {ex}).")
+                if n < tries - 1:
+                    sleep(3 * 2 ** n)
+    raise UpdateError(f"Couldn't download it ({last.__class__.__name__}: {last}). The server is busy - try again in a minute.")
 
 
 def update_urls(base, info):
@@ -2189,6 +2322,8 @@ class Tracker:
         self.lock = threading.Lock()
         self.on = True               # always on: only closing the program stops it
         self.armed = None            # (key, time pressed)
+        self.unequip_wait = {}       # key -> {"t0": click time, "pend": {(dict name, total name): cooldown}}: waits for its slot to stop being white
+        self.uq_scan_t = 0.0         # when the hotbar watcher last looked at the white slots
         self.item = None             # (name, time, is_potion) of an inventory POTION equipped by clicking its card (other inventory moves are armed as "inv:<name>")
         self.drink = None            # (name, end time) while a potion is being drunk
         self.buffs = []              # potion effects that are on: [(icon kind, start, length)], the oldest first
@@ -2204,6 +2339,13 @@ class Tracker:
         self.mining = None           # key of the Pickaxe while Auto Mining runs (the app's AutoMiner does the clicking)
         self.pick_cb = None          # fn(key or None): the app starts / stops the AutoMiner
         self.dive = None             # Rift Dive / Blade Crash: (key, time you went under / up, Azure variant?) while it lasts
+        self.ten_pend = []             # Tenebris right clicks waiting for the mana check
+        self.ten_t0 = {}               # Snap Tenebris: when the first right click (the cast) happened (key -> time)
+        self.ten_count = {}            # Snap Tenebris: right clicks so far (key -> n)
+        self.decomp_at = 0.0           # when Decompose was entered
+        self.decomp_on = False         # Decompose: M1 toggles it, M2 only works while it is on
+        self.gf_mode = None            # the armed snap Ignis: True = green box, "hold" = white box
+        self.soul_mode = False       # The Soul was used: Elegant Slash -> Violent Slash, Needle's Eye -> Threading Needle
         self.azure_on, self.azure_at = False, 0.0    # Vanguard: Azure Ignition is on (since when)
         self.held_weapon = None      # Solan: weapon key that was armed before a Charge / Charged Blow key
         self.charge_at = 0.0         # when the remembered Charge was activated
@@ -2287,6 +2429,10 @@ class Tracker:
                 out.append(sp)
         return out
 
+    def snap_pool(self):
+        """The snap spells that share ONE cooldown: every snap spell except Tenebris (it has its own)."""
+        return [m for m in self.snap_all() if not is_tenebris(m.get("name"))]
+
     def reset(self):
         with self.lock:
             self.held_weapon = None
@@ -2303,7 +2449,11 @@ class Tracker:
             self.song = self.song_pend = None
             self.fisch = None
             self.azure_on = False
+            self.soul_mode = False
+            self.decomp_on = False
+            self.ten_t0, self.ten_count = {}, {}
             self.armed = None
+            self.unequip_wait = {}
             self.running = None
             self.gate = None
             self._set_mining(None)
@@ -2339,23 +2489,34 @@ class Tracker:
         return (bool(mv) and float(mv.get("cd") or 0.0) <= 0 and charge_kind(mv.get("name")) is None
                 and not is_charged_blow(mv.get("name")) and not is_dark_charged_blow(mv.get("name"))
                 and not is_dive_move(mv.get("name"))
-                and not is_azure_ignition(mv.get("name")) and azure_kind(mv.get("name")) is None
+                and not is_azure_ignition(mv.get("name")) and azure_kind(mv.get("name")) is None and not is_the_soul(mv.get("name")) and not is_decompose(mv.get("name"))
+                and not mv.get("zero")                                  # (a cooldown typed as 0 = a real move that simply has no cooldown; only a BLANK box is a weapon)
                 and not mv.get("spell") and not mv.get("soul") and not mv.get("awk") and not mv.get("bmove") and not mv.get("pick"))      # (the Pickaxe is no weapon either) # (Soul Rip / Awakened / the buff moves have a blank cooldown but are no weapons)
 
     def is_spell(self, key):
         """A key is a SPELL when it has a snap spell or a cast mark on the mana bar (spells need no weapon).
         A spell stays armed after it is cast, like a weapon does."""
         mv = self.move_for(key)
+        if isinstance(key, str) and key.startswith("inv:"):         # a spell kept in the inventory (armed through its card)
+            lk = (self.inv_entry(key[4:]) or {}).get("link") or {}
+            if lk.get("kind") == "snap":
+                return True
+            if lk.get("kind") == "move":
+                src = next((m for m in self.cfg["profiles"][self.cfg["active"]] if m.get("iid") and m.get("iid") == lk.get("id")), None)
+                if src is not None and src.get("spell"):
+                    return True
         return (self.snap_for(key) is not None or bool(mv and mv.get("spell"))
                 or any(m["key"] == key for m in self.cfg.get("marks", {}).get(self.cfg["active"], [])))
 
+    def is_cast_spell(self, key):
+        """A key whose LEFT click casts a spell (Normal Spell move, or a normal-cast mark). A key with only a snap spell / snap mark is not:
+        snap spells are cast with the right click and never use Cast Run."""
+        mv = self.move_for(key)
+        return bool((mv and mv.get("spell"))
+                    or any(m["key"] == key and m.get("kind") != "snap" for m in self.cfg.get("marks", {}).get(self.cfg["active"], [])))
+
     def _live_armed(self, now):
-        """The armed (key, time) - or None once it has timed out (a weapon never times out: it stays
-        equipped). Call with the lock held."""
-        S = self.cfg["settings"]
-        if (self.armed and S["arm_timeout"] > 0 and now - self.armed[1] > S["arm_timeout"] and self.mining != self.armed[0]
-                and not self.is_weapon(self.move_for(self.armed[0]))):
-            self.armed = None
+        """The armed (key, time). A pressed key stays armed until something else un-arms it (there is no timeout). Call with the lock held."""
         return self.armed
 
     def swap_keys(self, a, b, snap=False):
@@ -2427,15 +2588,16 @@ class Tracker:
         if self.armed and self.armed[0] in keys:
             self.armed = None
 
-    def _set_mining(self, key):
-        """Auto Mining on (the Pickaxe's key) / off (None). Lock held; the callback only starts / stops a thread."""
+    def _set_mining(self, key, finish=False):
+        """Auto Mining on (the Pickaxe's key) / off (None). Lock held; the callback only starts / stops a thread.
+        finish=True (YOUR right click ended it): the miner ends with another key > the Pickaxe's key, so the tool is left equipped."""
         if key == self.mining:
             return
         self.mining = key
         cb = self.pick_cb
         if cb is not None:
             try:
-                cb(key)
+                cb(key, finish)
             except Exception:
                 pass
 
@@ -2502,8 +2664,6 @@ class Tracker:
                 cd = 0.0
             self.potion_until, self.potion_len = self.drink[1] + cd, cd          # ... and ALL potions are on cooldown
             self.item = self.drink = None
-        if self.item and not self.drink and S["arm_timeout"] > 0 and now - self.item[1] > S["arm_timeout"]:
-            self.item = None
         return self.item
 
     def _add_buff(self, name, at):
@@ -2605,7 +2765,7 @@ class Tracker:
                 # move's own M2 cooldown - two separate things with separate timers.
                 if button == "right" and (self.move_for(key) or {}).get("pick"):
                     on = self.mining != key                    # Pickaxe: a right click starts Auto Mining, the next one stops it
-                    self._set_mining(key if on else None)
+                    self._set_mining(key if on else None, finish=not on)
                     self._note(key, "m2", True, now)
                     return "Auto Mining ON: right click to stop (your own clicks / keys still count)" if on else "Auto Mining OFF"
                 if button == "right":
@@ -2635,8 +2795,12 @@ class Tracker:
                     if m:
                         msgs.append(m)
                     mv = self.move_for(key)
+                    if mv and is_snarvindur(mv.get("name")) and (m or float(mv.get("cd") or 0.0) <= 0):
+                        m2s = self._snarv_snaps(now, S)           # Snarvindur cast: every snap spell goes on a short cooldown
+                        if m2s:
+                            msgs.append(m2s)
                     if mv:
-                        self._note(key, "weapon" if self.is_weapon(mv) else "move", bool(m) or self.is_weapon(mv), now)
+                        self._note(key, "weapon" if self.is_weapon(mv) else "move", bool(m) or self.is_weapon(mv) or bool(mv.get("zero")), now)
                 if self.is_weapon(self.move_for(key)):
                     self.armed = armed           # a weapon stays equipped: no click un-arms it
                 elif self.is_spell(key) and self.armed is not None:
@@ -2986,6 +3150,47 @@ class Tracker:
         if mv and mv.get("unequip"):
             w = self.held_weapon if (not snap and self._is_solan_key(key)) else None
             self.armed = (w, time.time()) if w else None
+            if not snap and self.cfg["settings"].get("unequip_wait", True):
+                self._uq_register(key)
+
+    UNEQUIP_MAX = 20.0               # seconds the cooldown waits for the slot to turn normal at most
+
+    def _uq_register(self, key):
+        """The move just started its cooldown and will unequip itself: the cooldown is held back (no box) until its hotbar slot is not white
+        any more, then it starts. Lock held."""
+        now, pend = time.time(), {}
+        for rn, tn in (("ready_at", "total"), ("m2_ready", "m2_total")):
+            r, t = getattr(self, rn), getattr(self, tn)
+            if key in r and key in t and abs((r[key] - t[key]) - now) < 0.5:
+                pend[(rn, tn)] = t[key]
+                r.pop(key)
+                t.pop(key)
+        if pend:
+            self.unequip_wait[key] = {"t0": now, "pend": pend}
+
+    def _uq_finish(self, key, at):
+        """The cooldown of a waiting move starts at `at` (the slot turned normal) - or at the click when the slot couldn't be watched."""
+        w = self.unequip_wait.pop(key, None)
+        if not w:
+            return
+        for (rn, tn), cd in w["pend"].items():
+            getattr(self, rn)[key] = at + cd
+            getattr(self, tn)[key] = cd
+
+    def unequip_scan(self, white, scanned, now):
+        """From the hotbar watcher: white = keys whose slot is white (held), scanned = keys it could look at. Starts the cooldowns whose slot is normal."""
+        with self.lock:
+            self.uq_scan_t = now
+            for key in list(self.unequip_wait):
+                if key in scanned and key not in white and now - self.unequip_wait[key]["t0"] >= 0.08:
+                    self._uq_finish(key, now)
+
+    def _uq_tick(self, now):
+        """Gives up waiting (the cooldown counts from the click then) when the slot can't be watched or stays white for too long. Lock held."""
+        for key in list(self.unequip_wait):
+            t0 = self.unequip_wait[key]["t0"]
+            if now - t0 > self.UNEQUIP_MAX or (now - t0 > 1.5 and self.uq_scan_t < t0):
+                self._uq_finish(key, t0)
 
     def _dive_len(self, key):
         """How long Rift Dive (DIVE_MAX) / Blade Crash (BLADE_MAX) lasts when you don't click again."""
@@ -3108,10 +3313,131 @@ class Tracker:
         self.m2_total[ck] = cd
         return f"{name}: {CHARGE_LABEL[kind]} on cooldown {cd:g}s"
 
+    @staticmethod
+    def is_ignis(sp):
+        return "ignis" in str(sp.get("name", "")).lower()
+
+    def gf_why(self, now):
+        """'ok' when the armed key's snap spell is a snap Ignis with the green cooldown box and it can be cast right now, else why not."""
+        S = self.cfg["settings"]
+        with self.lock:
+            armed = self._live_armed(now)
+            if not armed:
+                return "nothing is armed (no key pressed / hovered)"
+            sp = self.snap_for(armed[0])
+            if not sp:
+                return f"armed key {armed[0]} has no snap spell"
+            if not sp.get("gf"):
+                return f"snap '{sp.get('name')}' ({armed[0]}) has no green box"
+            if not self.is_ignis(sp):
+                return f"'{sp.get('name')}' is not Ignis"
+            if self.running is not None or self.gate is not None:
+                return "a Gate / running spell is active"
+            keys = [m["key"] for m in self.snap_pool()]
+            left = max((self.snap_ready.get(k, 0.0) for k in keys), default=0.0) - now
+            if left > S["grace"]:
+                return f"the snap cooldown still has {left:.1f}s left (the tool thinks the snap can't be cast yet)"
+            self.gf_mode = sp.get("gf")
+            return "ok"
+
+    def vir_why(self, now):
+        """'ok' when the armed key is a Viribus Normal Spell with the blue name box and it can be cast right now, else why not."""
+        S = self.cfg["settings"]
+        with self.lock:
+            armed = self._live_armed(now)
+            if not armed:
+                return "nothing is armed"
+            mv = self.move_for(armed[0])
+            if not mv or not mv.get("spell") or not mv.get("vir") or "viribus" not in str(mv.get("name", "")).lower():
+                return "the armed key is not a Viribus spell with a blue name box"
+            if self.ready_at.get(armed[0], 0.0) - now > S["grace"]:
+                return "Viribus is still on cooldown"
+            return "ok"
+
+    def gf_ready(self, now):
+        return self.gf_why(now) == "ok"
+
+    def _snarv_snaps(self, now, S):
+        """Snarvindur (left click): EVERY snap spell of the profile is on cooldown for snarv_snap_cd seconds (a longer one that is
+        already running stays). Lock held."""
+        try:
+            cd = float(S.get("snarv_snap_cd", 4.5))
+        except (TypeError, ValueError):
+            cd = 4.5
+        snaps = self.snap_pool()
+        if cd <= 0 or not snaps:
+            return None
+        for m in snaps:
+            if self.snap_ready.get(m["key"], 0.0) < now + cd:
+                self.snap_ready[m["key"]] = now + cd
+                self.snap_total[m["key"]] = cd
+                if m.get("inv"):
+                    self.m2_ready[m["key"]] = now + cd
+                    self.m2_total[m["key"]] = cd
+        return f"Snarvindur: all snap spells on cooldown {cd:g}s"
+
+    # ---------- The Soul: Soul Mode ----------
+    def soul_mode_text(self):
+        with self.lock:
+            return "Soul Mode" if self.soul_mode else None
+
+    def _soul_consume(self):
+        """Violent Slash / Threading Needle was used: Soul Mode ends. The Soul's own cooldown keeps running. Lock held."""
+        self.soul_mode = False
+
+    def _soul_mode_click(self, key, mv, now, S):
+        """Soul Mode is on and Elegant Slash / Needle's Eye was used. Violent Slash = Elegant Slash (same cooldown). Threading Needle has its
+        own cooldown (blue box) that is SHARED with Needle's Eye. None when this isn't a Soul Mode click. Lock held."""
+        needle = is_needles_eye(mv.get("name"))
+        cd = float(mv.get("cd") or 0.0)
+        tcd = self._azure_cd("threading needle") if needle else cd
+        if tcd <= 0:
+            return None
+        busy = max(self.ready_at.get(key, 0.0), self.m2_ready.get(key, 0.0))
+        if busy - now > S["grace"]:
+            return ""                        # still cooling down: the game ignores the click (Soul Mode stays)
+        if needle:
+            self.m2_ready[key], self.m2_total[key] = now + tcd, tcd
+            self.ready_at.pop(key, None)
+            self.total.pop(key, None)
+        else:
+            self.ready_at[key], self.total[key] = now + tcd, tcd
+            self.m2_ready.pop(key, None)
+            self.m2_total.pop(key, None)
+        self._unequip_after(key)
+        self._soul_consume()
+        return f"{'Threading Needle' if needle else 'Violent Slash'} ({key}): cooldown {tcd:g}s started - Soul Mode over"
+
+    def _decompose_click(self, key, mv, now, S):
+        """Decompose (Metascroom / Scroom): every left click goes into / out of the Decompose state (M1's own cooldown, if it has one, applies).
+        M2 doesn't end it - only the next left click does. Lock held."""
+        cd = float(mv.get("cd") or 0.0)
+        if self.ready_at.get(key, 0.0) - now > S["grace"]:
+            return None                      # M1 is cooling down: the game ignores the click
+        if self.decomp_on and now - self.decomp_at < DECOMPOSE_LOCK:
+            return None                      # just went in: for 1.5 s a left click can't get you out
+        self.decomp_on = not self.decomp_on
+        self.decomp_at = now
+        if cd > 0:
+            self.ready_at[key], self.total[key] = now + cd, cd
+        self._unequip_after(key)
+        return (f"{mv['name'] or key} ({key}): Decompose ON - M2 works now (left click to get out)" if self.decomp_on
+                else f"{mv['name'] or key} ({key}): Decompose OFF")
+
+    def decomp_text(self):
+        with self.lock:
+            return "Decompose" if self.decomp_on else None
+
     def _move_click(self, key, now, S):
         mv = self.move_for(key)
         if not mv:
             return None                      # this key only has a snap spell: a left click does nothing
+        if getattr(self, "soul_mode", False) and not mv.get("spell") and (is_elegant_slash(mv.get("name")) or is_needles_eye(mv.get("name"))):
+            r = self._soul_mode_click(key, mv, now, S)
+            if r is not None:
+                return r or None
+        if is_decompose(mv.get("name")) and not mv.get("spell"):
+            return self._decompose_click(key, mv, now, S)
         if is_charged_blow(mv.get("name")) or is_dark_charged_blow(mv.get("name")):
             return self._blow_click(key, mv, now, S)
         if is_dive_move(mv.get("name")):
@@ -3129,6 +3455,9 @@ class Tracker:
         ign = is_azure_ignition(mv.get("name"))
         akind = azure_kind(mv.get("name"))
         cd = float(mv.get("cd") or 0.0)
+        tsoul = is_the_soul(mv.get("name")) and not mv.get("spell")
+        if tsoul and cd <= 0:
+            cd = THE_SOUL_CD                 # The Soul: 30 s unless the move's box says otherwise
         acd = self._azure_cd(akind) if (akind and self._azure_active(now)) else 0.0
         variant = acd > 0                    # Azure Ignition is on: this move is its Azure variant (typed cooldown, blue box)
         if cd <= 0 and not variant and kind is None and not ign:
@@ -3136,7 +3465,7 @@ class Tracker:
         shared = self._shared(mv)
         if kind or ign:                      # a Charge / Azure Ignition only waits for its OWN activation cooldown
             busy = self.ready_at.get(key, 0.0)
-        elif akind:                          # Brandish / Puncture share ONE cooldown with their Azure variant
+        elif akind or is_needles_eye(mv.get("name")):   # Brandish / Puncture share ONE cooldown with their Azure variant; Needle's Eye with Threading Needle
             busy = max(self.ready_at.get(key, 0.0), self.m2_ready.get(key, 0.0))
         else:
             busy = max(self.ready_at.get(key, 0.0), self.m2_ready.get(key, 0.0)) if shared else self.ready_at.get(key, 0.0)
@@ -3157,7 +3486,9 @@ class Tracker:
             self.charge_at = now             # ...for CHARGE_LIFETIME seconds
         if ign:
             self.azure_on, self.azure_at = True, now
-        if shared or akind:                  # ONE shared timer: it shows red because M1 started it
+        if tsoul:
+            self.soul_mode = True            # Soul Mode: until Violent Slash / Threading Needle is used
+        if shared or akind or is_needles_eye(mv.get("name")):                  # ONE shared timer: it shows red because M1 started it
             self.m2_ready.pop(key, None)
             self.m2_total.pop(key, None)
         self._unequip_after(key)
@@ -3169,7 +3500,7 @@ class Tracker:
     def _shared(mv):
         """M1 and M2 share one cooldown (the default) - only meaningful when the move has BOTH cooldowns
         (a weapon has no M1 cooldown, so there is nothing to share)."""
-        return float(mv.get("cd") or 0.0) > 0 and float(mv.get("cd2") or 0.0) > 0 and not mv.get("split")
+        return float(mv.get("cd") or 0.0) > 0 and float(mv.get("cd2") or 0.0) > 0 and not mv.get("split") and not is_decompose(mv.get("name"))
 
     def song_keys(self):
         """The Tracker keys of every Song in the profile (hotbar Moves and Inventory)."""
@@ -3272,6 +3603,10 @@ class Tracker:
         if mv and is_shard_name(mv.get("name")) and not mv.get("spell"):
             return self._shard_click(key, now, S)
         cd = float(mv.get("cd2") or 0.0) if mv and not mv.get("spell") else 0.0
+        if mv and is_decompose(mv.get("name")) and not mv.get("spell"):
+            if not self.decomp_on:
+                return None                  # Decompose's M2 only works while you ARE decomposed (left click first)
+            cd = DECOMPOSE_M2                # (hardcoded; the state stays on: only the next left click ends it)
         if cd <= 0:
             return None                      # M2 left blank: a right click does nothing for this move
         shared = self._shared(mv)
@@ -3286,16 +3621,68 @@ class Tracker:
         self._unequip_after(key)
         return f"{mv['name'] or key} ({key}) M2: cooldown {cd:g}s started" + (" (M1 shares it)" if shared else "")
 
+    def _tenebris_click(self, key, sp, now, S):
+        """Snap Tenebris: no shared snap cooldown (it neither waits for the other snap spells nor puts them on cooldown). A right click only
+        COUNTS when the mana is 0% half a second later (every real cast drains it): the app looks and calls ten_confirm. Its OWN cooldown
+        starts after the 5th counted click. Lock held."""
+        cd = float(sp["cd"])
+        if cd <= 0:
+            return None
+        if self.snap_ready.get(key, 0.0) - now > S["grace"]:
+            return None                      # its own cooldown is still running
+        t0 = self.ten_t0.get(key)
+        if t0 is not None and now - t0 < TENEBRIS_WAIT:
+            return None                      # the orbs aren't there yet: this right click sends nothing out
+        self._unequip_after(key, snap=True)
+        self.ten_pend.append((key, now))
+        return (f"Snap {sp['name'] or key} ({key}): right click seen - it counts when the mana falls below {TENEBRIS_BELOW:g}% "
+                f"({self.ten_count.get(key, 0)}/{TENEBRIS_CLICKS} orbs so far)" if t0 is not None else
+                f"Snap {sp['name'] or key} ({key}): cast seen - it starts the count when the mana falls below {TENEBRIS_BELOW:g}%")
+
+    def take_ten_pend(self):
+        """The Tenebris right clicks waiting for the mana check: [(key, click time)]."""
+        with self.lock:
+            out, self.ten_pend = self.ten_pend, []
+            return out
+
+    def ten_confirm(self, key, t):
+        """The mana was 0% after the Tenebris right click at t: it counts as 1 click; the 5th starts the cooldown (from that click)."""
+        with self.lock:
+            sp = self.snap_for(key) or self.inv_snap(key)
+            if not sp or not is_tenebris(sp.get("name")):
+                return None
+            cd = float(sp["cd"])
+            if cd <= 0 or self.snap_ready.get(key, 0.0) - t > 0:
+                return None
+            if self.ten_t0.get(key) is None:
+                self.ten_t0[key] = t         # the first right click: the cast. The orbs are there {TENEBRIS_WAIT} s later
+                self.ten_count[key] = 0
+                return f"Snap {sp['name'] or key} ({key}): cast - the {TENEBRIS_CLICKS} orbs are out in {TENEBRIS_WAIT:g}s, then each right click sends one"
+            if t - self.ten_t0[key] < TENEBRIS_WAIT:
+                return None
+            n = self.ten_count.get(key, 0) + 1
+            if n < TENEBRIS_CLICKS:
+                self.ten_count[key] = n
+                return f"Snap {sp['name'] or key} ({key}): orb {n}/{TENEBRIS_CLICKS} sent"
+            self.ten_count.pop(key, None)
+            self.ten_t0.pop(key, None)
+            self.snap_ready[key], self.snap_total[key] = t + cd, cd
+            if sp.get("inv"):
+                self.m2_ready[key], self.m2_total[key] = t + cd, cd
+            return f"Snap {sp['name'] or key} ({key}): orb {TENEBRIS_CLICKS}/{TENEBRIS_CLICKS} - cooldown {cd:g}s started (its own, the other snap spells are not affected)"
+
     def _snap_click(self, key, now, S):
         sp = self.snap_for(key) or self.inv_snap(key)
         if not sp:
             return None                      # this key has no snap spell: a right click does nothing
+        if is_tenebris(sp.get("name")):
+            return self._tenebris_click(key, sp, now, S)
         if self.is_gate_spell(sp):
             return self._gate_click(key, sp, now, S)
         cd = float(sp["cd"])
         if cd <= 0:
             return None
-        keys = [m["key"] for m in self.snap_all()]
+        keys = [m["key"] for m in self.snap_pool()]
         if max((self.snap_ready.get(k, 0.0) for k in keys), default=0.0) - now > S["grace"]:
             return None                      # the shared snap cooldown is still running
         if self.is_running_spell(sp):        # Gelidus: no cooldown yet - it runs until the next left click
@@ -3313,25 +3700,56 @@ class Tracker:
         name = str(sp.get("name", "")).lower()
         return any(w and w in name for w in GATE_SNAPS)
 
+    def gate_why(self, now):
+        """'ok' when the armed key is a Gate spell that can be cast / is waiting for its gate name right now, else why not."""
+        S = self.cfg["settings"]
+        with self.lock:
+            armed = self._live_armed(now)
+            if not armed:
+                return "nothing is armed"
+            sp = self.snap_for(armed[0]) or self.inv_snap(armed[0])
+            if not sp or not self.is_gate_spell(sp):
+                return "the armed key is not a Gate spell"
+            if self.gate is not None:
+                return "ok"                                              # (cast already: the box is waiting for the name)
+            keys = [m["key"] for m in self.snap_pool()]
+            left = max((self.snap_ready.get(k, 0.0) for k in keys), default=0.0) - now
+            if left > S["grace"]:
+                return f"the snap cooldown still has {left:.1f}s left"
+            return "ok"
+
+    def gate_waiting(self, now):
+        """True while a cast Gate waits for its name / Enter (the game's gate box is up); a wait that ran out starts its cooldown here."""
+        with self.lock:
+            self._gate_tick(now)
+            return self.gate is not None
+
+    def gate_cd(self):
+        try:
+            v = float(self.cfg["settings"].get("gate_cd", GATE_CD))
+        except (TypeError, ValueError):
+            v = GATE_CD
+        return v if v > 0 else GATE_CD
+
     def _gate_click(self, key, sp, now, S):
-        """Gate: the cast only ARMS the cooldown; it starts (8 s, shared by every snap spell) when Enter is pressed, or 5 s
+        """Gate: the cast only ARMS the cooldown; it starts (6.5 s, shared by every snap spell) when Enter is pressed, or 5 s
         after the cast when it never is."""
         self._gate_tick(now)
-        keys = [m["key"] for m in self.snap_all()]
+        keys = [m["key"] for m in self.snap_pool()]
         if self.gate is not None:
             return None                                          # (already waiting for the Enter)
         if max((self.snap_ready.get(k, 0.0) for k in keys), default=0.0) - now > S["grace"]:
             return None                                          # the shared snap cooldown is still running
         self.gate = (key, now)
         self._unequip_after(key, snap=True)
-        return f"Snap {sp['name'] or key} ({key}): the {GATE_CD:g}s cooldown starts at Enter (or in {GATE_WAIT:g}s)"
+        return f"Snap {sp['name'] or key} ({key}): the {self.gate_cd():g}s cooldown starts at Enter (or in {GATE_WAIT:g}s)"
 
     def _gate_tick(self, now):
         """(lock held) A Gate that nobody pressed Enter for: its cooldown starts when the wait is over."""
         if self.gate is not None and now - self.gate[1] >= GATE_WAIT:
             t0 = self.gate[1] + GATE_WAIT
             self.gate = None
-            self._apply_snap_cd(GATE_CD, t0)
+            self._apply_snap_cd(self.gate_cd(), t0)
 
     def enter_pressed(self, now):
         """Enter went down (in any window): a waiting Gate starts its cooldown now."""
@@ -3339,7 +3757,7 @@ class Tracker:
             self._gate_tick(now)                                 # (a wait that is already over starts at its own end)
             if self.gate is not None:
                 self.gate = None
-                self._apply_snap_cd(GATE_CD, now)
+                self._apply_snap_cd(self.gate_cd(), now)
 
     @staticmethod
     def is_running_spell(sp):
@@ -3348,7 +3766,7 @@ class Tracker:
 
     def _apply_snap_cd(self, cd, now):
         """EVERY snap spell of the profile gets the cooldown of the one that was used."""
-        for m in self.snap_all():
+        for m in self.snap_pool():
             self.snap_ready[m["key"]] = now + cd
             self.snap_total[m["key"]] = cd
             if m.get("inv"):                                     # (an inventory snap spell shows it on its card, like an M2 cooldown)
@@ -3369,6 +3787,7 @@ class Tracker:
         out = {}
         with self.lock:
             self._dive_tick(now)
+            self._uq_tick(now)
             for key, t_end in self.ready_at.items():
                 left = t_end - now
                 if left > 0 and not key.startswith("inv:") and self.move_for(key):
@@ -3564,15 +3983,7 @@ def _glyph(sub):
                     for y in range(ys.min(), ys.max() + 1))
 
 
-def scan_tabs(strip, scale=1.0):
-    """strip = RGB pixels just above the slots (any width). Finds the cream number tabs.
-    Returns [(centre_x, glyph)] sorted left to right. The tabs sit above the slots, so the red cooldown
-    boxes never cover them, and a slot's tab is exactly centred on the slot."""
-    a = strip.astype(np.int16)
-    r, g, b = a[..., 0], a[..., 1], a[..., 2]
-    # the tab's cream colour shifts with the game's lighting / screenshot tint, so accept a band of warm creams
-    fill = (np.abs(a - np.array(TAB_FILL)).sum(axis=2) <= 24) | (
-        (r >= 215) & (g >= 195) & (b >= 140) & (b <= 215) & (r - g >= 10) & (r - g <= 45) & (g - b >= 15) & (g - b <= 70))
+def _tabs_from_mask(strip, fill, scale):
     out = []
     for x0, x1 in _runs(fill.sum(axis=0) >= 2, max(8, int(10 * scale))):
         w = x1 - x0 + 1
@@ -3583,6 +3994,24 @@ def scan_tabs(strip, scale=1.0):
             continue
         out.append(((x0 + x1) / 2.0, _glyph(strip[ys[0]:ys[-1] + 1, x0:x1 + 1])))
     return out
+
+
+def scan_tabs(strip, scale=1.0):
+    """strip = RGB pixels just above the slots (any width). Finds the cream number tabs.
+    Returns [(centre_x, glyph)] sorted left to right. The tabs sit above the slots, so the red cooldown
+    boxes never cover them, and a slot's tab is exactly centred on the slot."""
+    a = strip.astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    # the exact tab colour first; the tab's cream colour also shifts with the game's lighting / screenshot tint, so a band of warm creams is the
+    # second try. A sandy / bright background (the Desert, the Tundra) is cream too and would swallow the tabs in that band: the try that finds
+    # MORE tabs wins (the exact colour on a tie).
+    strict = np.abs(a - np.array(TAB_FILL)).sum(axis=2) <= 24
+    t1 = _tabs_from_mask(strip, strict, scale)
+    if len(t1) >= len(HOTBAR_KEYS):
+        return t1
+    loose = strict | ((r >= 215) & (g >= 195) & (b >= 140) & (b <= 215) & (r - g >= 10) & (r - g <= 45) & (g - b >= 15) & (g - b <= 70))
+    t2 = _tabs_from_mask(strip, loose, scale)
+    return t2 if len(t2) > len(t1) else t1
 
 
 def _gdist(a, b):
@@ -3905,6 +4334,7 @@ WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
 WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_QUIT = 0x100, 0x101, 0x104, 0x105, 0x12
 WM_LBUTTONDOWN, WM_RBUTTONDOWN = 0x201, 0x204
 WM_LBUTTONUP, WM_RBUTTONUP, WM_MOUSEWHEEL = 0x202, 0x205, 0x20A
+WM_MBUTTONDOWN, WM_XBUTTONDOWN = 0x207, 0x20B
 
 
 def hwnd_of(tkwin):
@@ -4160,9 +4590,13 @@ TRAIN_MONITOR_EVERY = 0.008                  # Perfect %: how often the mana bar
 TRAIN_G_HOLD = 0.200                         # each G spam press is held down for 200 ms
 TRAIN_G_GAP = 0.020                          # while training, G is tapped every 20 ms
 TRAIN_G_MAX = 12.0                           # ...but never longer than this (safety: G is let go)
+SNAP_HOOK_EVERY = 250                        # Snap Training webhook: one post every 250 casts trained
+DAYFARM_HOOK_SECS = 30 * 60                  # Day Farm webhook: one screenshot every 30 minutes
 TRAIN_MILESTONE = 10                         # "Trained N times" is announced every 10 casts
 SEND_VK = {name: vk for vk, name in VK_NAME.items() if name != "esc"}
 SEND_VK["g"] = 0x47
+SEND_VK["\\"] = 0xDC                           # (Instant Menu: the backslash key)
+SEND_VK["enter"] = 0x0D
 SEND_VK["w"] = 0x57                           # (Block Run)
 SEND_VK["f"] = 0x46
 SEND_VK["shift"] = 0xA0                        # (left Shift: the Shiftlock key)
@@ -4649,6 +5083,34 @@ if IS_WIN:
         inp = _INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(0, 0, 0, 4 if up else 2, 0, TRAIN_TAG)))
         _send_input(inp)
 
+    def send_scan_key(scan, up=False):
+        """A hardware-style key press: only the scan code with KEYEVENTF_SCANCODE (no virtual key), the way a real keyboard reports it."""
+        _send_input(_INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(0, int(scan), 8 | (2 if up else 0), 0, TRAIN_TAG))))
+
+    def send_rclick(up=False):
+        inp = _INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(0, 0, 0, 16 if up else 8, 0, TRAIN_TAG)))
+        _send_input(inp)
+
+    def send_raw_key(vk, ext=0, up=False, tag=TRAIN_TAG):
+        """A key by its virtual key."""
+        fl = (2 if up else 0) | (1 if ext else 0)
+        _send_input(_INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(int(vk), u32.MapVirtualKeyW(int(vk), 0), fl, 0, tag))))
+
+    def close_foreground_window():
+        """What Alt+F4 does: asks the window in front to close."""
+        U = ctypes.WinDLL("user32")
+        U.GetForegroundWindow.restype = wintypes.HWND
+        U.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        h = U.GetForegroundWindow()
+        if h:
+            U.PostMessageW(h, 0x112, 0xF060, 0)               # WM_SYSCOMMAND, SC_CLOSE
+
+    def send_raw_scan(scan, ext=False, up=False, tag=TRAIN_TAG):
+        """A key by its PLACE on the keyboard (scan code)."""
+        fl = (2 if up else 0) | (1 if ext else 0)
+        _send_input(_INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(int(u32.MapVirtualKeyW(int(scan), 3)), int(scan), fl, 0, tag))))
+
+
     def _mouse_move_abs(x, y):
         vx, vy, vw, vh = (u32.GetSystemMetrics(i) for i in (76, 77, 78, 79))         # the whole virtual desktop
         vw, vh = max(2, vw), max(2, vh)
@@ -4683,6 +5145,21 @@ else:
         pass
 
     def send_click(up=False):
+        pass
+
+    def send_rclick(up=False):
+        pass
+
+    def send_scan_key(scan, up=False):
+        pass
+
+    def send_raw_key(vk, ext=0, up=False, tag=None):
+        pass
+
+    def send_raw_scan(scan, ext=False, up=False, tag=None):
+        pass
+
+    def close_foreground_window():
         pass
 
     def timer_resolution(on):
@@ -4778,74 +5255,199 @@ def screenshot_png(rect=None):
     return out.getvalue()
 
 
-IMENU_BTN_PNG = "iVBORw0KGgoAAAANSUhEUgAAADMAAAAUCAYAAAAgCAWkAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAJuSURBVFhH7ZdbSBRhGIafWU3pQhQPRZDeZJFlCIqBbJqKpFGJYaBmEZ4IIopMYlf0ZlOXxAqSMPOAoEtKhhaltixF5CZKlF1UZGfFlDQ1LUzLmW5scpYgxwIb6bma+d53hv+BH+Yf4d3lY1Lf8ATGajtaxJyux9fbjX3FbQidZZmSsdqOOTfLsacJjEUVspAQHRogmXOz2LjWz7GnCR4/78VYVEHdiTh0ACu83B07mmHu2nWKROP8l/lXUS3jtyWN87XXFbPIFANHTeWK2WKgWsbH052rtk75/k3/ewaHxhSdxUK1jCiK+Hi68/LtAACNLe3E6IMUneKLV4hOzSUyxUBd820ATOcuYSiu4UDOWSJTDJwsrZf7m7Yf5lXvIABdj3qI2Z8nZ2pQLfNlapqkHeE03LgLgLX9IeGhgXJ+zdbJh9EJblmKsNUVUtlwk7HxzwD0DQxTdeoIrTUmyiwtTE5Ny8/9DVTLzMyIxEYEY7N30/O6H3+/Vbi6OMt56537dDx4SsLBAvYcMjP99RuDQ6MAbA5ah7OTE8tdXfDycGN4ZHzOm/8c1TIAri7L2ODvi6m0nqSd4YpMkiAzOZbm8jyay/O411jC+jWrFR0ABAFRFH9cIkmSY0M1C5IBSN61la7uZ4otBhAXEcwFSwsTnyZhdmv9jpXeHjx50ceMKNJk7XCM582CZfQhAVhrC9DpBMU8YVsYiXF6olKNRO01cqaqSZH/iuyM3WQXVhKWmENIoL9jPG+E6NAAqep0Dj6e2jyfDY18JON4yc+D5lJBx+yHUKvMXbvOnK4nPi1fUdAS8Wn5mNP1AAhL6bf5O2SRzgV0gRMyAAAAAElFTkSuQmCC"      # the game's Menu button (1080p: 51 x 20 px)
-IMENU_FALLBACK = (321, 78)                    # (1080p) the button's centre: this far from the window's right edge / top
+# ---------------- Gate: the shortcut boxes next to the game's gate prompt, pinned gates, gate keybinds ----------------
+GATE_BASE = ("Sigil", "Skycastle", "Snail")                                    # pinned by default
+GATE_AREAS = (("Forest", 5), ("Desert", 5), ("Deepforest", 5), ("Shore", 4), ("Tundra", 7), ("Canyon", 9))     # the boxes on the right, in this order
+GATE_PAGE_ORDER = ("Desert", "Forest", "Shore", "Tundra", "Deepforest", "Canyon")                          # the order of the "Unpinned Gates Location" list
+GATE_RANDOM = ("Sigil", "Skycastle", "Snail", "Deepforest", "Forest", "Tundra", "Shore", "Desert", "Canyon")     # the random gate picks one of these
+def gate_icon(size=48):
+    """A little stone gate (an arch), for Extras > Other Stuff."""
+    im = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    b, t = (66, 53, 41, 255), (216, 188, 161, 255)
+    d.rectangle([6, 8, size - 7, size - 4], fill=b)
+    d.rectangle([9, 11, size - 10, size - 6], fill=t)
+    d.ellipse([14, 14, size - 15, size + 10], fill=b)
+    d.ellipse([17, 17, size - 18, size + 7], fill=(30, 24, 20, 255))
+    d.rectangle([17, size // 2 + 4, size - 18, size - 6], fill=(30, 24, 20, 255))
+    return im
 
 
-def find_menu_button(rect):
-    """Screen position (x, y) of the game's Menu button, or None when it can't be seen (the menu is open / loading). It LOOKS for the
-    button's picture (any window size / resolution: the picture is tried at many sizes, first in the top-right corner of the game window,
-    then in the whole window) - it doesn't click a fixed spot. Without opencv it can't look and uses the usual spot."""
-    L, T, W, H = rect
-    k = max(0.3, H / 1080.0)
-    cv2 = _bv_cv2()
-    if cv2 is None:
-        return (L + W - IMENU_FALLBACK[0] * k, T + IMENU_FALLBACK[1] * k)
-    tpl0 = np.asarray(Image.open(io.BytesIO(base64.b64decode(IMENU_BTN_PNG))).convert("L"))
-    scales = [k] + sorted((1.04 ** i * 0.35 for i in range(0, 72)), key=lambda v: abs(math.log(v / k)))      # (the likely size first)
-
-    def look(x0, y0, w, h, stop_at):
-        with mss.mss() as sct:
-            shot = sct.grab({"left": int(x0), "top": int(y0), "width": int(w), "height": int(h)})
-        hay = np.ascontiguousarray(cv2.cvtColor(np.asarray(shot)[:, :, :3], cv2.COLOR_BGR2GRAY))
-        best = (0.0, None)
-        for sc in scales:
-            tw, th = int(round(tpl0.shape[1] * sc)), int(round(tpl0.shape[0] * sc))
-            if tw < 12 or th < 6 or th > hay.shape[0] or tw > hay.shape[1]:
-                continue
-            tpl = cv2.resize(tpl0, (tw, th), interpolation=cv2.INTER_AREA if sc < 1 else cv2.INTER_LINEAR)
-            _, score, _, loc = cv2.minMaxLoc(cv2.matchTemplate(hay, tpl, cv2.TM_CCOEFF_NORMED))
-            if score > best[0]:
-                best = (score, (x0 + loc[0] + tw / 2.0, y0 + loc[1] + th / 2.0))
-            if score >= stop_at:
-                break
-        return best
-
-    rw, rh = int(W * 0.45), int(H * 0.35)
-    score, pt = look(L + W - rw, T, rw, rh, 0.93)
-    if score < 0.75:
-        s2, p2 = look(L, T, W, H, 0.93)
-        if s2 > score:
-            score, pt = s2, p2
-    return pt if score >= 0.75 else None
+GATE_ROWS = 6                                                                  # boxes shown at once in a column (more: scroll)
+GATE_RAND_KEY = {"id": 0x26, "label": "L"}                                     # the random gate key by default (scan code of L)
 
 
-def instant_menu_run(rect, find_fn, locked_fn, key_fn, move_fn, click_fn, cursor_fn, allowed, sleep=time.sleep):
-    """Instant Menu: Shiftlock off if it is on, the mouse onto the Menu button (checked that it really got there), click. Returns a message."""
-    if locked_fn():
-        key_fn("shift", False)                                # Shiftlock holds the cursor in the middle of the window: let it go first
-        sleep(0.03)
-        key_fn("shift", True)
-        sleep(0.12)
+def gate_spots(area):
+    n = dict(GATE_AREAS).get(area, 0)
+    return [f"{area} {i}" for i in range(1, n + 1)]
+
+
+def gate_all():
+    names = list(GATE_BASE)
+    for a in GATE_PAGE_ORDER:
+        names += gate_spots(a)
+    return names
+
+
+GATE_ALL = tuple(gate_all())
+
+
+def clean_gates(data):
+    """{"pinned": [gate names], "keys": {gate name: {"id", "label"}}, "rand": {"id", "label"} | None}."""
+    out = {"pinned": list(GATE_BASE), "keys": {}, "rand": dict(GATE_RAND_KEY)}
+    if not isinstance(data, dict):
+        return out
+    if isinstance(data.get("pinned"), list):
+        seen = []
+        for n in data["pinned"]:
+            if isinstance(n, str) and n in GATE_ALL and n not in seen:
+                seen.append(n)
+        out["pinned"] = seen
+    if isinstance(data.get("keys"), dict):
+        for n, d in data["keys"].items():
+            k = _clean_key(d) if isinstance(d, dict) else None
+            if n in GATE_ALL and k:
+                out["keys"][n] = k
+    if "rand" in data:
+        out["rand"] = _clean_key(data["rand"]) if isinstance(data.get("rand"), dict) else None
+    return out
+
+
+def build_gatemap(g):
+    """{pressed key id: gate name, or "random"}."""
+    m = {}
+    for n, k in (g.get("keys") or {}).items():
+        m[k["id"]] = n
+    if g.get("rand"):
+        m[g["rand"]["id"]] = "random"
+    return m
+
+
+def gate_pick_random():
+    import random
+    return random.choice(GATE_RANDOM)
+
+
+def gate_type_run(name, press, sleep=time.sleep, allowed=lambda: True, slash=0.04, hold=0.004, gap=0.003, pre_enter=0.025):
+    """What a gate shortcut / keybind does: the chat key (/), the gate's name, Enter - pressed one after the other. press(token, up) presses one
+    key: "/", a letter, a digit, " " or "enter". Returns "" or the reason it didn't."""
     if not allowed():
         return "the game window isn't in front"
-    pt = find_fn(rect)
-    if pt is None:
-        return "couldn't see the Menu button (already in the menu?)"
-    for _ in range(4):                                        # (the mouse has to be on the button: look, and move again if it isn't)
-        move_fn(pt[0], pt[1])
-        sleep(0.12)
-        try:
-            cx, cy = cursor_fn()
-        except Exception:
-            break
-        if abs(cx - pt[0]) <= 3 and abs(cy - pt[1]) <= 3:
-            break
+    press("/", False); sleep(hold); press("/", True)
+    sleep(slash)                                                                # (the chat box needs a moment to open: the only wait that matters)
+    for ch in str(name).lower():
+        if ch not in "abcdefghijklmnopqrstuvwxyz0123456789 ":
+            continue
+        press(ch, False); sleep(hold); press(ch, True); sleep(gap)
+    sleep(pre_enter)
+    press("enter", False); sleep(hold); press("enter", True)
+    return ""
+
+
+class GateMenu:
+    """What the gate shortcut boxes show (no windows here, so it can be tested): the pinned gates in a left column, the areas (Forest, Desert ...)
+    in a right column; an area replaces the right column with its numbers (Forest 1 ... Forest 5) and a Back box. Both columns scroll."""
+
+    def __init__(self, pinned):
+        self.pinned = list(pinned)
+        self.area = None
+        self.sel = 0
+        self.off = {"L": 0, "R": 0}
+
+    def set_pinned(self, pinned):
+        self.pinned = list(pinned)
+        self.off["L"] = max(0, min(self.off["L"], max(0, len(self.pinned) - GATE_ROWS)))
+        self.sel = min(self.sel, max(0, len(self.ring()) - 1))
+
+    def left(self):
+        return [("pin", n, n) for n in self.pinned]
+
+    def right(self):
+        if self.area is None:
+            return [("area", a, a) for a, _ in GATE_AREAS]
+        return [("spot", n, n) for n in gate_spots(self.area)] + [("back", "< Back", "")]
+
+    def ring(self):
+        return self.left() + self.right()
+
+    def reset(self):
+        self.area, self.sel, self.off = None, 0, {"L": 0, "R": 0}
+        if not self.pinned:
+            self.sel = 0
+
+    def _fit(self):
+        """Scroll the column of the selected box so the box is on screen."""
+        nl = len(self.left())
+        i = self.sel
+        col, idx = ("L", i) if i < nl else ("R", i - nl)
+        if idx < self.off[col]:
+            self.off[col] = idx
+        elif idx >= self.off[col] + GATE_ROWS:
+            self.off[col] = idx - GATE_ROWS + 1
+
+    def move(self, d):
+        n = len(self.ring())
+        if n:
+            self.sel = (self.sel + d) % n
+            self._fit()
+
+    def move2(self, dx, dy):
+        """W / A / S / D: up / down move inside a column (round the end), left / right jump to the other column (same row, or the last one)."""
+        nl = len(self.left())
+        if not self.ring():
+            return
+        i = self.sel
+        col, idx = ("L", i) if i < nl else ("R", i - nl)
+        items = self.left() if col == "L" else self.right()
+        if dy:
+            idx = (idx + dy) % len(items)
+        elif dx > 0 and col == "L" and self.right():
+            col, idx = "R", min(idx, len(self.right()) - 1)
+        elif dx < 0 and col == "R" and nl:
+            col, idx = "L", min(idx, nl - 1)
+        self.sel = idx if col == "L" else nl + idx
+        self._fit()
+
+    def scroll(self, col, d):
+        n = len(self.left() if col == "L" else self.right())
+        self.off[col] = max(0, min(self.off[col] + d, max(0, n - GATE_ROWS)))
+
+    def activate(self, item):
+        """item = a (kind, label, gate name) of ring(). Returns the gate name to go to, or None (an area opened / back)."""
+        kind, label, name = item
+        if kind in ("pin", "spot"):
+            return name
+        if kind == "area":
+            self.area = name
+            self.off["R"] = 0
+            self.sel = len(self.left())
+            return None
+        if kind == "back":
+            a, self.area = self.area, None
+            self.off["R"] = 0
+            names = [x[1] for x in self.right()]
+            self.sel = len(self.left()) + (names.index(a) if a in names else 0)
+            self._fit()
+        return None
+
+    def press(self):
+        r = self.ring()
+        return self.activate(r[self.sel]) if r and 0 <= self.sel < len(r) else None
+
+    def back(self):
+        if self.area is not None:
+            self.activate(("back", "", ""))
+
+
+def instant_menu_run(key_fn, allowed, sleep=time.sleep):
+    """Instant Menu: the \\ key, Enter, the \\ key again - pressed one after the other, each one let go before the next. Returns a message."""
     if not allowed():
         return "the game window isn't in front"
-    click_fn(False)
-    sleep(0.06)
-    click_fn(True)
+    for name in ("\\", "enter", "\\"):
+        key_fn(name, False)
+        sleep(0.012)
+        key_fn(name, True)
+        sleep(0.025)
     return ""
 
 
@@ -4855,12 +5457,61 @@ WEBHOOK_MSGS = {"out": ("Ran out of Ingredient!", "go farm more bro im just a to
                 "done": ("Made {n} Potion/Weapons!", "ye bro i did it for you can you advertise me now?", 0x57F287),
                 "boom": ("Yo mb gang I messed up ima go hide or smth", "ye mb og super gaian messes up sometimes sorry bro", 0xFAA61A),
                 "gank": ("yo {n} is using gank ping feature lol dude cant even gank alone", "go help them bro r u guys js watching for joy? hello? bad house bro", GANK_COLOR),
+                "snap": ("yo gng i trained yo snaps i think go test", "{n} tries brah {n} if u dont get it das on u lol", 0x57F287),
+                "dayfarm": ("dud day farmed in rogue lol", "30 mins past u got a day dud", 0x57F287),
+                "dced": ("yo bro ur internet buns", "u dced bro comeback", 0xED4245),
                 "test": ("Ye bro im working", "yea man i work ye thanks for installing me to your server i'll take it over now", 0x5865F2)}
+
+
+DISCONNECT_BG = (57, 59, 61)           # the Roblox "Disconnected" window's grey
+
+
+def disconnect_visible(rgb):
+    """rgb = the game window (or its middle). True when Roblox's 'Disconnected' window is there: one big, solid dark-grey rectangle
+    (about 8:5) with the white Reconnect button in its lower right and the outlined Leave button on its left. Works for any window size."""
+    a = rgb.astype(np.int16)
+    H, W = a.shape[:2]
+    if H < 120 or W < 200:
+        return False
+    bg = ((np.abs(a[:, :, 0] - DISCONNECT_BG[0]) <= 8) & (np.abs(a[:, :, 1] - DISCONNECT_BG[1]) <= 8)
+          & (np.abs(a[:, :, 2] - DISCONNECT_BG[2]) <= 8))
+
+    def run(v, thr, gap):                                    # the stretch (count above thr, small gaps allowed) in / nearest the middle: the window is centred
+        runs, start, last = [], None, None
+        for i, x in enumerate(v > thr):
+            if x:
+                if start is None:
+                    start = i
+                elif i - last > gap:
+                    runs.append((start, last + 1))
+                    start = i
+                last = i
+        if start is not None:
+            runs.append((start, last + 1))
+        if not runs:
+            return 0, 0
+        mid = len(v) / 2.0
+        return min(runs, key=lambda r: 0 if r[0] <= mid < r[1] else min(abs(r[0] - mid), abs(r[1] - mid)))
+    cs = bg.sum(axis=0)
+    x0, x1 = run(cs, 0.5 * cs.max(), 3)
+    if x1 - x0 < 100:
+        return False
+    y0, y1 = run(bg[:, x0:x1].sum(axis=1), 0.08 * (x1 - x0), max(6, int(0.02 * H)))      # (the line under the title is not part of the grey)
+    w, h = x1 - x0, y1 - y0
+    if h < 60 or w < 100 or not (1.45 <= w / float(h) <= 1.8) or not (0.07 <= h / float(H) <= 0.6):
+        return False
+    box = bg[y0:y1, x0:x1]
+    if box.mean() < 0.6:                                     # (a solid window: only text and the two buttons are not the grey)
+        return False
+    white = (a[:, :, 0] > 235) & (a[:, :, 1] > 235) & (a[:, :, 2] > 235)
+    right = white[y0 + int(h * 0.65):y1, x0 + int(w * 0.5):x1]
+    left = white[y0 + int(h * 0.65):y1, x0:x0 + int(w * 0.5)]
+    return bool(0.12 <= right.mean() <= 0.6 and left.mean() < 0.08)
 
 
 def webhook_payload(kind, n=0):
     title, text, color = WEBHOOK_MSGS[kind]
-    return discord_embed(title.format(n=n), text, color)
+    return discord_embed(title.format(n=n), text.replace("{n}", str(n)), color)
 
 
 def gank_payload(name):
@@ -5032,6 +5683,62 @@ class Seller(Brewer):
                 self.on_stop(self.count, why)
 
 
+class DayFarmer(Brewer):
+    """Day Farm: click the Play button, equip the chair and click the screen, wait (110 s), then the Instant Menu keys (\\ Enter \\),
+    and again - until it is turned off (or the game window isn't in front any more). Same machinery as the Brewer (every wait can be cut short)."""
+
+    def __init__(self, waits=None, center_fn=None, **kw):
+        super().__init__(**kw)
+        self.waits = waits or (lambda: (1.0, 0.5, 110.0, 15.0))       # (after Play, after the chair key, the farming wait, after the menu keys)
+        self.center_fn = center_fn
+
+    def start(self, recipe):
+        if self.running:
+            return False
+        self.recipe = {"play": tuple(recipe["play"]), "chair": str(recipe["chair"])}
+        self.count, self.reason, self.running = 0, None, True
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def _tap(self, key):
+        self._ok()
+        self.key_fn(key, False)
+        self._wait(0.012)
+        self.key_fn(key, True)
+
+    def _run(self):
+        why = "stopped by you"
+        R = self.recipe
+        try:
+            while True:
+                a, b, c, m = tuple(self.waits())
+                self._click_at(R["play"])                         # 1. the Play button
+                self._wait(a)
+                self._tap(R["chair"])                             # 2. the chair...
+                self._wait(b)
+                if self.center_fn is not None:                    # ...and a click on the screen (the middle of the game window)
+                    pt = self.center_fn()
+                    if pt is not None:
+                        self._click_at(pt)
+                self._wait(c)                                     # 3. wait
+                self._ok()
+                instant_menu_run(self.key_fn, self.allowed, sleep=self._wait)      # 4. \\ Enter \\
+                self._wait(m)
+                self.count += 1
+                if self.on_count:
+                    self.on_count(self.count)
+        except _BrewStop as e:
+            why = str(e)
+        except Exception as e:
+            why = f"error: {type(e).__name__}: {e}"
+        finally:
+            self.running = False
+            if self.on_stop:
+                self.on_stop(self.count, why)
+
+
 class AutoMiner:
     """Pickaxe Auto Mining: click > the Pickaxe's key > click > the key ... every PICK_GAP seconds until stopped. Everything it sends is
     tagged (TRAIN_TAG), so the tracker never sees it: the Pickaxe stays armed (it is never taken for a Fist) and only YOUR input counts.
@@ -5039,21 +5746,26 @@ class AutoMiner:
 
     def __init__(self, key_fn=send_key, click_fn=send_click, sleep=precise_sleep, allowed=lambda: True, gap=PICK_GAP, on_stop=None):
         self.key_fn, self.click_fn, self.sleep, self.allowed, self.gap, self.on_stop = key_fn, click_fn, sleep, allowed, gap, on_stop
+        self.other, self.finish = None, False          # other: a different hotbar key; finish: end with other > the tool's key (see stop)
         self._stop = threading.Event()
         self._thread = None
         self.running = False
         self.steps = 0
 
-    def start(self, key):
+    def start(self, key, other=None):
         if self.running:
             return False
         self.steps, self.running = 0, True
+        self.other, self.finish = other, False
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, args=(key,), daemon=True)
         self._thread.start()
         return True
 
-    def stop(self):
+    def stop(self, finish=False):
+        """finish=True: before it ends it presses a DIFFERENT key and then the tool's key, so the game ends with the tool equipped
+        (the last key press of the loop could have put it away)."""
+        self.finish = bool(finish)
         self._stop.set()
 
     def join(self, timeout=3.0):
@@ -5085,6 +5797,12 @@ class AutoMiner:
                 self.key_fn(key, True)
                 self.steps += 1
                 self._wait()
+            if self.finish and self.other and self.other != key and self.allowed():
+                for k_ in (self.other, key):               # a different key first, then the tool's: it ends equipped
+                    self.key_fn(k_, False)
+                    self.sleep(0.005)
+                    self.key_fn(k_, True)
+                    self.sleep(self.gap)
         except Exception as e:
             why = f"error: {type(e).__name__}: {e}"
         finally:
@@ -5741,6 +6459,68 @@ class ChecklistOverlay(Overlay):
         return hits, tuple(rects)
 
 
+class GateOverlay(ChecklistOverlay):
+    """The Gate shortcut boxes: pinned gates on the left, the areas (or the numbers of one area) on the right, both scrollable. Click-through
+    like the checklist: the mouse hook catches the clicks / wheel and the App resolves them with the hit boxes show_menu() returns."""
+    BOX_W, BOX_H, PITCH, TOP, GAP = 190, 32, 59, 316, 210       # (px at 1080p: box size, row distance, first row centre y, column centre -/+ GAP from the middle)
+
+    def layout(self, rect, s):
+        """(left column x0, right column x0, y0 of the first row, box w, box h, pitch) in screen pixels for the game client rect."""
+        L, T, W, H = rect
+        bw, bh, pitch = int(self.BOX_W * s), int(self.BOX_H * s), int(self.PITCH * s)
+        cx = L + W / 2.0
+        y0 = int(T + self.TOP * s - bh / 2.0)
+        return int(cx - self.GAP * s - bw / 2.0), int(cx + self.GAP * s - bw / 2.0), y0, bw, bh, pitch
+
+    def show_menu(self, model, rect, s, family):
+        """Draws the boxes. Returns (hits [(x0, y0, x1, y1, ring index)], rects [(x0, y0, x1, y1) of the left / the right column])."""
+        lx, rx, y0, bw, bh, pitch = self.layout(rect, s)
+        n = GATE_ROWS
+        colh = (n - 1) * pitch + bh
+        pad = int(8 * s)
+        wx, wy = lx - pad, y0 - pad
+        W, H = rx + bw + pad - wx, colh + 2 * pad
+        cv, win = self.cv, self.win
+        cv.delete("all")
+        cv.config(width=W, height=H)
+        win.geometry(f"{W}x{H}+{wx}+{wy}")
+        hits, rects = [], []
+        nl = len(model.left())
+        lw = max(2, int(3 * s))
+        for col, x, items, base in (("L", lx, model.left(), 0), ("R", rx, model.right(), nl)):
+            off = model.off[col]
+            for r in range(n):
+                i = off + r
+                if i >= len(items):
+                    break
+                kind, label, _nm = items[i]
+                by = pad + r * pitch
+                bx = x - wx
+                sel = (base + i == model.sel)
+                fill = TAN_HI if sel else TAN
+                cv.create_rectangle(bx, by, bx + bw, by + bh, fill=fill, outline=BROWN, width=lw)
+                if sel:
+                    cv.create_rectangle(bx - 3, by - 3, bx + bw + 3, by + bh + 3, outline="#ffd34d", width=max(2, int(3 * s)))
+                txt = label + (" >" if kind == "area" else "")
+                fnt = self._fit(family, txt, 17 * s, bw - int(16 * s))
+                cv.create_text(bx + bw // 2, by + bh // 2, text=txt, font=fnt, fill=BROWN)
+                hits.append((x, y0 + r * pitch, x + bw, y0 + r * pitch + bh, base + i))
+            if len(items) > n:                                            # a thin scroll bar next to the column
+                th = max(int(18 * s), int(colh * n / len(items)))
+                ty = pad + int((colh - th) * off / max(1, len(items) - n))
+                sx = (x - wx) + bw + int(4 * s)
+                cv.create_rectangle(sx, ty, sx + int(4 * s), ty + th, fill=BROWN, outline="")
+            rects.append((x, y0, x + bw + int(10 * s), y0 + colh))
+        try:
+            win.attributes("-alpha", 0.92)
+        except tk.TclError:
+            pass
+        self._visible()
+        flush_win(win, wx, wy, W, H)
+        self.shown = True
+        return hits, tuple(rects)
+
+
 MASCOT_PNG = "iVBORw0KGgoAAAANSUhEUgAAAFQAAABKCAYAAAAlt3MqAAANjUlEQVR42u1ca5Ab1ZX+zr3dao1Go3mI8Xg8OBiMwcY8bZMQyiFQCTgU4bEJAdvgbCreDJXEBrK1lQqLgSQQuyqp2kotTly8HWKSLAQwOK4FszyWJTFsEtuBBb/G4CcD9ow00mgkdav7nv0h9dCWNTPSSCOkmFN1a6Tu263b35zXPef0AWqXggDOyY0uAJskkeMOAKsI2J77DM/ccwDMyl1/Pj4hAMDlAJ7zAugdAsiMdM4D+Nrc3zuPdzCXjwVWMcPQddsFvpqcSjUm4gmPCGOGFD23BxtwwFGcP/nMG5ecPPWfurnQjQ719upXffnLSgghmBkO84sALjseufNJl8NmanLn+5Na7fcntdp97S3KO+I3LlTKcezRxoZnn1Ve9QBgRjUeQKslNAVwlft5rhQJ97NFpLzzdNsWY91LOQ4DABGJKj9D7ZAChtzPNiBH1FPa2HwQGRiwAYCJ4DD/FkBvPQMaLjC6igaW+ci3gw0nFzrHzJTYsYPHusc/fv3rctENN6SJGQDeAJCoV6O0HMDdAuQ7lgP5fgBPAZgKIJ077AewRRA9SMAF7ty7gw27v9FgnJp/Dz3ULMI796ixFrFx40ZxzdVXMzMrAKyy/un2etOh35dEq0bgLCWJlucAH5VmSNHzDb9vko9Z5OvPork8X4cyx+tR5E9xwTtGFPKMQ6E5Lu2wHf2QYr2chcQTCeXqUAAQQmj1aOXfdsFb2RToDQJthSZ1SaF/dSBR8J/pB/Pv20IdIdsWluFT413I4oUL5YYNG5JPPvFEQzUNayUBPUcS/dz9ssSnsY/IX2iiTwr+77amgoYlRGRN06Q/oSSXs5gXX3rJ9oKplLLrDdCrvV9ada1hyHZQSAdainGKHNEr8iUUc7mLSSWT+T9wMYADABo9x/4XQH9ul4ZKeAIVA1QS3cXMDhHJv4ZD0aijWjBOg1IJSiSTDnK+bM4gPpo/x2F+AcBWAK05r+MtAA/VjA4lIslE+EV8aO9dSs0ZBrspwKzrXE1AOzo6TMU8JIjaC+2WmNmRRJcCuNQD8CCA5wAc+jj90OGgBhNBKbVv9/PPdZ3Y3p610iedhNj8z7K9e0/B35JNAVaJJFFrc1HcXKwfmkkmacf27VbCs00NGAaHb1oq1+3cteeORKrg3t5hfgDAv4xX/Cvl2G+SRF8AgEfXrXMWLVxYlDuWOHBAYMUPoC6cj6G7VjARcaUAHY0OnzmTVN+RGACEpQxdEomrNzK2zAG6D8ACALsrIfJdAKZLopfHutBhvhfAIwCSAD4NAD6fjzs7O51i/dvg1KkKv3osa91v+jYAoP/06cLu75tQFSEzGVJEoQLPNAjgH8YLZr5jHxREjxcDZs4ILZdEWyTRDknUBADfu+UWdfHnP1+WQ2781ytwBpOjSk78vjXC3P7O8NpZqZI2KMGf/zs4mRy+xk9ZSRVZD+B7OSNVtlFaAMZ5jOzeN0R0YLIUdocgJDjrxjQLGXvFtOaMFBJ7e+dOp9zdl35g/+i6MR5T5s03i+S5Z3PjGbMFJ4cQ+o8nS1IB9tatELrODIAIZoLhczckApihmAMAouUCupgIBkBY29zYc5YmwwAwSYgWLwuvHkrvBoCpUtBjKdPeZGZOIyIx7ZRTzKefespXlf1yW7PC/n0Y2r+PASB95kxyDuyntt+vh3HpZWOCO/Sbdcy6zm2axMrBpPyLlQFlw3yDAO4px8prnjzONe7B6/zG9EHHEQBgAcMLTCjmZY3+GZajCAC+FvCriJXpBYDJu3Z1slKChCjP99RL1xiqv48pEODIlVcI5rElhFpDTESwlKIpQvQD1ArAqOROacrR/iRMi6jgDyQUM3LWOGI78BF1paNxAFBlgwnA+s060Dh9D2ptVqVeajI7HoPSqEaIP5RqlN53D6xsCvSmmf3F3iAdjaP1kUcqIspOJiMGf7kGxfqklSCDSHoyBs8CeKZcDp2VH9SwHEUowicctpILF1VGN8rqZmQMfPSMuXDirpxDHxzLhR4N0LINiWNloPkl6ol8zOIlK5PqjiUaJZEBECTwfWTHWD74CwB+XcCHf+Aox34y0R4f0amlRsk1v78iImo+80zVALWI1BcMHfeGGuO3Diabir0uF2g5KgbgAfotCWBIEN0GAA80N0a7NNlS0srSJqG/j4wvXc6sHEEkxr3DOXzu2STaqqc/k8zaRYbuayQ60gre+46jOooIAFF+kMX1ywlYqBGw0T3Z4yg1fxyWNfHwg0K0TxKN/7qiLDBkU4C5yqLf5yhjqaFPWWLogQWWfaSJivMxNEJou+3suyORmpHVv5QhIoMkkcPMiojESJnGknzCSEyEet7N7tNLpA9PaKZqh/nK1cP3p61dbuTKYb6EAFwuif5wriZ2P9QcPMG7MyoH1ELHQz3vQv8gr94gGETy9h8gtfE/UU1xrwSYFvOhqf3xKR4dOifHoTCJYHxTl1tXNQfnWBMUaR8JaPLroECgbsAcDVAttzMyHOaDlwUaploTmLaoJw4shVyVCcDn5RinXZIfn9B4Uj9CMe8C8L7g3F5WEp30P5Yd9zEL7/gErpH92KO4FPglgEOaAjrBvEcSNf0wkZrSRpQGgCjDOF2Kvqv8vvAxDjiYLEdRUNdUxHYQFlnc+5U6bgANCqJfp20vNlO8OaVZADZKopPyq+C+FvBP0j37+pRiukSXBz/n0wIbzEzqtmAg2D2YDE0G+M5QAILZZK5MKKw4cYPJDGPQcURIk6k0s98NLxbDWeOlsBAIfBihvJTQrVQo0eZRsiMpYaeBIFJM1mm6NHbb2QjY6Zpki0TVy8wv8mm4vykQnx4dbPqZX3/3ygZjxBDckO20VQLkVikGgh9EWnNgvghgEYD+/IdfBSAqiVYxw8zjBAO1b20d8oTj8mm+Lnu+G/DTR6oLfJYmw6X63mEhMC8Sx9tWRhGRVMyvMfCVQoAO/9ML5JvvK+qhgE5J1MQMs1PX/jpj3rx5r27eLIlItjQ3Z6IDA8L70KFgY+azF16IgWjUrRdFQ0OgYe/Bg857e/bo+ZISCjZmrIwt0qZZkfBWE7B3gU8bdL8fAZkLDL1rgU/zjxBADszUNZ7bHzfeydjk4dDrAUSpxIKGZk+hbCFqE0RrCbiAGeZXrv1q5PHHHzfWrFmjent76Z+XLWv6t9WrB8Fs5NjevPqaazB3zhxSSmWGFy2EbllW6p577vEPzwWgMhnfdYsX9/f19TW/tGmTJnTdGkW5mmtWrw4NxGIl51Qc5sEuIQ4XOneqJviLhi9w12Aq7EotA68r5usAHKIJMH7PE3BBKNiY2bO7h1uyFSScTU8Nqw1XnfjGKLYwUSguPPK5o2MDe/f6dx48mPEeO/3EE/Uz587NuEC7amIsu5EXiGavlHkBrXR9qP5R9F1DS3u75qlQMQqAgjGD6uM7BwDomDaNO6ZN047VSkfXYznMkyTR4VzWs5CYNw6H6AqArrLXxSai4LZeNwKzHWY5ytspy8H8GeRSH4LorKxaY8VAD4A73HOVBnQxmM8fd9qydune3HA5MiiInlfAqwB+B+BvmKCS8NmjuS21QgOxmM5EoPGHsxMgWoxsYdmEimi6HthtKJU6RGXmBpRS+/6edF55il6IZN6hVK0akeGF3dTdzTX2tvNIPuePAPy5FgENessAf7xyZZSZqUY5NFQPL37NkkTf8uiYOJVQfVJNenb9+uE3QQTRApTwHmo1AW1AndCWbdtMjws0G0DoeHfEy6IdO3Z4YwArUcGXao9HQM0Xn3/uBP5o8zHlk61ieeQTUgNNUI2KqEdLihpuXDMhgHYvXRoRRJNqEc0333rrg3Q6LQAgl5X4c80D+trrr4eKiVd+HHTrsmUdqXSach0mXgXwWM0D+vDatTGgNnNQzeGw7cY0Rfb9qnDNA6prmoXjlCoOKBNh7nnnddqO01OLD5yOx/W8SLuqaUBdd6QWrfyK225TL7z8MrtFHACWYpxvzFXdbVJKxWsN0I6uLo/vRCEAZ9eyyL/qMP/UzQzOnTPn5FrbIR05cmTANUgM3odsi4yKUqXTFVcKos8QEcViMTItKxJqaUlN6ez82AMnf9u2DUtuXKITZdM+CrgbwCu1bpR+pphfAwDTNHnVT34SPn/ePN9111//wbY330xsfuMNJz+NWy3qj0YzCmy5uXjUWaXfHyWRI4TwdpwdkETOittvj8UOH7bHaldZqeHYtqMcx77w0+cPuGuhCWzZRhPYXPXN/PJIl06bOVN9avJkAgAzk+Hrb7jhw5u6u1vHUQhRFK1/+umha6+9tsHNyCrmXZwt4ay7DrcXEXAfEUW8jQKPKW0RQhie12lSppnYsnUrZp9xxmFPhYfSpDwVRFEwj9lxwfWDZ82a9an33nvPgFLKLd1mYH6uX1NdtwxehexbzxEASwg4VxC1j7Q5KBRe6166NHLfgw81btm2NbJ58+ZRf2zZd77TmV/rmis7vAIT2Pry40qihQGcSNmqi8O5gqMDkmjRaFxcSgyTiJDr7OF2avgDsp0ho/g7bmrdhWxXHZETwTs9+an/k0SPOszrvd0mUFqKeH2uTOYVZMtmcDx1CS9EM5Bt9Ts973gfsi3V/gTgCQC3AGgHcDOAEzzz9k80R+bT/wMr6VbHOB78lgAAAABJRU5ErkJggg=="
 MASCOT_SCALE = 0.64                      # the idle Scroom is this much of the picture's size on screen
 
@@ -6017,6 +6797,25 @@ def inv_card_sig(rgb):
 
 
 HP_BAR_FRAC = (0.40, 0.86, 0.60, 0.93)       # where the HP bar (and the little bars under it) sit in the middle of the screen (fractions)
+def hp_bar_box(W, H):
+    """(x, y, w, h) of the look at the HP bar, in the game window of W x H pixels. The game's own UI keeps its pixel size on every
+    resolution (the bar is ~400 px wide at 1080p, 1440p and 900p) and sits in the middle, ~130 px above the bottom: so the look is a
+    fixed size around that spot (the old fractions of the screen cut the bar's top edge off at 1600x900)."""
+    w = int(min(W, 700))
+    h = int(min(H * 0.4, 170))
+    x = (W - w) // 2
+    y = max(0, H - 205)
+    return x, y, max(1, w), max(1, min(h, H - y))
+
+
+def hp_fill_box(W, H):
+    """(x, y, w, h) of the wide look that has the whole HP bar in it: a fixed size (pixels) in the middle of the game window's lower part."""
+    w = int(min(W, 1200))
+    h = int(min(H * 0.3, 330))
+    y = max(0, H - h - 30)
+    return (W - w) // 2, y, max(1, w), max(1, h)
+
+
 HP_FRAME = (230, 171, 113)                   # the light frame lines of the HP bar
 HP_DARK = (66, 53, 41)                       # its dark outline
 
@@ -6137,7 +6936,7 @@ def hp_bar_visible(rgb):
     H, W = a.shape[:2]
     if H < 8 or W < 40:
         return False
-    sh = H / (HP_BAR_FRAC[3] - HP_BAR_FRAC[1])                      # (screen height)
+    sh = 1080.0                                                      # (the bar keeps its pixel size on every resolution: sizes below are those of a 1080p screen)
 
     def longest(m):
         """Per row: the longest unbroken run of matching pixels."""
@@ -6150,7 +6949,7 @@ def hp_bar_visible(rgb):
         return out
     # The bar's LENGTH is not fixed: it grows with the player's health (about 0.16 of the screen's width on a 2560x1440 screen, 0.21 for
     # others), so a line counts when a good stretch of the grab is unbroken light colour - not a share of the whole grab's width.
-    need = 0.30 * W
+    need = min(0.30 * W, 120.0)                                      # (pixels: the bar is ~400 px long when full)
     light = longest(np.abs(a - np.array(HP_FRAME, dtype=np.int16)).sum(axis=2) <= 70) >= need
     # (the dark outline is only a pixel or two thick and gets blended with the red / the frame when the screen isn't 1080p: any DARK
     # row - every channel low - counts, not only the exact outline colour)
@@ -6345,6 +7144,197 @@ class InvBoxOverlay:
             pass
 
 
+def key_label(scan, flags):
+    """The name Windows shows for a keyboard key (F9, Q, Left Shift...), upper case."""
+    try:
+        buf = ctypes.create_unicode_buffer(64)
+        n = u32.GetKeyNameTextW(((scan & 0xFF) << 16) | ((1 if flags & 1 else 0) << 24), buf, 64)
+        if n > 0:
+            return buf.value.upper()
+    except Exception:
+        pass
+    return "KEY"
+
+
+# ----------------------------------------------------------------------------
+# Keybinds (Extras > Keybinds): your own keys for the hotbar slots + the Inventory key. Only while the game is in front and the Roblox
+# chat is not being typed in. The keys the tool sends are normal key presses for the game, so an AutoHotkey script of your own that listens
+# to them (a "$9::" hotkey) reacts to them exactly as it does to a real key press.
+# ----------------------------------------------------------------------------
+KB_SLOTS = tuple((k, k) for k in ("1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=")) + (("inv", "Inventory (`)"),)
+KB_SLOT_SCAN = {"1": 0x02, "2": 0x03, "3": 0x04, "4": 0x05, "5": 0x06, "6": 0x07, "7": 0x08, "8": 0x09, "9": 0x0A, "0": 0x0B,
+                "-": 0x0C, "=": 0x0D, "inv": 0x29}         # (the keys' PLACES on the keyboard: every layout, Turkish too, has them there)
+SCAN_EVENT = {v: k for k, v in KB_SLOT_SCAN.items()}
+for _i, _c in enumerate("qwertyuiop"):
+    SCAN_EVENT[0x10 + _i] = _c
+for _i, _c in enumerate("asdfghjkl"):
+    SCAN_EVENT[0x1E + _i] = _c
+for _i, _c in enumerate("zxcvbnm"):
+    SCAN_EVENT[0x2C + _i] = _c
+SCAN_EVENT[0x39] = "space"
+ALT_L, TAB_VK = 0xA4, 0x09
+
+
+def kb_key_id(scan, flags=0):
+    """One number for a physical key: its scan code (+0x100 for an 'extended' key such as the arrows / right Ctrl)."""
+    return (int(scan) & 0xFF) | (0x100 if int(flags) & 1 else 0)
+
+
+def _clean_key(d):
+    try:
+        i = int(d.get("id"))
+        if 0 < i < 0x200:
+            return {"id": i, "label": str(d.get("label") or "KEY")[:16]}
+    except Exception:
+        pass
+    return None
+
+
+def clean_keybinds(data):
+    """{"map": {slot: {"id", "label"}}, "custom": [{"send": {...}, "key": {...} | None}]}."""
+    out = {"map": {}, "custom": []}
+    if not isinstance(data, dict):
+        return out
+    mp = data.get("map")
+    if isinstance(mp, dict):
+        for slot, d in mp.items():
+            k = _clean_key(d) if isinstance(d, dict) else None
+            if slot in KB_SLOT_SCAN and k:
+                out["map"][slot] = k
+    cu = data.get("custom")
+    if isinstance(cu, list):
+        for e in cu:
+            if isinstance(e, dict) and isinstance(e.get("send"), dict) and _clean_key(e["send"]):
+                out["custom"].append({"send": _clean_key(e["send"]), "key": _clean_key(e["key"]) if isinstance(e.get("key"), dict) else None})
+    return out
+
+
+def build_kbmap(kb):
+    """{pressed key id: (scan to send, extended, event name for the tracker)}. A blank slot adds nothing: the normal key stays."""
+    m = {}
+
+    def add(src, scan, ext):
+        sid = src["id"]
+        if sid != (scan | (0x100 if ext else 0)):
+            m[sid] = (scan, ext, None if ext else SCAN_EVENT.get(scan))
+    for slot, spec in (kb.get("map") or {}).items():
+        add(spec, KB_SLOT_SCAN[slot], 0)
+    for e in kb.get("custom") or []:
+        if e.get("key"):
+            t = e["send"]["id"]
+            add(e["key"], t & 0xFF, 1 if t & 0x100 else 0)
+    return m
+
+
+def send_slot(scan, ext, up):
+    """Presses a physical key BY PLACE (tagged as the tool's own input)."""
+    if not ext and scan in SCAN_HOTBAR:
+        send_key(SCAN_HOTBAR[scan], up)
+    else:
+        send_raw_scan(scan, bool(ext), up, TRAIN_TAG)
+
+
+class AhkChatGuard(threading.Thread):
+    """While the Roblox chat is being typed in (after "/", until Enter / Esc / a click) your own AutoHotkey scripts are paused, so keys you type
+    don't set off their hotkeys. It presses File > Suspend Hotkeys of every running AutoHotkey script (v1 and v2) and presses it again afterwards,
+    only for the scripts it paused itself. Hotkeys a script marks #SuspendExempt keep working."""
+    SUSPEND_ID = 65305                 # the command number of File > Suspend Hotkeys in an AutoHotkey script's main window
+    WM_COMMAND = 0x111
+
+    def __init__(self, app, game_active):
+        super().__init__(daemon=True)
+        self.app, self.game_active = app, game_active
+        self.on, self.paused = False, []
+        self._end = threading.Event()
+        self._u = None
+
+    def want(self):
+        try:
+            return bool(keys_off(self.app) and self.app.cfg["settings"].get("ahk_chat_suspend", True) and self.game_active())
+        except Exception:
+            return False
+
+    def step(self):
+        w = self.want()
+        if w and not self.on:
+            self.on = True
+            self.paused = [h for h in self._scripts() if not self._is_suspended(h)]
+            for h in self.paused:
+                self._toggle(h)
+        elif not w and self.on:
+            self.on = False
+            for h in self.paused:
+                if self._alive(h):
+                    self._toggle(h)                         # (every script it paused itself is un-paused, whatever the menu says)
+            self.paused = []
+
+    def run(self):
+        while not self._end.wait(0.02):
+            try:
+                self.step()
+            except Exception:
+                pass
+
+    def stop(self):
+        self._end.set()
+        try:
+            if self.on:
+                self.app_off()
+        except Exception:
+            pass
+
+    def app_off(self):
+        self.on = False
+        for h in self.paused:
+            if self._alive(h):
+                self._toggle(h)
+        self.paused = []
+
+    def _user32(self):
+        if self._u is None:
+            U = ctypes.WinDLL("user32")
+            self._proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            U.EnumWindows.argtypes = [self._proc, wintypes.LPARAM]
+            U.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            U.GetMenu.argtypes, U.GetMenu.restype = [wintypes.HWND], ctypes.c_void_p
+            U.GetSubMenu.argtypes, U.GetSubMenu.restype = [ctypes.c_void_p, ctypes.c_int], ctypes.c_void_p
+            U.GetMenuState.argtypes, U.GetMenuState.restype = [ctypes.c_void_p, wintypes.UINT, wintypes.UINT], wintypes.UINT
+            U.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            U.IsWindow.argtypes = [wintypes.HWND]
+            self._u = U
+        return self._u
+
+    def _scripts(self):
+        """The main (hidden) windows of the running AutoHotkey scripts."""
+        U, out = self._user32(), []
+
+        def cb(h, _l):
+            buf = ctypes.create_unicode_buffer(64)
+            U.GetClassNameW(h, buf, 64)
+            if buf.value == "AutoHotkey":
+                out.append(h)
+            return True
+        U.EnumWindows(self._proc(cb), 0)
+        return out
+
+    def _is_suspended(self, h):
+        """The tick of File > Suspend Hotkeys (False when it can't be read)."""
+        U = self._user32()
+        m = U.GetMenu(h)
+        for sub in (U.GetSubMenu(m, 0) if m else None, m):
+            if sub:
+                st = U.GetMenuState(sub, self.SUSPEND_ID, 0)
+                if st != 0xFFFFFFFF:
+                    return bool(st & 8)
+        return False
+
+    def _toggle(self, h):
+        self._user32().PostMessageW(h, self.WM_COMMAND, self.SUSPEND_ID, 0)
+
+    def _alive(self, h):
+        return bool(self._user32().IsWindow(h))
+
+
 class InputWatcher(threading.Thread):
     """The hooks only drop (kind, name, time, point) into a queue (so they return instantly and Windows
     never drops them); this thread then handles the events one by one, in the order they happened.
@@ -6364,52 +7354,315 @@ class InputWatcher(threading.Thread):
         self._next = lambda n, w, l: 0          # replaced by CallNextHookEx on Windows
         self._procs = ()
         self._imenu_held = False
-        self._phys = {0x57: False, 0x46: False}   # W / F as the USER holds them (the tool's own key presses are not counted)
+        self._phys = {0x57: False, 0x46: False, 0x47: False, 0x53: False}   # W / F / G / S as the USER holds them (the tool's own key presses are not counted)
+        self._rb_init()                                                  # (Block Run engine + the Cast Run that uses it)
         self._br_thread = None
         self._cr_thread = None
         self._lheld = False                        # the left mouse button as the USER holds it
+        self.ac_capture = None                     # set while the Autoclicker key is being picked: callback(spec, label)
+        self._ac_kheld = set()                    # keys held down (a key repeat is not a new press)
         self._ac_thread = None
+        self._ac_key_t = 0.0                      # when the user last pressed a hotbar key
         self._cr_block_until, self._cr_block_key, self._cr_drop_up = 0.0, None, False     # after a Cast Run: clicks on the same spell are dropped for the lock time
+        self._g_cut = False                       # Cast Run let go of the user's held G for them (until they release it)
+        self._gf_virtual = False                  # the tool holds G for the user (white snap Ignis box): until they let go of G
+        self.vir_capture = None                   # set while the Viribus key is being picked: callback(spec, label)
+        self._vir_thread, self._vir_drop_up = None, False
+        self._gf_thread = None       # snap Ignis (green cooldown box): the right click is sent by the tool (G held, F after)
         self._cr_hold = False                      # the left button went down as a Cast Run (its button-up is handled too)
         self._cl_swallow = set()                 # mouse-up messages still to be swallowed (the click started on the checklist)
+        self._pk = set()                         # keys / mouse buttons the USER holds right now (virtual keys; mouse: -1 left, -2 right, -4 middle, -5 / -6 side)
+        self._gate_held, self._gate_thread, self._gate_pre = {}, None, set()     # Gate: keys taken for the shortcut boxes / a gate keybind (their release is taken too) / the typing run
+        self._kb_held = {}                       # key id of a key whose press was taken (a keybind) -> what it did; its release does the matching thing
+        self.kb_capture = None                   # set while a keybind is being picked: callback(key id or None, label)
+        self._alt_sw, self._alt_inj = False, False   # LAlt was taken / was handed back to the system because Tab came after it (Alt+Tab)
 
     # ----- hook side (must be fast) -----
     def _kb(self, n_code, w_param, l_param):
+        rb_swallow = False
         try:
             if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
                 info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 is_down = w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                physical = info.dwExtraInfo != TRAIN_TAG                           # (not the tool's own key press)
+                real = physical and not (info.flags & 0x10)                        # (typed on the keyboard: not injected by another program, e.g. your own AutoHotkey script)
+                if real:
+                    (self._pk.add if is_down else self._pk.discard)(info.vkCode)
+                    if is_down and self.kb_capture is not None:                    # picking a keybind: this key is it (Esc = cancel)
+                        cb, self.kb_capture = self.kb_capture, None
+                        cb(None if info.vkCode == 0x1B else kb_key_id(info.scanCode, info.flags),
+                           "" if info.vkCode == 0x1B else key_label(info.scanCode, info.flags))
+                        return 1
+                if real and self._alt_f4(info, is_down):
+                    return 1                                           # Alt+F4: always closes the window, whatever keybind / script has F4
                 if info.dwExtraInfo != TRAIN_TAG:
-                    if info.vkCode in self._phys:
-                        was_f = self._phys[0x46]
+                    if physical and info.vkCode in self._phys:
                         self._phys[info.vkCode] = is_down
-                        if (info.vkCode == 0x46 and is_down and not was_f and self._phys[0x57]
-                                and getattr(self.app, "chat_open", False) is not True):
-                            self.block_run()                             # W held + F pressed (not a key repeat)
-                    if is_down and (info.vkCode in (0xBF, 0x6F) or info.scanCode == 0x35) and getattr(self.app, "chat_open", False) is not True:
-                        self.app.chat_open = True                       # "/" = the Roblox chat opens: no keybind works until Enter / Esc / a click
-                    elif is_down and info.vkCode in (0x0D, 0x1B):
+                    if physical and info.vkCode == 0x47 and getattr(self, "_g_cut", False):
+                        if not is_down:
+                            self._g_cut = False                          # they let go of G: back to normal (this release goes through)
+                        else:
+                            return 1                                     # (their key repeats: swallowed, the game already got the G release)
+                    if physical and info.vkCode == 0x47 and self.gf_g_event(is_down):
+                        return 1                                         # (G while the tool holds it for the user: swallowed, the tool lets it go)
+                    if real and is_down and getattr(self.app, "gate_open", False) is True and (info.vkCode in (0x1B, 0x0D, 0xBF, 0x6F) or info.scanCode == 0x35):
+                        self.gate_hide()                                # (Esc / Enter / "/" : the gate shortcut boxes go away)
+                    if real and is_down and (info.vkCode in (0xBF, 0x6F) or info.scanCode == 0x35) and getattr(self.app, "chat_open", False) is not True:
+                        self.app.chat_open = True                       # a "/" YOU type = the Roblox chat opens: no keybind / AutoHotkey works until Enter / Esc / a click
+                                                                        # (a "/" an AutoHotkey script sends doesn't count: that is how a typing macro works)
+                    elif is_down and info.vkCode == 0x1B:
+                        if not getattr(self, "_esc_held", False):                # (a held Esc repeats: only the first press counts)
+                            self._esc_held = True
+                            if getattr(self.app, "chat_open", False) is True:
+                                self.app.chat_open = False                       # Esc closes the chat / the menu again
+                            elif real and self.game_active():
+                                self.app.chat_open = True                        # Esc in the game = the Roblox menu opens: keybinds, Block Run and AutoHotkey are paused
+                                                                                 # until Esc again / Enter / a click / leaving the game
+                    elif is_down and info.vkCode == 0x0D:
                         self.app.chat_open = False
+                    if not is_down and info.vkCode == 0x1B:
+                        self._esc_held = False
                     if is_down and info.vkCode == 0x0D:
                         self.events.put(("enter", "enter", time.time(), None))     # (Enter: the Gate spell's cooldown starts)
-                    if info.scanCode in getattr(self.app, "imenu_scans", ()):
-                        if is_down and not self._imenu_held and getattr(self.app, "chat_open", False) is not True:
+                    if physical and info.scanCode in getattr(self.app, "imenu_scans", ()):
+                        if is_down and not self._imenu_held and not keys_off(self.app):
                             self._imenu_held = True
                             self.app.q.put(("imenu",))                  # (a key press = one Instant Menu, whatever other keys are held)
                         elif not is_down:
                             self._imenu_held = False
-                    if getattr(self.app, "chat_open", False) is True:
+                    if real and not (getattr(self.app, "gate_open", False) is True and info.vkCode in self.GATE_NAV and info.vkCode not in self._gate_pre):
+                        rb_swallow = self.rb_event(info.vkCode, is_down)     # (Block Run: W / S / F / Q are taken and re-sent by the tool)
+                    if real and not self._chat_typing() and self._gate_filter(info, is_down):
+                        return 1                                       # (the gate shortcut boxes / a gate keybind took this key - also while the climb check
+                                                                       # thinks the mana drains slowly: casting a Gate drains it too)
+                    if keys_off(self.app):
                         return self._next(n_code, w_param, l_param)    # (chat: nothing else is looked at)
+                if real and self._kb_filter(info, is_down):
+                    return 1                                           # (a keybind took this key)
+                if physical:
+                    if is_down:
+                        if info.vkCode not in self._ac_kheld or self.ac_capture is not None or self.vir_capture is not None:
+                            self._ac_kheld.add(info.vkCode)
+                            if info.vkCode == 0x1B and (self.ac_capture is not None or self.vir_capture is not None):
+                                if self.ac_capture is not None:
+                                    cb, self.ac_capture = self.ac_capture, None
+                                else:
+                                    cb, self.vir_capture = self.vir_capture, None
+                                cb("esc", "")
+                            else:
+                                self.ac_pressed("vk:%d" % info.vkCode, key_label(info.scanCode, info.flags))
+                    else:
+                        self._ac_kheld.discard(info.vkCode)
                 if (w_param in (WM_KEYDOWN, WM_SYSKEYDOWN) and info.dwExtraInfo != TRAIN_TAG
                         and info.scanCode in getattr(self.app, "train_scans", ())):
                     self.app.on_train_key()          # start / stop key: acted on IMMEDIATELY, before anything else
-                name = hotbar_scan_name(info.scanCode, info.flags) or VK_NAME.get(info.vkCode) or LETTER_VK.get(info.vkCode) or ("inv" if info.vkCode == 0xC0 else None)
+                name = hotbar_scan_name(info.scanCode, info.flags) or VK_NAME.get(info.vkCode) or LETTER_VK.get(info.vkCode) or ("inv" if (info.vkCode == 0xC0 or (info.scanCode == 0x29 and not info.flags & 1)) else None)
+                if name in HOTBAR_KEYS and is_down and info.dwExtraInfo != TRAIN_TAG:
+                    self._ac_key_t = time.time()                               # (a hotbar key: the autoclicker waits a moment until the tool knows what is in hand now)
                 if name is not None and info.dwExtraInfo != TRAIN_TAG:         # (Snap Training's own keys are ignored)
                     kind = "down" if w_param in (WM_KEYDOWN, WM_SYSKEYDOWN) else "up"
                     self.events.put((kind, name, time.time(), None))
         except Exception:
             pass
+        if rb_swallow:
+            return 1
         return self._next(n_code, w_param, l_param)
+
+    def _alt_f4(self, info, is_down):
+        """Alt+F4 always works, even if F4 is a keybind or an AutoHotkey hotkey (the keybinds never take it; here the tool asks the window to
+        close itself, which is all Alt+F4 does). Only while the game is in front. True = the key is taken."""
+        kid = kb_key_id(info.scanCode, info.flags)
+        if info.vkCode != 0x73:
+            return False
+        if not is_down:
+            return self._kb_held.pop(kid, None) == ("altf4",)
+        if not (self._pk & {0x12, ALT_L, 0xA5}):
+            return False
+        if kid in self._kb_held:
+            return self._kb_held[kid] == ("altf4",)                       # (key repeat)
+        if not self.game_active():
+            return False
+        self._kb_held[kid] = ("altf4",)
+        try:
+            close_foreground_window()
+        except Exception:
+            pass
+        return True
+
+    # ----- Gate: shortcut boxes on a right click, gate keybinds -----
+    GATE_NAV = {0x57: (0, -1), 0x53: (0, 1), 0x41: (-1, 0), 0x44: (1, 0)}      # W / S = up / down, A / D = left / right
+
+    def _chat_typing(self):
+        """The Roblox chat / menu is open (not the pause a slow mana drain puts on the keybinds, which uses the same flag)."""
+        return getattr(self.app, "chat_open", False) is True and not getattr(self, "_drain_paused", False)
+
+    def gate_hide(self):
+        self.app.gate_open = False
+        self.app.q.put(("gate_hide",))
+
+    def gate_rclick(self, pt):
+        """A right click while a Gate spell is armed: the shortcut boxes come up (the click itself goes through to the game as always)."""
+        try:
+            app = self.app
+            if self._chat_typing() or not self.game_active() or not app.tracker.on or self.over_window(pt) or self.slot_at(pt):
+                return
+            if app.tracker.gate_why(time.time()) != "ok":
+                return
+            if getattr(app, "gate_open", False) is not True:
+                self._gate_held.clear()
+                self._gate_pre = {v for v in self.GATE_NAV if v in self._pk}      # (W / A / S / D already held: they stay the game's until let go)
+            app.gate_open = True
+            app.q.put(("gate_show",))
+        except Exception:
+            pass
+
+    def gate_armed_now(self):
+        try:
+            return self.game_active() and self.app.tracker.on and self.app.tracker.gate_why(time.time()) == "ok"
+        except Exception:
+            return False
+
+    def _gate_filter(self, info, is_down):
+        """True = this key is taken. While the boxes are up: the arrow keys move the selection, Ctrl picks, Backspace goes back. A gate keybind
+        (or the random one) works while the boxes are up or a Gate spell is armed."""
+        app = self.app
+        vk, kid, held = info.vkCode, kb_key_id(info.scanCode, info.flags), self._gate_held
+        if not is_down:
+            self._gate_pre.discard(vk)
+            return held.pop(kid, None) is not None
+        now = time.time()
+        for k in [k for k, v in held.items() if (v[0] != vk and v[0] not in self._pk) or now - v[1] > 1.0]:
+            del held[k]                                                    # (a key whose release the tool never saw: forgotten, so it can't block the next press)
+        if kid in held:
+            held[kid] = (vk, now)
+            return True                                                    # (key repeat of a key that was taken)
+        is_open = getattr(app, "gate_open", False) is True
+        if is_open and not self.game_active():
+            self.gate_hide()
+            is_open = False
+        if is_open:
+            if vk in self.GATE_NAV:
+                if vk in self._gate_pre:
+                    return False                                           # (held since before the boxes came up: the game keeps it)
+                held[kid] = (vk, now)
+                app.q.put(("gate_nav",) + self.GATE_NAV[vk])
+                return True
+            if vk in (0x11, 0xA2, 0xA3):
+                held[kid] = (vk, now)
+                app.q.put(("gate_ctrl",))
+                return True
+            if vk == 0x08:
+                held[kid] = (vk, now)
+                app.q.put(("gate_back",))
+                return True
+            if hotbar_scan_name(info.scanCode, info.flags) in HOTBAR_KEYS:
+                self.gate_hide()                                           # (another spell: the boxes go away, the key goes through)
+                is_open = False
+        gm = getattr(app, "gate_map", None)
+        if not gm or kid not in gm:
+            return False
+        if not (is_open or self.gate_armed_now()):
+            return False
+        name = gm[kid]
+        if name == "random":
+            if not is_open:
+                return False                                               # (the random gate key only works while the gate boxes are up)
+            name = gate_pick_random()
+        if self.gate_go(name):
+            held[kid] = (vk, now)
+            return True
+        return False
+
+    def gate_go(self, name):
+        """Types the gate (/ name Enter) for the user. False when one is running already."""
+        if self._gate_thread is not None and self._gate_thread.is_alive():
+            return False
+        self.gate_hide()
+        self._gate_thread = threading.Thread(target=self._gate_seq, args=(str(name),), daemon=True)
+        self._gate_thread.start()
+        return True
+
+    @staticmethod
+    def _gate_press(tok, up):
+        if tok == "/":
+            send_raw_scan(0x35, False, up)
+        elif tok == "enter":
+            send_raw_key(0x0D, 0, up)
+        elif tok == " ":
+            send_raw_key(0x20, 0, up)
+        else:
+            send_raw_key(ord(tok.upper()), 0, up)
+
+    def _gate_seq(self, name):
+        try:
+            T = self.app.tracker
+            if getattr(T, "gate", None) is None:
+                self.events.put(("click", "right", time.time(), cursor_pos()))     # (the Gate was armed but never cast: the cast counts now)
+                time.sleep(0.03)
+            S = self.app.cfg["settings"]
+
+            def ms(k, d):
+                try:
+                    return max(0.0, float(S.get(k, d))) / 1000.0
+                except (TypeError, ValueError):
+                    return d / 1000.0
+            why = gate_type_run(name, self._gate_press, lambda sec: self._spin(sec * 1000.0), self.game_active,
+                                slash=ms("gate_slash_ms", 40.0), hold=ms("gate_hold_ms", 4.0), gap=ms("gate_gap_ms", 3.0), pre_enter=ms("gate_enter_ms", 25.0))
+            if why:
+                self.app.q.put(("msg", f"Gate {name}: not typed ({why})"))
+                return
+            self.events.put(("enter", "enter", time.time(), None))                 # (Enter: the Gate cooldown starts now)
+            self.app.q.put(("msg", f"Gate: {name}"))
+        except Exception:
+            pass
+
+    def _kb_filter(self, info, is_down):
+        """Keybinds. True = this key press / release is taken: the game never sees it, the tool presses the key it stands for instead (a normal
+        key press for the game, so anything that listens to that key, an AutoHotkey script of yours too, reacts to it as to a real one).
+        Only while the game is in front and the chat is closed (the caller already left for the chat). LAlt + Tab is always left alone."""
+        app = self.app
+        vk, kid, held = info.vkCode, kb_key_id(info.scanCode, info.flags), self._kb_held
+        if not is_down:
+            h = held.pop(kid, None)
+            if vk == ALT_L:
+                self._alt_sw = False
+                if self._alt_inj:
+                    self._alt_inj = False
+                    h = h or ("alt",)
+                    if h[0] == "map":
+                        send_slot(h[1], h[2], True)
+                        if h[3]:
+                            self.events.put(("up", h[3], time.time(), None))
+                    send_raw_key(ALT_L, 0, True, TRAIN_TAG)                 # the system got LAlt for Alt+Tab: it gets the release too
+                    return True
+            if h is not None and h[0] == "map":
+                send_slot(h[1], h[2], True)
+                if h[3]:
+                    self.events.put(("up", h[3], time.time(), None))
+                return True
+            return h is not None
+        if vk == TAB_VK and ALT_L in self._pk:                              # Alt+Tab: never a keybind
+            if self._alt_sw and not self._alt_inj:
+                send_raw_key(ALT_L, 0, False, TRAIN_TAG)                    # (LAlt itself was taken: hand it to the system now)
+                self._alt_inj = True
+            return False
+        km = getattr(app, "kb_map", None)
+        if not km:
+            return False
+        if kid in held:
+            return True                                                    # (key repeat of a key that was taken)
+        if not self.game_active():
+            return False
+        m = km.get(kid)
+        if m:
+            held[kid] = ("map",) + m
+            send_slot(m[0], m[1], False)
+            if m[2]:
+                self.events.put(("down", m[2], time.time(), None))        # (the tracker sees the key the game gets)
+            if vk == ALT_L:
+                self._alt_sw = True
+            return True
+        return False
 
     @staticmethod
     def _spin(ms):
@@ -6417,53 +7670,192 @@ class InputWatcher(threading.Thread):
         while time.perf_counter() < end:
             pass
 
-    def block_run(self):
-        """Block Run (the AutoHotkey script ~W & F): W up, W down, 1 ms, W up, 1 ms, F down, 10 ms, W down; then wait until F is let go,
-        F up, 10 ms, and W up unless W is still held. Runs in its own thread; a held F doesn't repeat it."""
+    # ----- Block Run (the all-directional AutoHotkey script) -----
+    def _rb_init(self):
+        if getattr(self, "rb", None) is None:
+            self.rb = RunBlock(self._rb_send, self._spin, lambda: (self._phys.get(0x57, False), self._phys.get(0x53, False), self._phys.get(0x46, False)),
+                               gate=self.rb_enabled)
+            self._rb_q = queue.Queue()
+            self._rb_held, self._rb_was = set(), False
+            self._climb, self._sp_last, self._sp_down = False, -1e9, False
+            self._rb_thread, self._drain_paused = None, False
+            self._climb_pending, self._climb_seen = 0.0, 0.0
+
+    @staticmethod
+    def _rb_send(name, up=False):
+        if name == "click":
+            send_click(up)
+            return
+        send_raw_key(RB_VK[name], 1 if name in ("up", "down") else 0, up)
+
+    def rb_enabled(self):
+        S = self.app.cfg["settings"]
+        if not S.get("block_run") or keys_off(self.app) or getattr(self, "_climb", False):
+            return False                                   # (chat / Esc menu / a slow mana drain = climbing / Space climb: the script stays off)
+        return bool(self.game_active())
+
+    def _rb_put(self, *item):
+        self._rb_q.put(item)
+        t = self._rb_thread
+        if t is None or not t.is_alive():
+            self._rb_thread = threading.Thread(target=self._rb_loop, daemon=True)
+            self._rb_thread.start()
+
+    def _rb_loop(self):
+        while not self.quit.is_set():
+            try:
+                item = self._rb_q.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            try:
+                if item[0] == "reset":
+                    self.rb.reset(hand_back=True)
+                elif item[0] == "cast":
+                    try:
+                        self.rb.cast_clicked = False
+                        self.rb.on_cast()
+                    finally:
+                        if not self.rb.cast_clicked:
+                            try:
+                                send_click(False)                  # (the click must never get lost)
+                            except Exception:
+                                pass
+                        item[1].set()
+                else:
+                    self.rb.handle(item[0], item[1])
+            except Exception:
+                pass
+
+    def rb_poll(self):
+        """Called often (not from the hook): Block Run goes off / on with a slow mana drain or climbing. Space twice + a climbing-speed drain
+        (within CLIMB_CONFIRM s) = climbing; it ends with Space, or when the drain has been gone for CLIMB_END s."""
         try:
-            if not self.app.cfg["settings"].get("block_run"):
-                return
-            if self._br_thread is not None and self._br_thread.is_alive():
-                return
-            self._br_thread = threading.Thread(target=self._block_run_seq, daemon=True)
-            self._br_thread.start()
+            self._rb_init()
+            now = time.time()
+            d = getattr(self.app, "slow_drain", None)
+            seen = d is not None and d.blocking(now)
+            if d is not None and d.empty(now):
+                self._climb, self._climb_pending = False, 0.0       # the mana ran out: always back to Block Run
+            elif self._climb:
+                if seen or (d is not None and d.falling(now)):
+                    self._climb_seen = now
+                elif now - self._climb_seen > CLIMB_END:
+                    self._climb = False                      # (the mana no longer drains like a climb: it is over)
+            elif now < self._climb_pending:
+                if d is not None and d.climbing(now):                # (a short look: 0.5 s of steady fall at the climbing speed)
+                    self._climb, self._climb_pending, self._climb_seen = True, 0.0, now
+            self._rb_transition(self.rb_enabled())
+            self._pause_sync(now)
         except Exception:
             pass
 
-    def _block_run_seq(self):
+    def _pause_sync(self, now):
+        """A slow mana drain / climbing: every keybind and AutoHotkey script is paused (like the chat) until it is over."""
+        d = getattr(self.app, "slow_drain", None)
+        paused = bool(getattr(self, "_climb", False) or (d is not None and d.blocking(now)))
+        if paused:
+            if getattr(self.app, "chat_open", False) is not True:
+                self.app.chat_open = True
+                self._drain_paused = True
+        elif getattr(self, "_drain_paused", False):
+            self._drain_paused = False
+            if getattr(self.app, "chat_open", False) is True:
+                self.app.chat_open = False
+
+    def _rb_transition(self, en):
+        if self._rb_was and not en:
+            self._rb_held.clear()
+            try:
+                while True:
+                    self._rb_q.get_nowait()                # (what was still waiting to be sent is dropped: it would only add leftover keys)
+            except queue.Empty:
+                pass
+            self._rb_put("reset", True)                    # (virtual keys are let go, the keys you really hold go back to the game)
+        self._rb_was = en
+
+    def _rb_space(self, is_down):
+        """Space twice quickly while the mana drains at a climbing speed (or within CLIMB_CONFIRM s of it starting) = climbing: Block Run is off and its
+        keys are let go, until Space is pressed again."""
+        if not is_down:
+            self._sp_down = False
+            return
+        if self._sp_down:
+            return
+        self._sp_down = True
+        now = time.time()
+        if self._climb:
+            self._climb, self._sp_last, self._climb_pending = False, -1e9, 0.0
+            self._pause_sync(now)
+            return
+        T = self.app.tracker
         try:
-            if not self.game_active():
-                return
-            send_key("w", True)
-            send_key("w")
-            self._spin(1)
-            send_key("w", True)
-            self._spin(1)
-            send_key("f")
-            self._spin(10)
-            send_key("w")
-            t0 = time.perf_counter()
-            while self._phys[0x46] and not self.quit.is_set() and time.perf_counter() - t0 < 30:
-                time.sleep(0)
-            send_key("f", True)
-            self._spin(10)
-            if not self._phys[0x57]:
-                send_key("w", True)
+            win = max(0.05, float(self.app.cfg["settings"].get("climb_window", 0.5)))
+        except (TypeError, ValueError):
+            win = 0.5
+        if now - self._sp_last <= win:
+            self._sp_last = -1e9
+            d = getattr(self.app, "slow_drain", None)
+            if d is not None and d.climbing(now):
+                self._climb, self._climb_seen = True, now           # (the mana is draining like a climb already)
+                self._rb_transition(False)
+                self._pause_sync(now)
+            else:
+                self._climb_pending = now + CLIMB_CONFIRM            # (a double Space alone changes nothing - Whisperer's double jump is one too -
+                                                                     #  only a climbing-speed drain seen within a moment makes it a climb)
+        else:
+            self._sp_last = now
+
+    def rb_event(self, vk, is_down):
+        """A real key event: True when the tool takes it (W / S / F / Q while Block Run is on - the tool sends what the game should see)."""
+        try:
+            self._rb_init()
+            if vk == 0x20:
+                self._rb_space(is_down)
+                return False
+            name = RB_KEYS.get(vk)
+            if name is None:
+                return False
+            en = self.rb_enabled()
+            self._rb_transition(en)
+            if not en:
+                self._rb_held.discard(vk)
+                return False
+            swallow = name in RB_SWALLOW
+            if is_down:
+                if vk in self._rb_held:
+                    return swallow                           # (key repeat)
+                self._rb_held.add(vk)
+            else:
+                self._rb_held.discard(vk)
+            self._rb_put(name, is_down)
+            return swallow
         except Exception:
-            pass
+            return False
 
     def cast_run_wanted(self, pt, t=None):
         """Cast Run applies to a left click that CASTS a held spell while W is held (the run does not have to be detected)."""
         S = self.app.cfg["settings"]
-        if not S.get("cast_run") or getattr(self.app, "chat_open", False) is True or not self._phys[0x57]:
+        if not S.get("cast_run") or keys_off(self.app):
+            return False
+        if not (self._phys[0x57] or self._cr_engine(True)):         # (W held, or Block Run is in run mode in any direction)
             return False
         T = self.app.tracker
         a = T.armed
-        if not a or not T.is_spell(a[0]) or not T.on or not self.game_active():
+        if not a or not T.is_cast_spell(a[0]) or not T.on or not self.game_active():
             return False
         if self.over_window(pt) or self.slot_at(pt):
             return False
         return True
+
+    def _cr_engine(self, running=False):
+        """True when the Block Run engine does the Cast Run (all directions). With running=True: only while it is in run mode."""
+        try:
+            rb = getattr(self, "rb", None)
+            if rb is None or not self.app.cfg["settings"].get("block_run") or not self.rb_enabled():
+                return False
+            return bool(rb.trick) if running else True
+        except Exception:
+            return False
 
     def _cr_lock_s(self):
         try:
@@ -6485,17 +7877,184 @@ class InputWatcher(threading.Thread):
         except Exception:
             return False
 
+    def gf_why(self, pt, t=None):
+        """'ok' when a right click at pt is a snap Ignis the tool should do G + F for, else the reason it is not ."""
+        try:
+            if keys_off(self.app):
+                return "chat is open"
+            if not self.game_active():
+                return "Roblox is not in front"
+            T = self.app.tracker
+            if not T.on:
+                return "tracker is off"
+            if self.over_window(pt):
+                return "cursor over the tool's window"
+            if self.slot_at(pt):
+                return "cursor over a hotbar slot"
+            r = T.gf_why(time.time() if t is None else t)
+            if r == "ok" and getattr(self, "_phys", {}).get(0x47) and getattr(T, "gf_mode", None) != "hold":
+                return "you are holding G"                     # (green box: nothing while you hold G; the white box takes over your G instead)
+            return r
+        except Exception as e:
+            return f"error {e!r}"
+
+    def gf_wanted(self, pt, t=None):
+        return self.gf_why(pt, t) == "ok"
+
+    GF_SCAN = {"g": 0x22, "f": 0x21}                           # the keys of the snap Ignis sequence, by scan code
+
+    @staticmethod
+    def send_gf(name, up=False):
+        send_key(name, up)                                      # (virtual-key presses, as before: they worked; the scan-code version did not)
+
+    def gf_g_event(self, is_down):
+        """The user's G while the tool is holding G (virtual key) for them after a snap Ignis: their key repeat is swallowed, and when they let go
+        the tool sends the G release. True when the event was taken."""
+        if not getattr(self, "_gf_virtual", False):
+            return False
+        if not is_down:
+            self._gf_virtual = False
+            try:
+                send_key("g", True)
+            except Exception:
+                pass
+        return True
+
+    def vir_why(self, pt, t=None):
+        try:
+            if keys_off(self.app):
+                return "chat is open"
+            if not self.game_active():
+                return "Roblox is not in front"
+            T = self.app.tracker
+            if not T.on:
+                return "tracker is off"
+            if self.over_window(pt):
+                return "cursor over the tool's window"
+            if self.slot_at(pt):
+                return "cursor over a hotbar slot"
+            return T.vir_why(time.time() if t is None else t)
+        except Exception as e:
+            return f"error {e!r}"
+
+    def vir_fire(self, pt):
+        """The Viribus key went down: left click (casts it), wait, hold F. True when the tool took it (a running sequence also takes it)."""
+        try:
+            if getattr(self, "_vir_thread", None) is not None and self._vir_thread.is_alive():
+                return self.vir_why(pt) == "ok"
+            if self.vir_why(pt) != "ok":
+                return False
+            self.events.put(("click", "left", time.time(), pt))      # (the tracker sees a left click: Viribus is cast, its cooldown starts)
+            self._vir_thread = threading.Thread(target=self._vir_seq, daemon=True)
+            self._vir_thread.start()
+            return True
+        except Exception:
+            return False
+
+    def _vir_seq(self):
+        S = self.app.cfg["settings"]
+        def ms(k, d):
+            try:
+                return max(0.0, float(S.get(k, d))) / 1000.0
+            except (TypeError, ValueError):
+                return d / 1000.0
+        cd = fd = False
+        try:
+            send_click(False)
+            cd = True
+            self._spin(10)
+            send_click(True)
+            cd = False
+            time.sleep(ms("vir_wait_ms", 450.0))
+            send_key("f")
+            fd = True
+            time.sleep(ms("vir_hold_ms", 700.0))
+            send_key("f", True)
+            fd = False
+        except Exception:
+            pass
+        finally:
+            for flag, fn in ((cd, lambda: send_click(True)), (fd, lambda: send_key("f", True))):
+                if flag:
+                    try:
+                        fn()
+                    except Exception:
+                        pass
+
+    GF_HOLD = 0.4                                              # seconds F is held after the snap Ignis
+
+    def gf_cast(self, pt):
+        """A right click that casts a snap Ignis with a green / white cooldown box: the click goes through as it is; right after it the tool
+        presses G and holds F for GF_HOLD seconds. True when the sequence was started."""
+        try:
+            if self._gf_thread is not None and self._gf_thread.is_alive():
+                return False
+            if self.gf_why(pt) != "ok":
+                return False
+            self._gf_thread = threading.Thread(target=self._gf_seq, daemon=True)
+            self._gf_thread.start()
+            return True
+        except Exception:
+            return False
+
+    def _gf_seq(self):
+        """G for 50 ms, then F for GF_HOLD seconds. Green box: not started while the user holds G. White box (hold): the tool then holds G for them."""
+        phys = getattr(self, "_phys", {})
+        hold = getattr(self.app.tracker, "gf_mode", None) == "hold"
+        gd = fd = False
+        try:
+            if hold and phys.get(0x47):
+                self._gf_virtual = True                         # from now on the tool is the only one talking to the game about G: your key repeats
+                                                                # would make the tool's G press at the end a "repeat" (the game ignores those)
+            self._spin(10 if hold else 150)                      # (the game gets the click first: white box 10 ms, green box 150 ms)
+            self.send_gf("g")
+            gd = True
+            self._spin(50)
+            self.send_gf("g", True)
+            gd = False
+            self.send_gf("f")                                   # F immediately after the G
+            fd = True
+            time.sleep(self.GF_HOLD)
+            self.send_gf("f", True)
+            fd = False
+            if hold:
+                self._spin(25)                                  # (a short pause before the user's held G takes over)
+                if phys.get(0x47) and self._gf_virtual:         # the user is still holding G: the tool holds it (virtual key) until they let go
+                    self.send_gf("g")
+                    if not phys.get(0x47) and self._gf_virtual: # (they let go meanwhile)
+                        self._gf_virtual = False
+                        self.send_gf("g", True)
+                else:
+                    self._gf_virtual = False
+        except Exception:
+            pass
+        finally:
+            for flag, key in ((gd, "g"), (fd, "f")):
+                if flag:
+                    try:
+                        self.send_gf(key, True)                 # (nothing stays held down)
+                    except Exception:
+                        pass
+
     def cast_run(self, pt):
         try:
-            if self._cr_thread is not None and self._cr_thread.is_alive():
+            ev = getattr(self, "_cr_done", None)
+            if (self._cr_thread is not None and self._cr_thread.is_alive()) or (ev is not None and not ev.is_set()):
                 return False
             if not self.cast_run_wanted(pt):
                 return False
+            if self._phys.get(0x47):                           # the user is holding G (charging mana) while they cast: the game stops seeing their G now
+                send_key("g", True)
+                self._g_cut = True                             # (their key repeats are swallowed until they let go of G)
             self._cr_hold = True
             self._cr_block_until = time.time() + self._cr_lock_s()
             self._cr_block_key = self.app.tracker.armed[0]
-            self._cr_thread = threading.Thread(target=self._cast_run_seq, daemon=True)
-            self._cr_thread.start()
+            if self._cr_engine():
+                self._cr_done = threading.Event()
+                self._rb_put("cast", self._cr_done)                # (the Block Run engine casts it: W / S / A / D, whichever way you run)
+            else:
+                self._cr_thread = threading.Thread(target=self._cast_run_seq, daemon=True)
+                self._cr_thread.start()
             return True
         except Exception:
             self._cr_hold = False
@@ -6528,15 +8087,53 @@ class InputWatcher(threading.Thread):
         t = self._cr_thread
         if t is not None:
             t.join(0.5)
+        ev = getattr(self, "_cr_done", None)
+        if ev is not None:
+            ev.wait(0.5)
         try:
             send_click(True)
         except Exception:
             pass
 
+    def ac_pressed(self, spec, label):
+        """A key / mouse button went down (not the tool's own, not a key repeat): picks the Autoclicker key, or pauses / resumes it."""
+        cb = self.ac_capture
+        if cb is not None:
+            self.ac_capture = None
+            cb(spec, label)
+            return
+        cb = getattr(self, "vir_capture", None)
+        if cb is not None:
+            self.vir_capture = None
+            cb(spec, label)
+            return
+        S = self.app.cfg["settings"]
+        if spec == S.get("vir_key", "m2") and spec != "m2":
+            self.vir_fire(cursor_pos())                    # (a key / button other than the right click: it is not taken, the game sees it too)
+        if S.get("autoclick") and spec == S.get("autoclick_key", "m3") and self.game_active():
+            self.app.ac_on = not getattr(self.app, "ac_on", True)
+
+    def autoclick_hits(self):
+        """True when the autoclicker's next click would be the one that casts the armed MOVE (not a weapon / spell, not cooling down): the
+        tool's own clicks are ignored by the tracker, so the autoclicker tells it about this one."""
+        T = self.app.tracker
+        now = time.time()
+        with T.lock:
+            a = T._live_armed(now)
+            if not a:
+                return False
+            mv = T.move_for(a[0])
+            if not mv or mv.get("spell") or T.is_weapon(mv):
+                return False
+            busy = max(T.ready_at.get(a[0], 0.0), T.m2_ready.get(a[0], 0.0)) if T._shared(mv) else T.ready_at.get(a[0], 0.0)
+            return busy - now <= T.cfg["settings"]["grace"]
+
     def autoclick_wanted(self, pt):
         S = self.app.cfg["settings"]
-        if not S.get("autoclick") or getattr(self.app, "chat_open", False) is True:
+        if not S.get("autoclick") or keys_off(self.app) or not getattr(self.app, "ac_on", True):
             return False
+        if getattr(self.app, "hp_missing", False) is True:
+            return False                              # no health bar (inventory / menu): the autoclicker waits
         T = self.app.tracker
         a = T.armed
         if a and T.is_spell(a[0]):
@@ -6561,11 +8158,20 @@ class InputWatcher(threading.Thread):
             T = self.app.tracker
             while self._lheld and not self.quit.is_set():
                 time.sleep(0.03)
-                if not self._lheld or getattr(self.app, "chat_open", False) is True or not self.game_active():
+                if (not self._lheld or keys_off(self.app) or not self.game_active()
+                        or not getattr(self.app, "ac_on", True) or getattr(self.app, "hp_missing", False) is True):
                     break
+                if time.time() - getattr(self, "_ac_key_t", 0.0) < AC_KEY_WAIT:
+                    continue                          # a hotbar key was just pressed: no click until the tool has seen what is in hand now
+                                                      # (a click with a spell in hand while running = the run stops: that is what Cast Run is for)
                 a = T.armed
                 if a and T.is_spell(a[0]):
                     break                             # a spell is held now: stop, and stay off until the button is pressed again
+                try:
+                    if self.autoclick_hits():
+                        self.events.put(("click", "left", time.time(), cursor_pos()))     # (the click that casts the move you just armed: its cooldown starts)
+                except Exception:
+                    pass
                 send_click(False)
                 send_click(True)
         except Exception:
@@ -6575,11 +8181,38 @@ class InputWatcher(threading.Thread):
         try:
             if n_code >= 0 and w_param in (WM_LBUTTONDOWN, WM_LBUTTONUP):
                 _inf = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                if _inf.dwExtraInfo != TRAIN_TAG:
+                if _inf.dwExtraInfo != TRAIN_TAG and not (_inf.flags & 0x1):      # (a click another program sent, e.g. an AutoHotkey script: not the user's button)
                     self._lheld = (w_param == WM_LBUTTONDOWN)
+            if n_code >= 0 and w_param in (WM_MBUTTONDOWN, WM_XBUTTONDOWN):
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if info.dwExtraInfo != TRAIN_TAG:
+                    if w_param == WM_MBUTTONDOWN:
+                        b = "m3"
+                    else:
+                        b = {1: "m4", 2: "m5"}.get((info.mouseData >> 16) & 0xFFFF)
+                    if b:
+                        self.ac_pressed(b, b.upper())
             if n_code >= 0 and w_param in (WM_LBUTTONUP, WM_RBUTTONUP) and w_param in self._cl_swallow:
                 self._cl_swallow.discard(w_param)                # (the button that went down on the checklist doesn't come up in the game)
                 return 1
+            if n_code >= 0 and getattr(self.app, "gate_open", False) is True and w_param in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MOUSEWHEEL):
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if info.dwExtraInfo != TRAIN_TAG:
+                    x, y = info.pt.x, info.pt.y
+                    col = None
+                    for i, (a, b, c, d) in enumerate(tuple(getattr(self.app, "gate_rects", ()))):
+                        if a <= x < c and b <= y < d:
+                            col = "L" if i == 0 else "R"
+                    if col is not None:                                    # on the gate boxes: they take the click / wheel, the game doesn't
+                        if w_param == WM_MOUSEWHEEL:
+                            self.app.q.put(("gate_wheel", col, ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value))
+                        else:
+                            self._cl_swallow.add(WM_LBUTTONUP if w_param == WM_LBUTTONDOWN else WM_RBUTTONUP)
+                            if w_param == WM_LBUTTONDOWN:
+                                self.app.q.put(("gate_click", x, y))
+                        return 1
+                    if w_param == WM_LBUTTONDOWN:
+                        self.gate_hide()                                   # (a left click anywhere else closes them; the click goes through)
             rects = tuple(getattr(self.app, "cl_rects", ())) + tuple(getattr(self.app, "kda_rects", ()))
             if n_code >= 0 and rects and w_param in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MOUSEWHEEL):
                 info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
@@ -6597,14 +8230,31 @@ class InputWatcher(threading.Thread):
                     self.app.chat_open = False                                # a click closes the chat box
                 button = "left" if w_param == WM_LBUTTONDOWN else "right"
                 if info.dwExtraInfo != TRAIN_TAG:                              # (Snap Training's own click is ignored)
+                    if w_param == WM_RBUTTONDOWN:
+                        if self.vir_capture is not None:                       # picking the Viribus key: this right click is it
+                            cb, self.vir_capture = self.vir_capture, None
+                            cb("m2", "Right click")
+                            self._vir_drop_up = True
+                            return 1
+                        if self.app.cfg["settings"].get("vir_key", "m2") == "m2" and self.vir_fire((info.pt.x, info.pt.y)):
+                            self._vir_drop_up = True
+                            return 1                                          # (the right click is taken: the tool sends the left click + F instead)
                     if w_param == WM_LBUTTONDOWN and self.cast_run_blocked((info.pt.x, info.pt.y)):
                         self._cr_drop_up = True
                         return 1                                              # (a click right after a Cast Run is dismissed: not seen by the game or the tool)
                     self.events.put(("click", button, time.time(), (info.pt.x, info.pt.y)))
                     if w_param == WM_LBUTTONDOWN and self.cast_run((info.pt.x, info.pt.y)):
                         return 1                                              # (this click is sent by the Cast Run itself, between the W presses)
-                    if w_param == WM_LBUTTONDOWN:
+                    if w_param == WM_RBUTTONDOWN:
+                        self.gate_rclick((info.pt.x, info.pt.y))              # (Gate armed: the shortcut boxes come up)
+                        self.gf_cast((info.pt.x, info.pt.y))                  # (snap Ignis with a green / white box: the click goes through as it is, then G + F)
+                    if w_param == WM_LBUTTONDOWN and not (info.flags & 0x1):          # LLMHF_INJECTED: clicks from AutoHotkey never start the autoclicker
                         self.autoclick((info.pt.x, info.pt.y))
+            if n_code >= 0 and w_param == WM_RBUTTONUP and self._vir_drop_up:
+                info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                if info.dwExtraInfo != TRAIN_TAG:
+                    self._vir_drop_up = False
+                    return 1
             if n_code >= 0 and w_param == WM_LBUTTONUP and self._cr_drop_up:
                 info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                 if info.dwExtraInfo != TRAIN_TAG:
@@ -6774,6 +8424,41 @@ class InputWatcher(threading.Thread):
             msg = T.click(t, name, runes)           # name is 'left' or 'right'
             if msg:
                 self.app.q.put(("msg", msg))
+            for tk_, tt_ in (T.take_ten_pend() if name == "right" else ()):
+                threading.Thread(target=self._ten_look, args=(tk_, tt_), daemon=True).start()
+
+    def _ten_say(self, text):
+        """(spamming Tenebris makes one of these per click: at most one a second)"""
+        now = time.time()
+        if now - getattr(self, "_ten_say_t", 0.0) >= 1.0:
+            self._ten_say_t = now
+            self.app.q.put(("msg", text))
+
+    def _ten_look(self, key, t):
+        """Snap Tenebris: the mana has to be charged (TENEBRIS_BELOW % or more) when you click, and the click counts THE MOMENT it falls below
+        TENEBRIS_BELOW % (every cast / orb drains it), for at most TENEBRIS_LOOK s. Says why when it doesn't."""
+        try:
+            read = self.app.read_mana_pct
+            pct = read()
+            if pct is None:
+                self._ten_say("Snap Tenebris: couldn't read the mana bar - the click isn't counted (check the mana bar setup)")
+                return
+            if pct < TENEBRIS_BELOW:
+                self._ten_say(f"Snap Tenebris: the mana was {pct:.0f}% (not charged) - the click isn't counted")
+                return
+            end = t + TENEBRIS_LOOK
+            while time.time() < end:
+                time.sleep(0.015)
+                pct = read()
+                if pct is not None and pct < TENEBRIS_BELOW:
+                    m = self.app.tracker.ten_confirm(key, t)
+                    if m:
+                        self.app.q.put(("msg", m))
+                    return
+            self._ten_say(f"Snap Tenebris: the mana never fell below {TENEBRIS_BELOW:g}% (it reads {pct:.0f}%) - the click isn't counted"
+                          if pct is not None else "Snap Tenebris: couldn't read the mana bar - the click isn't counted")
+        except Exception as e:
+            self._ten_say(f"Snap Tenebris: the mana check failed ({type(e).__name__}: {e})")
 
     def run(self):
         if not IS_WIN:
@@ -6799,9 +8484,450 @@ UI_FONT_FAMILY = None    # None = use Manufaktur if it can be found, else Segoe 
 
 # palette sampled straight from the mockup
 PARCH, GREYT, BROWN = "#d7cbbf", "#b1a79d", "#423529"
+def climb_paused(app):
+    """True while the mana drains slowly (the player is climbing) or Space was double-tapped while it drained at a climbing speed."""
+    try:
+        if getattr(getattr(app, "inputs", None), "_climb", False) is True:
+            return True
+        d = getattr(app, "slow_drain", None)
+        return d is not None and d.blocking(time.time()) is True
+    except Exception:
+        return False
+
+
+def keys_off(app):
+    """Every keybind / Block Run / AutoHotkey is off: typing in the chat, the Esc menu, or climbing."""
+    return getattr(app, "chat_open", False) is True or climb_paused(app)
+
+
+CLIMB_CONFIRM = 1.0                         # seconds after Space twice in which a climbing-speed mana drain has to be seen
+EMPTY_MANA = 1.0                            # % - at or below this the mana is empty
+CLIMB_CHECK = 0.3                           # ... and how long a steady fall has to be seen for (after Space twice, so the look is short and a bit looser)
+CLIMB_END = 5.0                             # seconds without the mana falling at all after which a climb is over (Space ends it earlier)
+RB_VK = {"w": 0x57, "s": 0x53, "f": 0x46, "q": 0x51, "g": 0x47, "up": 0x26, "down": 0x28}
+RB_KEYS = {0x57: "w", 0x53: "s", 0x41: "a", 0x44: "d", 0x51: "q", 0x46: "f", 0x47: "g"}      # the keys Block Run looks at
+RB_SWALLOW = ("w", "s", "q", "f")                                                              # ... and takes (the others pass through)
+
+
+class RunBlock:
+    """The all-directional Block Run AutoHotkey script. handle(key, down) is one of its hotkeys; send(name, up) presses a key for the game,
+    sleep(ms) waits. W / S / F / Q are taken by the tool (the caller swallows them); A / D / G only pass through and are tracked."""
+    TAP, FIRST, DBL, RUNTAP, GAP = 180, 400, 500, 200, 10     # tapThreshold, firstHoldThreshold, doubleTapWindow, runTapWindow, runGap (ms)
+
+    def __init__(self, send, sleep, phys=None, clock=None, gate=None):
+        self._send, self.sleep = send, sleep
+        self.gate = gate                                           # () -> True while Block Run may act; else a key is only sent as it is
+        self.vdown = {}                                            # the keys the tool is holding down for the game right now (insertion order)
+        self.phys = phys or (lambda: (False, False, False))
+        self.clock = clock or (lambda: time.perf_counter() * 1000.0)
+        self.clear()
+
+    def clear(self):
+        self.lastA = self.lastD = self.lastS = self.lastW = -10000.0
+        self.dashing = self.fDown = self.blockMode = 0
+        self.cast_clicked = False
+        self.wDown = self.aDown = self.sDown = self.dDown = 0
+        self.trick = self.walkEntered = self.upHeld = self.downHeld = self.wIsSecond = 0
+        self.wPressTime = 0.0
+
+    def send(self, name, up=False):
+        if name != "click":                                        # (the mouse button is let go by the Cast Run when the user lets go)
+            if up:
+                self.vdown.pop(name, None)
+            else:
+                self.vdown[name] = True
+        self._send(name, up)
+
+    def dirty(self):
+        return bool(self.vdown or self.trick or self.upHeld or self.downHeld or self.blockMode or self.dashing or self.fDown)
+
+    def reset(self, hand_back=True):
+        """Block Run goes off (slow mana drain / climbing): EVERY key the tool is still holding down for the game is let go (no leftover
+        arrow / W / S / F / Q); the W / S / F you really hold go back to the game."""
+        w, s, f = (tuple(self.phys()) + (False, False, False))[:3]
+        self.clear()
+        held = list(self.vdown)
+        for k in ("w", "up", "down", "s", "f", "q"):               # (the usual ones first, then anything else)
+            if k in held:
+                self.send(k, True)
+        for k in held:
+            if k in self.vdown:
+                self.send(k, True)
+        self.vdown.clear()
+        if hand_back and held:
+            self.sleep(30)
+            w, s, f = (tuple(self.phys()) + (False, False, False))[:3]      # (look again: you may have let go meanwhile)
+            for k, down in (("w", w), ("s", s), ("f", f)):
+                if k in held and not down:
+                    self.send(k, True)                                       # a key you let go must not stay held for the game
+                    self.vdown.pop(k, None)
+        if hand_back:
+            if w and "w" in held:                                  # (only a key the tool had let go: the game still needs it held)
+                self.send("w", False)
+            if s and "s" in held:
+                self.send("s", False)
+            if f and "f" in held:
+                self.send("f", False)
+
+    def handle(self, key, down):
+        if self.gate is not None and not self.gate():
+            if key in ("w", "s", "f", "q"):                        # (switched off - climbing: W sends W, S sends S ... nothing else)
+                self.send(key, not down)
+            return
+        getattr(self, ("on_" if down else "off_") + key)()
+
+    def _exit_sprint(self):
+        for k in ("up", "down", "s", "w"):
+            self.send(k, True)
+        self.trick = self.walkEntered = self.wIsSecond = self.upHeld = self.downHeld = 0
+        if self.wDown:
+            self.send("w", False)
+        if self.sDown:
+            self.send("s", False)
+
+    # ---- W ----
+    def on_w(self):
+        if self.wDown:
+            return
+        self.wDown = 1
+        self.wPressTime = self.clock()
+        self.wIsSecond = 1 if self.wPressTime - self.lastW <= self.DBL else 0
+        self.lastW = self.wPressTime
+        if self.trick:
+            if self.wIsSecond:
+                if self.upHeld:
+                    self.send("up", True)
+                    self.upHeld = 0
+                self.send("w", True); self.sleep(15)
+                self.send("w", False); self.sleep(15)
+                self.send("w", True); self.sleep(15)
+                self.send("w", False)
+                self.walkEntered = 0
+            self.update()
+        else:
+            self.send("w", False)
+
+    def off_w(self):
+        self.wDown = 0
+        needed = self.TAP if self.wIsSecond else self.FIRST
+        if self.trick:
+            self.update()
+        elif (self.aDown or self.dDown or self.sDown) and self.clock() - self.wPressTime >= needed:
+            self.enter_trick()
+            if self.trick:
+                self.walkEntered = 0 if self.wIsSecond else 1
+        else:
+            self.send("w", True)
+
+    # ---- S ----
+    def on_s(self):
+        if self.sDown:
+            return
+        self.sDown = 1
+        now = self.clock()
+        dbl = 1 if now - self.lastS <= self.RUNTAP else 0
+        self.lastS = now
+        if self.trick:
+            self.update()
+        elif self.wDown:
+            self.enter_trick()
+        elif dbl:
+            self.lastS = -10000.0
+            self.start_run()
+        else:
+            self.send("s", False)
+
+    def off_s(self):
+        self.sDown = 0
+        if self.trick:
+            self.update()
+        else:
+            self.send("s", True)
+
+    # ---- A / D ----
+    def on_a(self):
+        if self.aDown:
+            return
+        self.aDown = 1
+        now = self.clock()
+        dbl = 1 if now - self.lastA <= self.RUNTAP else 0
+        self.lastA = now
+        if self.trick:
+            self.update()
+        elif dbl and not self.wDown:
+            self.lastA = -10000.0
+            self.start_run()
+
+    def off_a(self):
+        self.aDown = 0
+        if self.trick:
+            self.update()
+
+    def on_d(self):
+        if self.dDown:
+            return
+        self.dDown = 1
+        now = self.clock()
+        dbl = 1 if now - self.lastD <= self.RUNTAP else 0
+        self.lastD = now
+        if self.trick:
+            self.update()
+        elif dbl and not self.wDown:
+            self.lastD = -10000.0
+            self.start_run()
+
+    def off_d(self):
+        self.dDown = 0
+        if self.trick:
+            self.update()
+
+    # ---- Q (dash) ----
+    def on_q(self):
+        if not self.trick:
+            self.send("q", False)
+            return
+        if self.dashing:
+            return
+        self.dashing = 1
+        if not self.wDown:
+            self.send("w", True)
+            if self.sDown:
+                self.send("s", False)
+        self.sleep(15)
+        self.send("q", False)
+
+    def off_q(self):
+        self.send("q", True)
+        if self.dashing:
+            self.dashing = 0
+            self.sleep(40)
+            if self.trick:
+                self._exit_sprint()
+
+    # ---- G (mana charge ends the sprint) ----
+    def on_g(self):
+        if self.trick:
+            self._exit_sprint()
+
+    def off_g(self):
+        pass
+
+    # ---- F (block) ----
+    def on_f(self):
+        if self.fDown:
+            return
+        self.fDown = 1
+        if self.trick:
+            self.blockMode = 1
+            self.send("w", True); self.send("w", False); self.sleep(1)
+            self.send("w", True); self.sleep(1)
+            self.send("f", False); self.sleep(10)
+            self.send("w", False)
+            if not self.wDown:
+                self.send("up", False); self.sleep(self.GAP)
+                self.send("up", True)
+                self.upHeld = 0
+            if self.downHeld:
+                self.send("down", True); self.sleep(15)
+                self.send("down", False)
+        elif self.wDown:
+            self.blockMode = 2
+            self.send("w", True); self.send("w", False); self.sleep(1)
+            self.send("w", True); self.sleep(1)
+            self.send("f", False); self.sleep(10)
+            self.send("w", False)
+        else:
+            self.blockMode = 0
+            self.send("f", False)
+
+    def off_f(self):
+        self.fDown = 0
+        self.send("f", True)
+        if self.blockMode:
+            self.sleep(10)
+            if self.blockMode == 2 and not self.wDown and not self.trick:
+                self.send("w", True)
+        self.blockMode = 0
+
+    # ---- Cast Run (360): the same as F, but the spell is cast instead of F being pressed ----
+    def on_cast(self):
+        """A spell is cast while running: W + cast = a forward cast, S + cast (backward run) = a backward cast, A / D too. The click goes down
+        here; the caller lets it go when the user lets go of the mouse button. Returns True when the click was sent."""
+        self.cast_clicked = False
+        if not (self.trick or self.wDown):
+            self.send("click", False)                               # (not running: a plain cast)
+            self.cast_clicked = True
+            return True
+        self.send("w", True); self.send("w", False); self.sleep(1)
+        self.send("w", True); self.sleep(1)
+        self.send("click", False)
+        self.cast_clicked = True
+        self.sleep(10)
+        self.send("w", False)
+        if self.trick:
+            if not self.wDown:
+                self.send("up", False); self.sleep(self.GAP)
+                self.send("up", True)
+                self.upHeld = 0
+            if self.downHeld:
+                self.send("down", True); self.sleep(15)
+                self.send("down", False)
+        elif not self.wDown:
+            self.send("w", True)
+        return True
+
+    # ---- logic ----
+    def start_run(self):
+        if self.sDown and not self.wDown:
+            self.send("down", False)
+            self.downHeld = 1
+        self.send("w", False); self.send("w", True)           # (a quick W tap)
+        self.sleep(self.GAP)
+        self.send("w", False)
+        self.enter_trick(self.GAP)
+
+    def enter_trick(self, hold=40):
+        self.trick = 1
+        self.walkEntered = 0
+        self.send("s", True)
+        if self.sDown and not self.wDown and not self.downHeld:
+            self.send("down", False)
+            self.downHeld = 1
+        self.send("up", False)
+        self.sleep(hold)
+        self.send("up", True)
+        self.upHeld = 0
+        self.update()
+
+    def update(self):
+        if not (self.wDown or self.aDown or self.sDown or self.dDown):
+            self.exit_trick()
+            return
+        want_up = bool(self.wDown and not self.sDown)
+        want_down = bool(self.sDown and not self.wDown)
+        if want_up and not self.upHeld:
+            self.send("up", False)
+            self.upHeld = 1
+        elif not want_up and self.upHeld:
+            self.send("up", True)
+            self.upHeld = 0
+        if want_down and not self.downHeld:
+            self.send("down", False)
+            self.downHeld = 1
+        elif not want_down and self.downHeld:
+            self.send("down", True)
+            self.downHeld = 0
+
+    def exit_trick(self):
+        for k in ("w", "up", "down", "s"):
+            self.send(k, True)
+        self.trick = self.walkEntered = self.upHeld = self.downHeld = 0
+
+
+class SlowDrain:
+    """Detects a slow mana drain: the mana % keeps falling steadily at lo..hi % per second (a straight line, a little reading noise allowed;
+    no sudden drop like a cast, no charging). feed(now, pct) with every mana reading (None = the bar can't be read: starts over)."""
+
+    NOISE = 2.5                            # the largest distance (in %) of a reading from the straight line (the bar is read in steps of 1-2 %)
+    STEP_RATE = 25.0                       # no single reading may drop faster than this many % per second (a cast; a reading is ~0.25 s)
+
+    def __init__(self, cfg_settings):
+        self.S = cfg_settings
+        self.pts = []                      # (time, mana %) of the last second or so
+        self.active = False
+        self.rate = 0.0                    # % per second of the window (for the log / a later display)
+        self.last_active = self.last_feed = -1e9
+
+    def _num(self, k, d):
+        try:
+            return float(self.S.get(k, d))
+        except (TypeError, ValueError):
+            return d
+
+    def reset(self):
+        self.pts.clear()
+        self.active, self.rate = False, 0.0
+
+    @staticmethod
+    def fit(pts):
+        """(fall in % per second of the straight line through the readings, the largest distance from it, the fastest single step down in % per second)
+        or None. The readings come 4-20 times a second, so a step is judged by the time it took (at least 0.25 s)."""
+        if len(pts) < 2:
+            return None
+        ts = np.array([t for t, _ in pts]) - pts[0][0]
+        vs = np.array([v for _, v in pts])
+        if ts[-1] <= 0:
+            return None
+        k, c = np.polyfit(ts, vs, 1)
+        resid = float(np.max(np.abs(vs - (k * ts + c))))
+        dts = np.maximum(ts[1:] - ts[:-1], 0.25)
+        step = float(np.max((vs[:-1] - vs[1:]) / dts))
+        return -float(k), resid, step
+
+    def _window(self, now, secs):
+        pts = [(t, v) for t, v in self.pts if now - t <= secs + 0.25]
+        if len(pts) < (2 if secs < 0.5 else 3) or pts[-1][0] - pts[0][0] < secs * 0.6 or now - self.last_feed > 0.7:
+            return None                                    # (a short look can do with two readings: they may come only 4 times a second)
+        return pts
+
+    def _is_drain(self, pts, short=False):
+        f = self.fit(pts)
+        if f is None or pts[-1][1] <= 0.5:
+            return False, 0.0
+        rate, resid, step = f
+        lo, hi = self._num("climb_rate_lo", 3.5), self._num("climb_rate_hi", 10.0)
+        if short:
+            lo, hi = lo * 0.5, hi * 1.6                       # (a short look sees only a step or two of the bar: the range is wider)
+        return (lo <= rate <= hi and resid <= self.NOISE and step <= self.STEP_RATE), rate
+
+    def climbing(self, now, secs=None):
+        """A short look (CLIMB_CHECK s): is the mana falling like a climb right now?"""
+        secs = CLIMB_CHECK if secs is None else secs
+        pts = self._window(now, secs)
+        return bool(pts and self._is_drain(pts, secs < 0.5)[0])
+
+    def empty(self, now):
+        """The mana has run out (the latest reading is about 0): a climb is over, Block Run is back at once."""
+        return bool(self.pts and self.pts[-1][1] <= EMPTY_MANA and now - self.last_feed < 0.7)
+
+    def falling(self, now, secs=1.0):
+        """Is the mana still falling at all (a climb that has gone on: the reading may be noisy, or the mana nearly empty)?"""
+        pts = self._window(now, secs)
+        if not pts:
+            return False
+        if pts[-1][1] <= 2.0:
+            return True
+        f = self.fit(pts)
+        return bool(f and f[0] >= max(0.5, self._num("climb_rate_lo", 3.5) * 0.25) and f[2] <= self.STEP_RATE * 1.5)
+
+    def blocking(self, now, hold=0.6):
+        """True while a slow drain is going on (readings still coming in) and for `hold` seconds after the last time it was seen."""
+        return (self.active and now - self.last_feed < 0.6) or now - self.last_active < hold
+
+    def feed(self, now, pct):
+        self.last_feed = now
+        if pct is None:
+            self.reset()
+            return False
+        secs = max(0.3, self._num("climb_rate_win", 0.6))
+        self.pts.append((now, float(pct)))
+        while self.pts and now - self.pts[0][0] > max(secs, 0.7) + 0.4:
+            self.pts.pop(0)
+        pts = self._window(now, secs)
+        ok, self.rate = self._is_drain(pts) if pts else (False, 0.0)
+        self.active = bool(ok)
+        if self.active:
+            self.last_active = now
+        if float(pct) <= EMPTY_MANA:
+            self.active, self.last_active = False, -1e9         # (no mana left: no drain, and no waiting before Block Run is back)
+        return self.active
+
+
+AC_KEY_WAIT = 0.12                         # seconds after a hotbar key press in which the autoclicker doesn't click
 TAN, TAN_HI, TAN_DN = "#d8bca1", "#e8d2bb", "#c4a688"
 ORANGE, CREAM = "#e8ad72", "#ffdda2"
 OKGREEN, DIM = "#4f8a2b", "#8d8379"
+VIR_BOX = "#8ec8ff"                        # name box of a Viribus spell: its key casts it and holds F
 GREEN_BOX = "#a3d484"                      # M2 box: M1 and M2 DON'T share; name box: the move unequips after use
 
 WIN_W, WIN_H = ART.BG_SIZE                 # 387 x 1034
@@ -7051,8 +9177,6 @@ def tab_layout(widths, grow=None):
 SETTINGS_TIPS = (
     "Only count keys / clicks in the game window: the cooldown only starts while the active window's "
     "title contains the text below (Roblox). Turn it off if the game window has another name.\n\n"
-    "Armed timeout: if you press a move key and don't click within this many seconds (30 by default), it forgets "
-    "the key (0 = never).\n\n"
     "Pressing the armed key again un-arms it (on by default): press 1 = armed, press 1 again = not "
     "armed. Turn it off if pressing a selected move again does NOT un-select it in the game.\n\n"
     "Updates: type the web folder the new versions are published in (an https link). 'Check for "
@@ -7789,6 +9913,73 @@ class BardBadge(Overlay):
 BARD_TEXT = "Auto Bard is Active."
 
 
+class AutoclickBadge(Overlay):
+    """'Autoclicker: ON / OFF' with the pause key under it, on the right of the screen. Click-through, always on top."""
+
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.win, self.cv = self._make()
+        self.red = self.num = (self.win, self.cv)
+        self.shown, self.alpha, self.geom = False, None, None
+        self._key = None
+
+    def hide(self):
+        if self.shown:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+        self.shown = False
+        self._key = None
+
+    def show(self, right, top, s, family, on, label):
+        s = max(0.6, float(s))
+        key = (int(right), int(top), round(s, 2), family, bool(on), label)
+        if key != self._key:
+            self._key = key
+            fnt = tkfont.Font(family=family, size=-max(10, int(round(17 * s))), weight="bold")
+            t1, t2 = "Autoclicker: ", ("ON" if on else "OFF")
+            w1, w2, wl = fnt.measure(t1), fnt.measure(t2), fnt.measure(label)
+            lh = fnt.metrics("linespace")
+            W = max(w1 + w2, wl) + 8
+            H = lh * 2 + 10
+            x0 = int(right - W)
+            cv = self.cv
+            cv.delete("all")
+            cv.config(width=W, height=H)
+            self.win.geometry(f"{W}x{H}+{x0}+{int(top)}")
+            tx = (W - (w1 + w2)) // 2
+            ty = 2
+
+            def text(x, y, t, col):
+                for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+                    cv.create_text(x + dx, y + dy, text=t, font=fnt, fill="#000000", anchor="nw")
+                cv.create_text(x, y, text=t, font=fnt, fill=col, anchor="nw")
+            text(tx, ty, t1, "#ffffff")
+            text(tx + w1, ty, t2, "#2ee62e" if on else "#ff1c1c")
+            ly = ty + lh + 2
+            cv.create_line(2, ly, W - 2, ly, fill="#b9a98a", width=max(1, int(round(2 * s))))
+            text((W - wl) // 2, ly + 2, label, "#ffffff")
+        try:
+            self.win.attributes("-alpha", 1.0)
+            if self.win.state() != "normal":
+                self.win.deiconify()
+            self._click_through(self.win)
+            self.win.attributes("-topmost", True)
+            self.win.lift()
+        except Exception:
+            pass
+        self.shown = True
+
+    def raise_top(self):
+        if self.shown:
+            try:
+                self.win.attributes("-topmost", True)
+                self.win.lift()
+            except Exception:
+                pass
+
+
 def merge_covered_slots(old, new, tol):
     """old / new: {key: screen x of the slot centre}. A slot that one of our own boxes / icons covers can't be seen, but the
     slots that ARE seen stay exactly where they were; when the game re-centres what is left (a slot really went), they move.
@@ -7810,6 +10001,21 @@ def same_slots(a, b, tol):
 
 
 MENU_HIDE_AFTER = 1.5          # the cooldown boxes hide only after the HP bar has been missing this long (one bad look must not blink them off)
+
+
+def slots_white(rgb, centers, pitch):
+    """rgb = a thin strip across the slots' upper body, centers = {key: x of the slot's centre in that strip} -> (keys whose slot is white, keys looked at).
+    A held (equipped / hovered) slot is near white (254, 247, 237); a normal one is beige (215, 203, 191)."""
+    white, seen = set(), set()
+    for k, c in centers.items():
+        a, b = int(max(0, c - 0.2 * pitch)), int(min(rgb.shape[1], c + 0.2 * pitch))
+        if b - a < 2:
+            continue
+        med = np.median(rgb[:, a:b].reshape(-1, 3), axis=0)
+        seen.add(k)
+        if med.mean() > 225 and med.min() > 200:
+            white.add(k)
+    return white, seen
 
 
 class HotbarWatcher(threading.Thread):
@@ -7844,8 +10050,27 @@ class HotbarWatcher(threading.Thread):
                     self.app.q.put(("msg", "Disarm detection error:\n" + traceback.format_exc()))
             self.quit.wait(0.06)
 
+    def scan_white(self, sct):
+        """Moves that unequip themselves wait for their slot to stop being white (held): look at the slots they sit in."""
+        app = self.app
+        keys = list(app.tracker.unequip_wait)
+        cx = {k: app.slot_cx.get(k) for k in keys}
+        known = [k for k in keys if cx[k] is not None]
+        if not known:
+            return
+        bar = app.cfg["bar"]
+        pitch, scale = float(bar["pitch"]), max(0.5, bar["w"] / 54.0)
+        x0 = int(min(cx[k] for k in known) - 0.3 * pitch)
+        x1 = int(max(cx[k] for k in known) + 0.3 * pitch)
+        shot = sct.grab({"left": x0, "top": int(bar["y"] + 6 * scale), "width": max(4, x1 - x0), "height": max(3, int(8 * scale))})
+        rgb = np.asarray(Image.frombytes("RGB", shot.size, shot.rgb))
+        white, scanned = slots_white(rgb, {k: cx[k] - x0 for k in known}, pitch)
+        app.tracker.unequip_scan(white, scanned, time.time())
+
     def scan(self, sct):
         app = self.app
+        if not app.selecting and app.tracker.unequip_wait:
+            self.scan_white(sct)
         if app.selecting or not app.cfg["settings"].get("detect_disarm", True):
             return
         bar = dict(app.cfg["bar"])
@@ -7906,14 +10131,17 @@ class HotbarWatcher(threading.Thread):
             self._lay = (None, 0)
             app.slot_cx = cand
             app.slot_good_t = time.time()
-            msg = app.tracker.update_hotbar({k for k in keys if k}, unknown)
+            # a tab that is only not SEEN (snow / sparkles / a bright sky over it) leaves the other slots exactly where they were: that slot is
+            # still there (merge_covered_slots). A weapon that is really gone makes the game re-centre the bar, so the others move.
+            msg = app.tracker.update_hotbar({k for k in keys if k} | set(cand), unknown)
         if msg:
             app.q.put(("msg", msg))
 
 
 TRAIN_DESC = ("How to set this up\n\n1. Add the Spell to \"Main\" Tab first.\n2. Add Mana Marks in Mana Overlay. (The box that shows cast%)\n"
               "3. Click on Spell Key to Train box and press what Key the spell you wanted to train is on.\n4. Press Start/Stop")
-EXTRA_ICONS = {'sell': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAARoElEQVR42u2aaYxeV3nHf+ecu73b7OPZvG+JQ+I4CVsCNC2RgFSUBooqUdEPtHyo1IpW/YAqUdRKLVKLWlUIiQ9UiFa0FaigttCWQCqVtQ0lwQkmiWOP42U8Hnv2ebe7naUfzjvjiT3eEoOElCsdzTvvcu95lvN//s//HHjt+vm+xG27kRC3dWLOudei81OJoBACpST0PCyVwBjHH3z4fb+/c6r2rouXLuVxHMXW2WvcQW79joAiz/OJscl4ZiF//K8/88VPKSmw1iGEoNTmFRkYvJLU0Zsf1nsZx/YBoefflTZPQ1LBXiPFrpV5UkrStIMcS2hUBxaMsRjzM4zg+hob7G/I9zz68COBWzqSZR0ncMpYYe4+UP3QSL25N8s6Fqekw235sCgUW9wbrBVoq22c9MmlTv9Lx15sfl5Ip4SQZmxsD5/+3L/9lXVgrcNad/sNVEphjKFWq/H1L33KPfndL7G6cgkEZLlj/5TjnoMJSRxgjEOprQ1pVOVVT5VS0M0s2jiaLc3RF7pcWAwIQ0ugQu5//Tv5o7/4cuXFk9PZurNvFoTUzUQuCCTGWBq1WL730fvfOzZQ/Nra4vPNSLR0rPIikGkxMZoEI0ORKI1jea1kpVnS7hiaHb0xWr2x0tKsNHujpVlaK0hTS6gEUgrSbmHTtNmphnkRqbzIyrxo1Brl1MSgXFhuzRalsVJKbsbGWwKZxx59y0OPvKH+/aWF6faDRwbr9YpEAE4IrHMEEtpdw/EzbRaWC8JQXnMtrj9dCshLx9RIzKG9dZJYYYxjPcMdjlMzOdMzjj17DvLxv3miNnux2X3VICOlBBy1alWMbxuq3XPXvn0Pv/nAn5+ffqI5OR7Xo9AhlCNNLcY6rHMIIMstUSjoqwcEgbgOWPkhBCSRIwgEndRQlBbrHEpKkkiQxJJ6FbDN5dmZF+Q9d0zdOzUxcXphaa15fm6pa4wGxzUdecMIvvXBNw196Ncf+m537fRdzrSYHFymWpH01SXGOE7NpLQ6mvU6H4WC0cGYRl2hBASb1+L6SweldpTa4RyoQNDsaOYXc7QGKyAKBLsmEnaMJXQzTTt1dDPHfHsnIhwgKxtf+9t/+tYHnj12rHO9+cutgABgbGQwGN82GN5zx+Q7GnHzzmeefnyuTM/Z8RFFX02R5dZ7vLAUxpJrS15YtHYoCXEoiSNJHG8a0eURBZIwkIShJA4lEkFRWvLSoI3FGEtRWrqZJgwEk6MhuyYiFmafyf7nO1+Z3TUufuXhBw89NjzUFzTqVXHTazAMFKU2/OlHP/RnRw4O/vEzP/6B3TVWMDGkpXM+cmttzenZFGMdU6MJ1YpHRiUFWW6ZW8xpdw1BKBDXWoIOTC9FtXYMNELGRyKiUBAEIBDMLeTMr5RMjkbs35EQBpLFFY2QkpcumGwtHU8aQwfnvv6t59/+la9+8/g60l83guvzaa4uNk+99Lydu3CyG4e5HBuJqVUFxjoKbUlzQ1464ljSVw+oVwIqsSKKJNo4upkhzQyda43ckBWGLDd0c4OxliSWVBJFfz2kv65wwtHuarqZIdcObR0D/YqJkZBY5snJ6R+3q7Ebu++eOx9dLzc3BBkpBVIIhBBKCiR4RFNSsNYuOXU+pZYoDu2tEoaKKFCoQDJ3MeXsXEoSKfZuT7j/UB2tHRLIjaMo3dYLvrcG19qaH59oIaTgrj1Vto/F7N9eZfdEhYXVkqd+0gYc9x2q01cLcc4hEVIIJwVO9uZ8YwOLQgOgrcgQEmfAOf9DbXwZiAJBNQlIYokxoASUpaPZLrE1qMSKoUZAbryBWe4N3MpCayEOPYK2uhqEoNQOKaGSSAIFq21Nu6vRhg365gALVimFk1Zb5yiK8tqFft36T3zsd/7koSMjH+kP5x7bNZYP7tsRByODoQgCaKeGxdWcJFaMDEQAnLmQMn0+pZpIDuyqsmMsoV5VOARF4chLhzZg3eXSsD4AwlAQBIIkkkyMRkyMxKw1NafOp4SBoF4NWG1r5lcKHI6J0QgpJVIIxobjoNtedsuL5w+//t4DDx6+941LTz/z3OnNkbxqDe7ZNfH+bUPyfU4v7Bmsl+zeUZWVxEfKp7jYgCdrHKstzex8hgC2j1V6QOG/rzWUJRi7dR201t9TSahVJNvHEia3RWSFZeZiTie1PUf4jkIIf6+isNRqAbsmEyndklyePzm1e6r+/re9+b6P3DBFW6322eWVtf26NEgpEmMcS2slna5GSMHESIyUkvnlAhwMD4Q0aoqh/hBr/YS0dhjr02irPtgBQSAQwrHaLmm2NfWqYmIkAQfbhiOUhNJYTs10yUrH+FCEA1bWSpZXSwbqEf2NAKUUhTZZq92h3xp3QwOVUmEQRonNReEQWAMLKwUzFzOmtsXs31Gl2TG8dL6Lc3D4YI2BvoBAegJsLC9bK+sGXkk0osAD2rlmyYmzKZMjMcP9EXEomBqNGO4PODWbcvJszuhQxO7JClLA86c6LK4V7JuCRk2BAylUoKQMdGm6N0nV3MuKZGkcaeGjU68E5IWlKB0OX9SriaTUPiXzwrK4WtJJDVKKXgehaNSCnmECi2OlqWl1NUurmjSzlNptYIEQIIREa0hzizWOKPToXhpHmhscjjAEpS7PV0qpbr3hFR4lA+lvppTr/fXo6pzAWk+9tIZ213LuQspSqyQIJErCnvEKQ/0hzkEUCYyFSysF5y5kaOM7R4EvI0JAVji6qcVa54u+8BnhhH+tpCQMBHEoL1NB8So6+t469xPoRcX10k73jDPGg4aSgsG+ECegmxlK7VjraC4s5CgJ28fiXoPrsBb66wFjsWSoP8BYj7qb1Y711Bbi6nT37/U+cLdJsrgSCfPC0em6jQfGsWD/ziprXc3Js10WlgvmlnNmF3JqiWRqLCIO1IbXto/H3Lm7SlE62l3PZ6UUt03vC64Xts1eu3ZD/PLvrEfVOQiVJ9nOgXYOoaAoHM5Z74zIt2Rl6TDWvQyUrlwmNzOXmzPQ+SElJJGgEgsCKViXQQQ3NtjhSCLJwd0VShMzeynn3FxGqeHoiTaBEoz0B9x3Z504knRzd3V3Li7PRUlBJRI9GvlqDRSXoyd7YLLZc9Y5rLuxRBCFgnpFIQSsNT39swbmlwqUFIwNhWwbiihK6GZ2y+itP0YKL0+uz8VxBSNyrwBktrLBGMgKKPXVX1h3uBB4+JYeF519ub4mpY9EWUIns7675SbTbyOLHNr69V9qy3pD8OpApuc5XXrE3OqGAoGQoJRASe95bbdasw7jfN2U4moSLnoYc02jhddnS+2R+BVFcCsBxTnP8sUGVLsNqA6VN0z0DNu8ptwmAcm7geuKwlEkCJToZcHlGiXoyYWOm1LUttbR3Rb/99y5wdKF29DbnXMb4lEYOoIr1qzYlH/ieqknLv9CCu8s78weBXDrRm6qf1wzM28AMsK3N52uRQnBxEjCQF+EMY7npltEkeTAzioCWFopOTObsWsiZudEjJSX1bJ1pWvbUEQSNigNnDzb8QrcFU6QQpBU/D7HmdmUpbWS4YGQh4700eoanj3RwVnH1LaEnZMV4kjhXC9FxbUtlVu/2+vqpUQFksG+iF3jFSqJ4tJKQTfTjAyEDA+ErLRKTs50aXY0USRJYumRbh0QJDQSxeRowrahCGscRWG99tlLS9Nrm/rrklpVsLhScPJcSiAFe6YSKolidjFnZj6jrxGyY7zCYCMkiZUXi3vestaaG0aw1Dp12ug01ZybS1lZkzRqAYONgLJ0RIEgUBJnIQhgcjSmXlWEoeTMhYw4lPTVFXEkMdobUBrb6zAc24YjrIVaRfmdKulRNy8tp86XlMZSrwUc2lMliSWttqEsrCfpQqK1V9tW1jTNdsn8coHRxuKsVqGq3tDAoaHBu7PlJJg5q7tHn29GUQAP3N3P+HCEcxbrfP7HsaSWSPbtkESh4MS5lB+90KKeBBw5VKMaK7ql9Sm0Xj4CwcFdNQ800pNrpfx+xfn5kqdfaGGt454Dde7eX6ObWfLSc11n8cNBFEguLuYce7FFacAKZZUKImO5frskhOCpo8c/edfufZ/Ys0+PzMycIStyHAKpBJVEMTka9eS7glbkiXUSS/prAdsGIwIlWGsZsjQn22TgRr/ZQ0bXYwsqgOVIkqaG4f4AKQS1iu96Ol3DWseQl5ah/hAJBIHcIOu5hkp12B68Y1di6D/7+BPf+8srhSf18odLvveDZ5+e2H7g6OHXHXqk3bpUz9Om2TVZlSMDEVLA2IjXYjyRLhnsD4hDQRwpJkYj6lXFzMWMU+dTVpuapbWS5Y1RsLBasLRasLRWbnw2czEnCCR376uzfSwmkIJOajl/KefMbEoUSnaOJ4wOxUShRCnJ/HLOworRu/feq/YcfOvpbz158oP/+M9fe0op+bLtNXXl5mYSR+LJp559aWK83+wcrz96cW6m29eXRNo6ytIwMhBhndc9lZJESpAVlm5mKXp/08zDaBxLonDzEMShIg69/llJFEnk12slkYTKb8Q0O4Z2x5KVBoGgrxEw1BcSBoJLizmrTc2lpZzllTK749Dr1Y+eu/CHn/7sP34tiWPKUl9/DWpjnBCCJIjqSpQ4a+X02Q7TZzvsHI+ZGosZaAQcPtggyww/OdVltVVuOKiaSHZPVTmws0pp3DXZSBQKosCnaxQJLsznPHeqQ1ZaJAIVCCa3Jdy1t4JUPjV1afnJdJul1RKBxSBkHEpZq1RHhRCYq0F0aybjnMMJYYVUCKEoS8/58sLXnVD5yZnQtzlF6TaIeByCRBCGYqPN2aqoR6EgCn2XEocCJQRF6cgLL4OEeCUhisQGqbbOt1vd1BJHfgfMrznn3K3sLkkpCMNAjA4Phr/1G7/80fH+9OM//ME3ioHBgXpfzeuX995Zp5IoOl2Dtpay9GJTVhgWlwtaqWHTWYWrBVnpGYUQoI2jrxoyOhwSKuG5roAk9rLE7MWUE+cy0tTQTo1tNtPVh3/pV+vHTrZ/97Nf+OrnjDakebGlkVtG0FpHnpfu/IX5op2KY3e+6VD05P/+ZzvLbDdNTTWOla+DUtBfD5AS0tyT31ZbMJPnLK2WhIHgWoct1smAEL4rCMYEjUrS2wC1m+RXQV7CwkpJmhoqlUjWavHQ6OgEK0dfPNZqd90r2uFV0pOcwYF++Yb77zjwgcfe/uV6Rd/9+L9/oT3QH9VHh0LCHmQXpWPHRIVdEzHWwfKaptSWKPJ8civuqbWP3Lp8n8SS4YEQa2D6XJfZeY+eOGh2NMtrpUUEemTiDf+iosbJ7zx57B+eeubEyVa7bb2+Y299A3Rjs18IHjhyuHFo7/CDRw64b5w9O9M0Tvc5YxDCN6xH7mxw+GCNIBRo7QgDsdEVbGVgVjrK0m5MwzrPktLMcvSFNsdPd0hiiXOOMEywzl46uP/A2FeeuLD//Hz33JkzZ0pjzA0PJAQ3OhPjN/stTx99tjU9Xf2v+w9/8AuvO7zjN489++1mnqcSBNY4Li7KqnNOerLtevLe1hF0eP65Xq82mmU82V5cSa3VeTe3PpcHhnfoX3jbo2PHp+f+/uixb59utjMrhceKGx0puSmFQ0qBUgohJG984MjIRz78nu8vzP7fwbXVBZxzqECxuLBIp9v2Te9NHvPYLAP6tsj/plqrMzIyjC40QRhwz72/yH/89/S7v//D5759/MWTbW3KXifhbu9BoPVJv+uRt+zbs6Px7kCJAeGsMlY2+6rd3+6snt3ZSVMdSBVwq4fphECbUvfV+oPG8J5zS035OSXpE1LoUicnPvN3//rFn9lZtXVDh4eHRRiEYml5yX7s9979jb740jtmZs6RJPH1j49s2aFJ0rTL3r0H6bod3/z4J7/4zpHhEZnlmVtZWXGBUj61b/F8V/BK1N6gtxe+tLS0rmlx/NSFzw9Ws+lLC7qIQhlZ7K0ZiKIodFHIZtTOZr5bliVzF+es30MMrqJgP/Xzoley9tt9vnPz/V/NvW/bKVYpxfWUg1uakENcs669dr12vXb9fF3/D5Q2NIJtj2/CAAAAAElFTkSuQmCC', 'auto': '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', 'brew': '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', 'inv': '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', 'snap': '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X99k/eYd7NrTTFtnkt2NLezY3VTUjq9LEYp0QjT06UN9n3oGjTiSd995h9GjR/Pt686huqqKmpoaaqqrqa6pobq6iiGDh7DioxXMvmM2yz/84IDwHcdly5YtzJz5JebNf5PLLzyLc848EQFEqysZNWIIAAWtR3zaRu8YY7UQYpDrOPTrU4vFkkyluWLWXYSjcY6aMAEhBMNGH8X0mRezZMliBg0cyI033kh9XR39B/SnsrISRzkgBGeffTael+d/3XPPQfXX3NLCxk2b2L59O4MHDy4lv8YYwuEwruOwceNGNm7cyNcunM7D992GMYZsziMSCTN0cH9bzPD1QA4SspW+HDBgQAxY36eu2jaueEGnN823tulde/VXzrF9+jTYj1assOXt2WeftSdMmWL3bb7vW2OMvfnmmy1gt23bZn3ft4VCwQZBYIMgsL7vW621Xb16tXVd186bN88GQWALhUKpnz/98Y+2tq7OAvbG73zFejsW2vTm+Ta5/g3bte51axuX2Fcf/5UPWCHEX/bdC+W+KIMgWQVUNdTXEo9FhLGWbCbHL392PQMbqph0zGQeeugPpedPP/101q5bx8svv4wxhiAISuYqhGDq1KkALFiwAMdxkFKilEIpVeJpGhoaMMbQ2NiIUgrXdVm1aiWXXPJlvnn11RTyWR657zbuu3MWXr6A1kWSqkg5WqorY70aq913q5D7atDznDhQ1aeuhkgkCtYSBAEVsShz/3If006YyHe+cy1nzZjB/HnzqK2tZfbs2dx///1IKXvohGKapLXmuOOOw3VdnnrqKYwxPeyb7mHSJFJK+vbty4wZM0gkEixY8DaXXXYZEycezbPPPseZJx/H0lce4urLzyfZlQIssiyottZQURFDKYm1Nr4vJyP3J2KDKiAej0Ws40hhrUVKST7vUV9TxdwnfsVPfvgN5r3xBtPPOoujj56El8/T0tzsz58/v6Qd13VRSjFgwACuvPJK3n77bbq7u0vfSynJZrNs3rSJOXOexhjD7T/5Kaeddjpz5szhuIljePLBO3n18Xs5cuQQujq6UErtTTwJgdaWcCgkotEwQGTy5MluucKcfTUYBKIaIBYNWyWl6GW1lJJ4XgEpJXfffh1XXHw2Dz3xIn9+9lVuu/12ADXz3POYPPkYxowezeDBg6mtraG2ppYhQwajdcBtt91G//792bVrF1u2bGHrtu3s2L6tJMCwwf2ZfuEZXDLzdE4+/igisUiRdLYWx1EHKbpaIuEQ0XCYdDoXbW9vVz31iv28jQJ0ZTR6bncu99IVF88wjz0wW3YlkjhK7ZWwamOIR6O4kTDtbZ2899Ea5i9axocr17Fy9QbSucJnKkyOGDqAcaNHcvyksZx07AQmHDmSPn3qQBcpSW00SqlDFHgsjuOQ6k6b4875tty1p2VLQ0PD0W1tbele/Pvlg8baKEA8Hi0WAuz+RRZHKXJ5j0wuRzwWZuaZJzHz7JPxcx5dyW5a2hO0dqZIJJKkM1l8P0ApSXVVBdXVldRVV9Kntora6koqKuKgJDYIyOU8uhJdCHrpevWpE2WtQTpKhEIOQLhaa9l2qITXFqu4xCJhe6hKsZQCiSox3b3cS0U8Sm11JeOOUAgl96a3rcXqoqMJtO55t7vIcMtiDdH5DKDK7cBaUMrBdRyAUNb33UNn9MWqDI7jfOaymSorswWBxvd1saZoy2uLZbX/Evkk9iKk/q4TBtaipOhdo66OGUX3oQAKYXqigr9vzFLlSfCPbr1ZgpQSVdxTHa2jCjIcfJuAHEB3OidKden/D5r9xPGIA9EUZb5UtQO0J7qwWiO+wAhtbxVKG3w/AMiHQl7hYABtD/O7G8g3NrXLfN77z62RfzhCi5KSXDZLqjsDkDImnjskwFAo1ATsXrdpOy2tncZ1nc9Uvv5vwofrKto6ukxreydAa0tLS648o98XoOro6OhWSn2YSmfs4mWrbDgSRhvzBQVoUK7L2k07rB9oq5Ra1xOHyoOvQSCk1DOAeOSJl4UONPKLa6EgBAveXS4AEXbkOwfjQvei7nOFwqtSyjUL3/tIPD93gamqr6Hg+184gCHXoaM9wWtvv6+AjEYuOFS61PuDBHKOEP8ihBA33PFrs2XzTupqqns91Rei+X5ArKqCl+a9o3c2tiClXOB53tZywmk/Frh8LWpr1yohBqXSmWPnL1rmTztxkho6fBD5bK6Uy/13tUIQUBmPkuhK8Y0f3m26kt0yFJKztLZbys7eHRRgSbsWXpdSjmvtSIyb89Jbum99NcdOHCOi0QieV8ysy2t+/8jWe0xFCkF1bTXJVIavf3+2v+xv61wpxfNBYO7ZV3ufBhAgsNY+p5SKZbK5qS++tlgs/mCVrqurYcSwgaKqphJHyp6aebE8VnYGpxh9is/rOOxeaVlvwh2PRYhWxvH8gJfmLtBXzrrLvLdijSulXGmMvZSeCOxQB2IPeZBXKXWOtfYuY8xkgGPGH2G/fN7p+ox/mizHHD5UVFVVCKQErQn8AK01gTY9ZWuzF3C73+DFiRBSoqQoMgKOgwy5YAzdqYxdu2mbnbfoQ/PMK2+pVWs3i56g5K/GmGt7jl0e8NDxZ5lfUVYaDodd92u+1t82xpzYA5xRwwcx+ajRZuKRh5vRI4eIwYP6UV9TLSoroiIcDhFyXaRS4pOTTGIvZ2eMxWht/YJPNu+RTGXsntY2u3rdNj78eD1LP/xYrd+8s0QnSimXKMVvfN/MKT+t/PdocF9z7k0xZCQSOVFrf6bv69OAcUBFufuORSPU1lTRp7aa6uoK4rGojYRD1nUUjpI9PKYRfvFAgshmcyKR7Ka1PUFXspvuTK48gsoAq11XzXec0Cu5XO69A87UfxLgvtostaqq8Ejft+Ot5ihf+6O0tsOB/kDlPme6D7nee9ZRuqfuuN113TVKsdx1xfLu7sLGQ0w4/1UAy9/rBRscKCccOHBg1OvsrPYcp0JrHZHSxK21EWuVK611KZ6ALwihAylFTmmZ1Urlolp3DxozJrFi+XL/AGpxPu/B9P8q/y73qVTZz1Iv/xx9mr+3v/8HJJCuHRQHrQUAAAAASUVORK5CYII=', 'dash': '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', 'rc': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAZTElEQVR42sWbeZRddbXnP/v3O8O9NaZSSchoJVQSyEAiSIAMJGIYVHyIQKGAiq7ngC77NdpLV9tvaVYan726nz5b7can3bZPQYaUEwjKoIFIogmEIQMVMpGEzEOlUvO955zfb/cf51SlAoj4fHbfWmfVreHec75nT9/93fsKf+FDQW6kzbTT7kb+/urG85qauxsmgm316BSgwaIhgENSoMcg+8Ht7myUQw93r+0a+fo22mw77T4/xb/+IX/Ja9vOBCY3h4vmB2mwDPxSROeiMhGR2gArADLiUlUgwynQ7+CQVd3qjP4usbqmPf39piFgfynQfxXA4qQuf75kbGj89daHNxvcxRFh5AFB8QheHAqeV12h5IcRBMFgMKh6UrJEhQ1OzD2pdz9tZ+3xV5/zrwZwBZiV+XXqlQ2XjB7fE9xmkE8E2BbB4nCAOgUEEYPI0Dm0sNrwiTX/g6Lqiz+DIog1WMCTkO5zxnzvuE/++THWnwRkBcjK4ob9mwIceQdvMhd9ONDwSyWNpns8Hu8EKzJsGEFEXnOi06DAy4gLUC2sqzgZuheqRrGIJSHb5dXdcTfrfvTnWlP+HHBtvGNSLe4bRmhTFFGcgghiLObMNz5tvOGHGeGjXs78vZKDdDIEFVS9F7yKWIsqDt/uST/7I9YffLMg5c2CuylYsixw/KCk0bQU7wUIkGFUluCPnED+RBbWV2fl4rvH41AEj/eKJyQwCW5PEviP3putXfNmQNo3A+4WFn0w8vbeEDvOiXciYo2cdkLBIK/zNRKeMQZrTB6HhcVk2JWH/ldGJCDBn+HziMO7EDvaetrmMOmV+3h0UxtttoMO/bMBDoG7lSWfCAi+j9hIwVkxVopICoKIIAxR9QXIkS5agLKWKI6IShFhGGIDW4C1OTjVM1zpDItL7uoy9ByMRx2YWDDvm8PZh+/n4Y1vBNK+EbgPsuiWkOD7BiOgahFrAIPkFxkKb7v2Mg5u34vxYMSACMYIQRAUwErEcUwYxwQ1ETYMsNYQmvy7iEFUEcAUYMwZHpAXkRE/GQ/eYCTAXz2XSbvfyJL2teCw7XS4m4IlyyJv780tp2pFjCncyRghsAEuySAImLn8Qg5s2klkQwDCICQqxURxjA3yU4i1uVUV8EUhKSxpRFBVVDW3WHHoCIuefq6FWVUVFWf0nefalnXt/pE9bWA7XkUIXg3QdIB+gMsnhpo9FGLHOkQDxMgwOENgA+KaEnHDKHa8/ByX33oDcWMDe7Zuob6mkTAKCYI86WRpSpZliFfCmhh1DldJyTIHmsehLSznvRZIcgowdK0iihbuijGItRixoqABxFb1sllMXrWK/b2AGckpzJmFfAUAEcm3ajRuUbwLh9iG5q4SmpjaUY1MXTKPedcv5uqPfoi7v/BPXHDNIs6a3gppRmBC1AtpJcUPZEiipH0JrUvPp751Al4F4wQ3mOEGUzRVrDNYDbASYMSSuowgDrE2wKNENsCrR4DIBhgBq2JU1ZU0bImQb43E8BqAbbTZlaz0N5lLbg6R61OcE4wZGfjGGMI4ptLbT/PEcQwM9NN6yTw+/M3Ps+mR33POwvmoGKwKmrn8KNwxjiOM9djaiDgu5c6mHu8dWZaReZ/HpCreZ5x3zWIW3HIV6j2lqIbBrJexLZOYNHcGWZaS8z8PiEnJXERw/QfNpTevZKVvo82+GqCsot23NVwy2qi5w+epTXJfKXzZGsIwRL3DqrDuvgdZfN3lPPnDB9j04JNMnns2TVPHUx7VgKsmkDrE5SwliiwexznL5zNj4Vyq1cE8XQ0xG++xgcVlVRqmjuGCD11J66LzqCaDgGew2sucK5cxffFb6Tx4JI9P55ARuRZQVb3jyoZLRq/KybkMA1zBChHQck/4yRqNpwHekCeVnFFaAhvlCcHnZVd6Hb/4yne55av/nr1P72DNf2tn3++3EFqLTx2kivg84aRJP+MWTKNh5iQuuOFSsjpFjGLFEmhIbCPSpMqo2ZN515dvZe+mrbgkoffACQa0n4tueSdzrriQjQ8+TnpyEHGCwRIQYLEYrMnwPtZg2ui+8JMCuoIVOcCcQK/0H2J5s6Cf8njVVzEcaw3GWlDFOY96T02pnkMbd/HML9Zw+y+/jlPHwXU7GDzWi3pQVYwYJDC4sfUs+8x1/O57D1NVx/nXvZ2e/j5sHGFNQKYp516zkOvu+BSPf+3HJAe6aTyrmZ1rNjNv+aXU1DXwqy//CBnIi6GOqJ15nRQMRgQ09PKpa1nevJKVfgUYO44200GHzjYTbi1reLNHVcBYzPCLAxtgxOC9B69YG2BEqC01sHvtFuKGMrOWX8jedVtQVazklSwoB3QOnuCKL9wM/Z6tP/8DCY6lH34X6378KJEG+Y0wwvhpLaz+zk/ofOUQMy+/mK7OTs571yL6u7p54Z7HiU2eZFxRM0f2lUNh5vAaY0dhKnu26P6N42gztoMOVoDp1ZZ/CgmmAGoxOcAivVgMoqBesUGUlwAxiIXGpkYObtyJLdWCEXqOniQKSxAomWaMntXCe//+Vu6+7b8ytXUGWx7fwNuuuRQTKnvXbSaMS0gGR3bsxlbBSMD4xTOZPGMqBzftoOOB31MfNZJoBuIR70aQw9NsVkUB7wURlFHX8tEf3smdagDdHl481yALXM7+zMiOQIoi7L0nsJYojHLgRrA2t2pcLrHz4T9waudByqUyHiWMIyrVKtes+Aj9h3s4dHQ/YUMtpqo89pX7WP7vboTGGKOCd47QxIi1RFFMc80oNv7gcbb9fD21cSPVLM3rpbUENnhtKyZDeUZMgWHB1vC3cwE1AEEaLg+JYwUnr9NheBQxhiiKsXFAubkBFGwQAkJaTQjikBDBiMGGIUnqGLNgKrOuPJ9f/sNd1EkJn6Y0NDXy/KOPk3RXWfyxd9NT6cJGQe7+qgQ2YP33HuLU7qPEcZnUZ6iANUIUhtgwwBj7mpbIYBAxAuoCTBw7v3w4iyqyxOfdOCKCtQEiFlUDmncAYSlGAsPUJXOoHV2HeDA2QBxo4nDVFC+CBSJrqMbKLXd+lv5DPex9agu1WoZqBiqUKPGjW7/K3Hcuom7KGDxSpAjFZ1khYAjGeSJr8mrsFGMt5eacKQlS9CM5hw1sTuKHOhnVcAmAbWt6W2NQDf8+xDQDGGvFWovBDJUXojDAqKFlybkEUcDLT75A7aj6/N45j88cKATWEoQBA9kg57ZdzOL3L+fuz36b0TVNdB86St/Rbga7+iibEp1HDxGWa5j81pkcfGYXkQmG83ceEg5jJL+JIqj3KI7x50yjWklIBgdzZiMgRjDWgBFUPaqIE2/Pahp7l7FdDZOt6iSP5g4mBhsEIIL3CU5TfOKpH9vEzCsuZPvqjUShIXN+JE/AGIuIIYhCdHTMZbe9lyRNybpSyvUNGBviBhNs6lA8tVLP2u8/TNexTponjkXFgzndYhkjI3smvIJzysnjnYyfezaKYI05w1HNEFqUQJk0pqs02US4VhUpO/GoQcQaEpfhYqF+ylgap0wgntrM5KvmQSD4upC62VMIa0NMmuUxqqDGYkoRic+Yf81Cxk0Zzz9edjuXXPcOKiVPTWNjnnxsRJpVMWNKXPf1TzFhxmTi2pCwoZw3fMYO3ywvkmcJY3J39ELS3UfrotlETbXgfZ5G1GBMkPcOasTnkkjZoq2BR6dEBRNAxHj1zLxsARPntTBt3iyMClmWMOWCs+nqOsl7v/hxXnluG1YMOx94GrLcTYIAwnJIJRIu+/R1PPTFf+H4izvZ8MNHaXnHXA4/tRljA7qyE7QsPI9rv/4Zdq7dyou/WIfrTzDGEgRRHlNhQKC5S9owwAM+80BGpbOP1CecvXQOz/9sNZHUDGdVGeo4wAcYk8CUAGgYTpua06dXNrzIrqee5zcD9+R3dEyJD337drq7e+jZd4LjW/dTPdmTNyXWIKkSijDY388FH7iSw5v38sT/WcWkaAp7nn6WxmnNjJ89nRc3rOUdn7uJpZ+7jpee2MTzv/0D069awNhzJvLKE9t46YF1GBdS7e6nSpWMjHiwhEepMEhsSzj1NE5sZrC7F3B5L3laphrROwLQEAzJ6VKoW2IESR2x5n3X+Flnc/vqr2FrAl54cAP9/gQD4SCmKaJcX6ZypIuGsc3UTGrCGZi8aBaPfGMV46dOo3qwjxrKdNy/hnHnTWfOFYu54eu30XXsFLMWzmfGW2exc+0mOn79NDOXnM+B9VvBWBZc/x68UbxzZH0JLktxPmPbr56l53gnuzZsJiAiIAIv2FAxoaBqEJ9b0QIhEgZn6FuquUZi8wIfxWWO7T7I/V/6X1z1meupa65n4QeuxA863GBG5WQfB492MWriWMbOmszEt03n0I49XP7xazFZwMtPbabaM4CNLT1HujDOcvcn/ztHOvbT+dIhSJTOngOMmTCFxR9+N847xkw5Cx+npL0V0li44ONvJ61kPHHnz6lISsOkMQz2V1h43aVs++16oiBmsHcgb5x8rgdLJlgEoxmBQ9KRZVO95ofLU3WAZftDG5m3+ELu+fy34GRKTVwisCE+gtqaMl27DnN82wHCxlp6Bnt46AvfpZYyYVQmMAEYpTqYUdU+zq1eTNeLh3CnuoltHXVBHW+9dglBbUyaCpUjPez91Ys0zBjH3BsWcdbYCTz90FoiF/E3X/4IjS1NjJ48FlJoWXY+cTlm7++20nu0C7FyhmDh0TQAekZKpIqimmdGn3mstdj+jFee3UXT6DEk/d3YOMCavDmt9lWJShH1Y+rY8rN13PKDz9Oz+xA7HlhPmNUSKFS0h7lXv53eo90cfWU/F33sajavWk2y/ySpppx39SJ2rX2B9NQgSblE84QmMoXNP13PxrvXEMcxJ7fs4/EnN1OpJrz7qx+h68AJNtz9CCUJCeKIMI7IqilptUrqHSlCqllPYHD7HXgpOGgu/viCDYB3Du8d3cc6yZKE1GVoqqi1eOcxxpClKWklI3Cetf/7Qdr+8e/4yurnMYOQZAlhYxNNb5lI5+FOxo0/i2PP7mHGJRew5chqmkZPYNL8Vh799n2IQv/RXk6+vJEkraJAFMVF45tRU1dHkqa4akrvkW4Co0RBiFfIModzuf7j1RsneFXZbxJkt8KgIHhUvfe5zDCsbCkuc5w6fJyJ50wlqVbzfr8Qt1QVl3mqA1VKpRIvP7aVw9v2ceM3b+dQdoC6SWO47D98kJc2vEDngSPUnTWKfes7SDOHjwwT50yl69gJDmzYThBaMk2wUUgcl6mvr6NcU6JcU4O1YR5no2ImnXs2h7a+jHhw/rSw7fM+UQ2CooMudLvNiabKAQ8HzRAtLeQ7FY+Ix3uPSED/y8dpGNdEubEWl2bDvaE6nytl1SqDA4PUlkv8+h9+xDlL5zPvA1cw5+ZL2fv8i/jjvSTHOyk11lKp9HGiYx+mscy5f3MJ2556DtebYTJBEvBJhrp85qTO41JPEOTdycwl8zm6+yAvrX2W2NbgNFfcVH3RaIsW06mDrq5ywPym69luVLcaHfZQnHf5UKu4K857ksEqO57ciPWSN55FxhpqpbxzJJUKapTK4VM8+q12/u7e/8yhPfs4su1lqj0VQg2pDlQQY+k6cJiJM6cxY/E8On6RZ8MsSfBZhnqHGPBGScnwxuHFkcUBF7VdyZPffYAQyS1ayP/e52rDkAWBre1dz3YbAG/8WsWjKF5zqznnCzcFl6b09/YzecFs4omNJNXK8ETIiOCdJ8s8SZrR29tPXeModv5qI8//8g8s/eR7kHKJwf5+qqSMv+BsRrdO5ETfETKbcuzwYfZv2EkUlMiylDTLcHhsaEEMSSWhWh2gGsO1X/kY6+5+mFO7j1AT1eG9O4Oc50YpkAhrh9ulqnW/TUirINaLqnMOMpe7qgHnc5c59OwOlnz8PZSaakkrKcYImmVIKQITQgrV/gF8klIf1vDgf/oBrRfPYvrSufRl3ShKUq3Q0NxIRsaiW9/NS6ufQypAluIyhw1LhDVlpDhvuWUMExfN4aL3X0XHExs5tH0Pk2ZOI9Es12KKPJGPUZ0qaquSVavW/HYIoMxN37nVizwTYBXweReUu+EQz1OBzj2HefrHj9J66XwIlP7ufuIpjcy6bhGEkFJlzIxJDHT3YcQS9Xnu/9z/5F1ffD9NkybjxbNz9WaSzj7GjGmhYXwTL/x0DTW1tbkCLo6acXXMuPxCEpfg1TNm/BgaRzfy8nMvUTnWj1XY/vRzSKq5/go4V3gc6i1GFZ6Zmy7fCohto83eyZ1+rmmJQ5X3+FwCkKFhx9AkyHuHhJbuIyfJ+jMq3aeY895LGTO7hSkXtbJrzQssuu29lGvL7N/wEoihtr6Ww1t3UzN2FNPffgG/e+jnXLh0GaNmTKFmQj3V6gC7fv08gQ1x1RQbhHSf6qLx7PHUNtTRva+T7gPHOLB9FyYVBo51cfLQEcKgjBtyRc3DSlXxOCzGpCb7L/9D736mjTZrZtOuANZX2qsk+y0iWozNczGnmBMYyLKUqKbM0VcOM+emy2hdMpddazbRc6ST2W0LmTJ/Os/8+BHK9TX09/XRe6qbxromHv9aOy0XTuf8ZcvZ89yLpCXH5AXTefkP2yiV6sgGq/nFeqUc1bBj9TOMmjGZYHQZYw2loJae4yfo7TpFYEsFyc6dzfv8UPXeCJKQ7Lc+bQeYTbualeBXsMLcxTOdzgTfyX3Sa74nocPZ1BaC0GB3Dws++g5aF8xm1X/8Ns1Tz2LGsvnUj2nmnk9/nZpyHU5BVRjsH6RSqRCk8MAd3+f6r95Gb28vps7S191N19aDBNagTvOuRYSBpI9q5RRbf/kUUy44l+7kFKqOQMKiT6SYRg3VPR3mX0ZD8cZ+5y6e6VzBCrMSvAVYwxoU5P76CS9qojdaMU0juw5jctneGMNbFs9j9NhmVn/jPnzVMXbBdKbOaeUnt38T25sVk1uLtRbnlCxLKZVLdO0+RtfJLlqXzqduXCPbf7YO7aky0NMLmitmthQwffnbGD+nlfK4GiYtOYf6xib2b9tOYMK807H5BobzuVtq7qreYExFsr2J1nzyRXZXLmPNGbMJvZE2096z/qSI/5Iooqh6UXVFHXTOURpdj/OOJ773EzTzBFGAHcxY9elvQ58jEyGpZCRJgiuGKd4rg70D1NXWsv83mzm48SVKxOgp6O+t4JxiQsgko+mtLUxePJ1zrz6fee9bQuO4BpJKQiaCt7myB0o2VHvxpOLVi8+piciX2nns5I20DY/Q5FXjM7OSlfohlrSXia5PcE4QG0g+hg7DkCxNscaiaYYpRbhqRuAUVcH7QqeyhiCICMMACYr+zFqiUkSaOjJRNPFklQScQ4ySVKpMWjiX1FXZtn4tlhgPRISUTQ0a5QK9844sS3MyAjhxLtTAVkl+ehfr2lawQlay0r/uAHQNayQPzslrFW4ICZo83gsq6hUVwUQhUsjtmuXu6Hw6PCbTIXaj+QwDNJ9IFpTKhALq8IkvJr1K5h3WGA7v3cuF119B9WRC1jVIORpFIBYCA9bmFsuy4n3zFGMwNsPvC/E3PM/+vgKD/rEJr7aBXcX+npnBhOet0iYQCV5RFS3SsbFBHg9ecC7Lp01D7iB50yyau7VmDnWOLPN4FJziM49LksISGc45nHdYG7LjmS0s/ui7ObJzH0lvHzYOkMCimsezcw4vis87IHHCQBr4trv8uq3FCNu/4Yy+A7SNNtvuH9szm8n7jJj3GSS/bFXxWhBWyaVCrMmVb8iJb1E/tUDsUVzBXZUcfJZmpElStGK5ok0xvfbq6O3q5eyF53Fk+yuEcYz63HLOZUViwZviVib4v73Xr/1lvjjR4d7UlkUHHdpGm72fRzfNoeWIhfeIqFHUAUaLxIMYjDVF8FOwWc44kJwFDS/8iOC9wzs3PAYb2nNSgTCO6TnaSfPkcTSNH8eJfQfxLiPJig4GdYhYBTKyT93D2n95o4WgP7oncxrkrzfOYcpuJ3JVICZW9U5VDerB++EVEMkHBHmZ8CPl2MJCongzXLPIihVEFbBWMFGAjUPEGkrlEp2vHMW5lEpvP2mWkalH8c5grRffX8X97T2s/cGf2nZ6w02nIZD38cimc4O3rLNelsUEox2+CErJk08Rm1q4muiQxYQi8oaPYtaMc/kcxBSyu4QBmovSpGnujn2nulGjpN559aoRoXX4PWngbrxv2C3/glWukSDb/SN7ZtL6E0s2JcDMNRjJKa7iVUVPU6YRuo/iixUQPZ1/hl1TR8z28h7TkWYZaZrisgzB+wy8xVqjSEraDsH7f+zXbPk3W8Z7vXXKD7L4w4L9UihmulHB4VzOWocmiiPf3JyxmCcjRnKnRVo//DzNF3xUQK0aa0xEIumuVNM77vV/pXXKP7YQ29wX3RZ5PhFjWxxKhkdEi41IKUJzeLXtjKWc05BQxZ+2q4g1mo/BUvw+h3zvOMf++TE6/roLsW+00lwy/npVezNwcYiNTC5gnXbB4oJeZ1/UCLkKbTQn91VxiSgbgHsq6P/bleY/tZTeFi6aHzlZhpqlCnND1YlOpNYWa3ZWT8dmJuByy/UrMryU3md1zQP/v5fS3+zHCuq7GyZabKsUHyuQYg6ixccKFNnvQre7t+b1P1awinYvf+HHCv4v62ON3Fmbp/gAAAAASUVORK5CYII=', 'class': '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', 'race': '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'}
+EXTRA_ICONS = {'dayfarm': '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', 'sell': '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', 'auto': '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', 'brew': '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', 'inv': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAMzklEQVR42u1aS2wU15r+zqlTr67qtmnTftDYYPMM4doYg7ESIhAoJBKwuYpHms1I0UisSHQV3cXMIkJoJFYzyp2Z1dVcRRppNDOKFyONrqJRNuAsxo4xaSDBIeBXYndo2/jV3dX1POfM4lIlnARdTAzJSP43fqjq1Pnr+//v//7/FLBpm7Zpm7Zpm/ZEI7+wdeUmJD8TgmvW6enpYT09PeteZHl5WQwMDIiNRJRtkIPJRjo7Oy0p5XChUMhQSuVTvkSuKIrCOf8DgL97dI/8JSBI+vv7aSqVUjnnSiqVkpOTk/W1Wm2cMWYS8uPLE0IgpUx+AoCqqgjD8Pf79u17z3Ec1tjYGM7OzgYAMDAwwH/WED148OAHjLG/DIIgsixLe++997LpdPoHa0spkUqloKpq4hghBK7rghCCTz/91P3oo4/KmUxGCcPw21u3bh19bJ/yhYXopUuX6LVr16iu6y21Wu3lbdu2ddu23eS6LkzTRDabBaUU5XIZlNI1DnqehyiKEgdjJ23bRnNzs9Xd3W3Ztg3f99WtW7eeC4KgTCn938HBQQFAvFAEe3t7z3qe98e3334br732mnRdF5RSSCnJzMwMRkdHoaoqhPjxfVFKEQQB2tvbcejQIQghpKqqIIRgfn5eXrlyhbquW7x9+/b2F0Uy5MSJE4qu6y2O4xzN5/O96XSaW5YFx3GUhYUFBEEQ5xN27NgBRVGgKAqklGtQi50WQsA0TZRKJQghCOccuVwOjDF55MgRHgSBaGxs/HUYhpMAvmxsbJTrycl1Idjf368MDAzwY8eOnXRd92pPTw8uXryI1dVV6LqOkZERzM7OghCCfD6Pnp4eEEJgWRYURUnCVQiBlZUVcM6haRqmpqZQKBSg6zqCIMCZM2ewbds2KIqC2dlZ8f7771PP8/7x1q1bv1kvgsp6XsTp06c13/f/ad++fb8+f/58W3t7u0yn03RmZgYTExPIZrNoa2tDY2MjmpqakE6nQQiBoii4d+8evv76axSLRTx48ADpdPpP9YFzMMaQzWaxfft2dHR0oFQqoVgsor6+HlJK2dHRIbLZrO267iu7d+/Wvv322zv9/f3K2NiY3MgQJaVSSaWU/rVlWfrx48dluVwmnHOUy2UUi0Xk83m0tLQgDMMEMSEEpJRYWFjAzMwMGGNQVRXbt2+HoijgnMMwDNi2DVVVkclkMDk5iUqlgv3790PTNHry5ElUKpVfMcZ+BWABwEfz8/Nko3NQHjhwILh79+5Dz/OaPc+jc3NzGBsbw/79+7Fv3z4IIeC6LrZs2YLvvvsOn3/+OVRVTZBKpVLJYtevXwchBGEYYufOnejs7EQQBHAcB8eOHYPrurh27Rp0XceZM2cQBEHgeR5ljFUAyMbGRrmhDvb29mYKhYJtWZZqGIZCCJEx7VNKoes6fN8HIQSccwghwDmPWfUHJBP/Hv+fc54Uf03TwDmH53mIxQJjjNq2zUzTtLu6uuorlYoLgP/UHCQAcOHCBXVubm5ECPG3Fy9erO/p6aGqqhLHcTAzM4Pm5mZYlgXLsmCaJj7++GNwznH69Gm0tLQgn8/DcRxUKhUQQqDrOg4fPozW1lZ0dnbCdV188skn0DQNbW1tiKIIvu9jfHwcjDE0NTVhy5Yt9NSpUwjD8ND4+PhFVVX/Z3p6+sGfy8X1hGiWEFJv27aglGJ2dhZBECCfz8OyLGiahuXlZfi+j1wuFxMEKKVgjOH7ss0wjCQfbdvG9u1/KnVTU1PIZrNgjKGlpQWUUhSLRZimGTOrSQgxpZRPtXe6DgdDIYQEgEqlguvXr2N5eRlHjhxBQ0MDbNvG+Pg4RkdH0dfXh71792J5eRlhGCIu3rGTlFJkMhlkMhkEQYCtW7fi9ddfh67ruHr1KqrVKgzDQFdXFzo6OnDz5k3Mzs7GuSyklPKRkN9QkiGxJiSEQFXVNcjEdK+qKqrValIeXNfFwsLCmnyKogjffPMNNE1DY2MjOOdwXRdCCOi6jiiKEAQBwjBEFEVQVRWapkHTNCiKQtZTv+mzSiAhBCilsG0buq5D0zQQQiCEQBRFEELAMAxUq1UUCgVUKhVQSkEIQRRFGB0dxe3bt5OXous6GGOQUiKKIkRRlOhUIQQURUEqlUquYYw9/34wzrHJyUksLi6iXC6DEIKxsbEkJD3Pg2maa1ojANB1HVJKjIyMJGFbrVahqiomJiZQKpWwZ8+eNfc9fv9z6ya+/xBKKZaWljA9PZ3Uufn5+eQ6SmlSKn6Q1GGIYrGYrBvr1sXFRdRqNezevfuZnPpJDqZSKXiet7bWKEpCJPFGn2ZjhJAfDTVKaRKST2qan5uDqqom+RHnoqIo0DQNlFJwztewJud8zfVPcvDxazVNg67rSVfyuCBYL6LPFKLxQzjnWFlZQWtrK9rb2/Hll19iaWkJ3d3dMAwDdXV1mJqawo0bN6Dr+pp1oiiCaZo4evRorFQwOzuLsbEx9PX1oaGhYQ2ZhWGIarWKMAwTonquLBqHjhAiQSJmScYYGGNQFAW6rsO27TWhSAiBaZowTTMR5YqiJKgripKwZSzfnpVk6LM6FgQBhBBJeZBSJrVry5YteDR2QC6Xw5tvvomtW7cmb50xhqNHj6Krq2uN/gQA3/eTZljTNKiqmjzrheRgPCDq6OiAaZqYnJxEfX09VFVFS0sL6urqMD09DcuykMvlEsH9pBdFKYXjOCiVSgCAl156CYZhIAgCFItFcM6xY8cO1NXVPXVYPjOCcdG1LAvd3d2oq6tDoVBAuVyGEAK7du1CV1cXRkdHcf/+fZimmYTr99kwLgm6rqNcLmNoaAhRFOHVV19FOp1GEAQYHR3FvXv38PLLLyOfzyfEs55QfSoEb9y4AVVVBedcfPjhh9i1axfOnTuXjBwMw4BlWeCcJ13E6uoqrl69muTWysoKFEVJCOaLL74ApRRRFCGbzeLs2bPQdR3VahVBEMB13USQU0px8+ZNDA8Po1KpSMMwZK1W2/AQtQkh9M6dOzImBSEEgiAAYwypVAq1Wg1CCLS0tMDzPExPTyeKRVXVxEEpJebm5pJctm0bra2tcF13jWoJwzDpRhYXFzE6OopsNks1TYPneXQjHJSPEOS9vb3nFUXJGIbxH5ZlZQHIXC5H3njjDRSLRXz11Vc4dOgQmpqa4Ps+GhoacObMmURXTkxMYGlpKSGU48ePgzEGzjlM04Tv+4iiCJxzjI2NwXEcHD58OCElTdN4JpNRNE37tyAI/mCa5t1HU2+xEQjKkZGRYUIIurq6vCAI5Pz8PBhjaGtrQ7FYRKVSQa1WQ61WS0aHuVwOnueBc45SqYRarQZFUWAYBnK5XIJoGIZwHCdhYcdx4Ps+stkswjDEw4cP4TiOIIQQIcT94eHhwcc6CrkRY0PS399Pi8ViSko5o6pqXbValX19feSdd97BysoKNE3DZ599lowNm5ub0dXVhSAI1tSxeHQf/61pGsbHxxMxEIYhuru7kc1moWka5ubm8MEHHyQlyfO8v29tbf2byclJeuPGjXDDWHRgYIALISIp5RjnfFYIEdVqNT4zMwPXdZO6lUqlkEqloCgKHMeB67pwXRee58HzvATlarWKarWKSqWCKIpgWRYMw4BhGAn5zM3NYWFhQUZRFHHO5znn9ymlDwYGBnhHR4d4boPfvr6+86Zp/ncs1d59912cOnUKq6urkFKiWq2iWCyiUCg8cXRPCElG921tbTh48CCEEGCMQdd1LC4u4sqVK4iiSFiWRWu12r8MDQ1dOHHiBBscHIyeS6E/cOCAfCTPJsIw/J2Usl3TtLO3bt0ilUpFiRHM5/MwTRM7d+5cw56P69m4aHPOUVdXByklHj58iLm5Obiui+XlZSmE4FLKpTAM/x3AIACcPHlSDA4OvrjDl3Q6/cfV1VW4ros9e/Ygn8/jrbfeQiqVAuccuq4jlUr9YGRYqVTWiHZVVVEoFDA0NISpqSksLy+joaEBvu/PDQ0NNb/Q88H+/n5lfn6eRFH0MqX0L6SUZwF0ptNpkU6n6a5du4hlWchkMkkd+z6CYRiucfrRGYW8e/eurFarxHXdFULI7wEs+L7/z+fOneOXL18WP8sB6CuvvPKvqqr+VTxYqlaryGaz2Lt3b9LePEmLxg4zxjA/P5+MCKMoejA8PLztpx6A/iQH44NQ3/d3MsYaOOdCUZQM5/y/NE2z43LwNGf0jDElDMP/dBznd5RSBYDr+/4d27blekjluX8nc+HCBfX27duLlNL007Y4sZQLguAfRkZGfotf4GcktL+/nwDA5OQkpZTupZQquq5LIcSffUYURZIxRqIoWmxtbS3FjP0sOYfND4E2CNFLly6t+6bLly/Lzc+5Nm3TNu3/lf0f5DWkocqaz2MAAAAASUVORK5CYII=', 'snap': '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X99k/eYd7NrTTFtnkt2NLezY3VTUjq9LEYp0QjT06UN9n3oGjTiSd995h9GjR/Pt686huqqKmpoaaqqrqa6pobq6iiGDh7DioxXMvmM2yz/84IDwHcdly5YtzJz5JebNf5PLLzyLc848EQFEqysZNWIIAAWtR3zaRu8YY7UQYpDrOPTrU4vFkkyluWLWXYSjcY6aMAEhBMNGH8X0mRezZMliBg0cyI033kh9XR39B/SnsrISRzkgBGeffTael+d/3XPPQfXX3NLCxk2b2L59O4MHDy4lv8YYwuEwruOwceNGNm7cyNcunM7D992GMYZsziMSCTN0cH9bzPD1QA4SspW+HDBgQAxY36eu2jaueEGnN823tulde/VXzrF9+jTYj1assOXt2WeftSdMmWL3bb7vW2OMvfnmmy1gt23bZn3ft4VCwQZBYIMgsL7vW621Xb16tXVd186bN88GQWALhUKpnz/98Y+2tq7OAvbG73zFejsW2vTm+Ta5/g3bte51axuX2Fcf/5UPWCHEX/bdC+W+KIMgWQVUNdTXEo9FhLGWbCbHL392PQMbqph0zGQeeugPpedPP/101q5bx8svv4wxhiAISuYqhGDq1KkALFiwAMdxkFKilEIpVeJpGhoaMMbQ2NiIUgrXdVm1aiWXXPJlvnn11RTyWR657zbuu3MWXr6A1kWSqkg5WqorY70aq913q5D7atDznDhQ1aeuhkgkCtYSBAEVsShz/3If006YyHe+cy1nzZjB/HnzqK2tZfbs2dx///1IKXvohGKapLXmuOOOw3VdnnrqKYwxPeyb7mHSJFJK+vbty4wZM0gkEixY8DaXXXYZEycezbPPPseZJx/H0lce4urLzyfZlQIssiyottZQURFDKYm1Nr4vJyP3J2KDKiAej0Ws40hhrUVKST7vUV9TxdwnfsVPfvgN5r3xBtPPOoujj56El8/T0tzsz58/v6Qd13VRSjFgwACuvPJK3n77bbq7u0vfSynJZrNs3rSJOXOexhjD7T/5Kaeddjpz5szhuIljePLBO3n18Xs5cuQQujq6UErtTTwJgdaWcCgkotEwQGTy5MluucKcfTUYBKIaIBYNWyWl6GW1lJJ4XgEpJXfffh1XXHw2Dz3xIn9+9lVuu/12ADXz3POYPPkYxowezeDBg6mtraG2ppYhQwajdcBtt91G//792bVrF1u2bGHrtu3s2L6tJMCwwf2ZfuEZXDLzdE4+/igisUiRdLYWx1EHKbpaIuEQ0XCYdDoXbW9vVz31iv28jQJ0ZTR6bncu99IVF88wjz0wW3YlkjhK7ZWwamOIR6O4kTDtbZ2899Ea5i9axocr17Fy9QbSucJnKkyOGDqAcaNHcvyksZx07AQmHDmSPn3qQBcpSW00SqlDFHgsjuOQ6k6b4875tty1p2VLQ0PD0W1tbele/Pvlg8baKEA8Hi0WAuz+RRZHKXJ5j0wuRzwWZuaZJzHz7JPxcx5dyW5a2hO0dqZIJJKkM1l8P0ApSXVVBdXVldRVV9Kntora6koqKuKgJDYIyOU8uhJdCHrpevWpE2WtQTpKhEIOQLhaa9l2qITXFqu4xCJhe6hKsZQCiSox3b3cS0U8Sm11JeOOUAgl96a3rcXqoqMJtO55t7vIcMtiDdH5DKDK7cBaUMrBdRyAUNb33UNn9MWqDI7jfOaymSorswWBxvd1saZoy2uLZbX/Evkk9iKk/q4TBtaipOhdo66OGUX3oQAKYXqigr9vzFLlSfCPbr1ZgpQSVdxTHa2jCjIcfJuAHEB3OidKden/D5r9xPGIA9EUZb5UtQO0J7qwWiO+wAhtbxVKG3w/AMiHQl7hYABtD/O7G8g3NrXLfN77z62RfzhCi5KSXDZLqjsDkDImnjskwFAo1ATsXrdpOy2tncZ1nc9Uvv5vwofrKto6ukxreydAa0tLS648o98XoOro6OhWSn2YSmfs4mWrbDgSRhvzBQVoUK7L2k07rB9oq5Ra1xOHyoOvQSCk1DOAeOSJl4UONPKLa6EgBAveXS4AEXbkOwfjQvei7nOFwqtSyjUL3/tIPD93gamqr6Hg+184gCHXoaM9wWtvv6+AjEYuOFS61PuDBHKOEP8ihBA33PFrs2XzTupqqns91Rei+X5ArKqCl+a9o3c2tiClXOB53tZywmk/Frh8LWpr1yohBqXSmWPnL1rmTztxkho6fBD5bK6Uy/13tUIQUBmPkuhK8Y0f3m26kt0yFJKztLZbys7eHRRgSbsWXpdSjmvtSIyb89Jbum99NcdOHCOi0QieV8ysy2t+/8jWe0xFCkF1bTXJVIavf3+2v+xv61wpxfNBYO7ZV3ufBhAgsNY+p5SKZbK5qS++tlgs/mCVrqurYcSwgaKqphJHyp6aebE8VnYGpxh9is/rOOxeaVlvwh2PRYhWxvH8gJfmLtBXzrrLvLdijSulXGmMvZSeCOxQB2IPeZBXKXWOtfYuY8xkgGPGH2G/fN7p+ox/mizHHD5UVFVVCKQErQn8AK01gTY9ZWuzF3C73+DFiRBSoqQoMgKOgwy5YAzdqYxdu2mbnbfoQ/PMK2+pVWs3i56g5K/GmGt7jl0e8NDxZ5lfUVYaDodd92u+1t82xpzYA5xRwwcx+ajRZuKRh5vRI4eIwYP6UV9TLSoroiIcDhFyXaRS4pOTTGIvZ2eMxWht/YJPNu+RTGXsntY2u3rdNj78eD1LP/xYrd+8s0QnSimXKMVvfN/MKT+t/PdocF9z7k0xZCQSOVFrf6bv69OAcUBFufuORSPU1lTRp7aa6uoK4rGojYRD1nUUjpI9PKYRfvFAgshmcyKR7Ka1PUFXspvuTK48gsoAq11XzXec0Cu5XO69A87UfxLgvtostaqq8Ejft+Ot5ihf+6O0tsOB/kDlPme6D7nee9ZRuqfuuN113TVKsdx1xfLu7sLGQ0w4/1UAy9/rBRscKCccOHBg1OvsrPYcp0JrHZHSxK21EWuVK611KZ6ALwihAylFTmmZ1Urlolp3DxozJrFi+XL/AGpxPu/B9P8q/y73qVTZz1Iv/xx9mr+3v/8HJJCuHRQHrQUAAAAASUVORK5CYII=', 'dash': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAATkElEQVR42sWbeZQfVZXHP/e9+m3dv17S6aSXJE1IQsi+ILKLDI47gkFccRkPIiqOynHjjI4LCgw6446ADqKijCLu6ygKKgiEBEJYQ0InIelOd3rv/u1V9e78UfVrft12kgbUeefU+VV1Le99737vu22Z3TCAxufzgJOAtYAAgzXPSM1zRxoC2PiQ+H0TX/9DR3XCLuArwF4j4qyICowDvwVeOsPzRwI227nl2SxeZjFBCJwM3CLQyTQWWRGcKgo3Ax8G9tRwXKfNZeLvASSBE4Hjib5bB+SA3cAW4P6aZ734XP+WnDPx71KgT6KPVwC3vrFBz2xt1dZkwgEB4IyIAgeAt8zwDVPzt0XApcA2AWdFtPYwkWT4wGbgklglZisdT4uzBqgH7orBBc2JhH5j4zp98kVnau+LX6D3nn6qvvPoLs1Yq4AfL06Ba2OOVKlPfH0l0G9iIDFH/JhIQc252qe+tQd4V8zxpy22h3rQiye6QeBfRCSw4H37Oet58fz5jFQqJIwhaQwJEbaMjvGZXd38fmBQibhiQ9XNwJuBHbEU3CRwgkQiHQLSkU7Jc5ubZUW2npQ1jFR8to6O88D4uBbCUGOgNlQFuBv4d+DWaerztAFWX3w/8J9WJAhVvY8du4xLli6h5BwV5+grlxGF+akkrakkuSDkG08+yWd37mbE9wMBTyPqvxm4RmC1Rhzy1jc2yvkLO3lJ2zzaUymsCAI4oOwcT+QL3NzTy437exjzAweoEbEuAvp14BNA72ystsygdw44B/iRFdFQ1by6s0Ou37CWId/nRwf6+N7+XrrzBUSEZfV1nNvZzrkd7XRm0twzPMondzzOHweHHWAUSgJpBZcyxnx8xTGcv3ABWWvJhyG+c1MtkQhpY0hbw2MTOb66ey837e9FI8kQpyoK+4FPAf89gzE7JMCq5esCNhuR+U7VbWxqNL85+QSeLBS55KFHuGN4ZMYPrWts4LKVy3lFWxu/GxjkZXdtxoEKiIioAbl2/Rpes6CDwYpPqDrJuenDqeKAOmtJG8MfBof49I5dPDA+TixdVWPzHuDLhxNXOw2sAl82cIqDsC2Vsj878Xj2FAq8est9PDyRwxPBARlrSFmD7yLi9Zcr/LTvIF11GazA93oOUAXnVOVDxyzh7YuPor9cxohMglNAY0BVVghgRAico+gcx2br2dTRRtoYHs3lTCl0vkSP5YBbpgUiMwK0sWgeB3xORAxgrtuwVlpTSc66ewv95QqeCIEq5y/q5ItrV/GmRQtpSSZ5ZCJHyTkCVX7TP8CI7+uufEFigyJrGrN8fu0qiqHDVPUt8p0kjaHOs2SsJR0fSWOQmJAKlFz03svb27hneJTH83msiFX4CXBbjZ+c0VrW+u5/NZB0qm5tY4NZ1ZDlvHvvY7BSwUokTJ9bvZK3dC2k7BwO+MjyZbyyo433PvgIW0fHqKjyq/6BKfJ/4VFdZK3HiO9jRQhVyXoeRoTeYpHHcnkGK5VoQSI0JxIsyqRZlMnQmPDIBSGBc+zOF3hofAJAYoPTy1P+uepr3Uw6WJXhj8bKG9RZ47UkEuwvlWOxVL64djVvWbSA/nIlCjxjjjZ6Hrkg4I1bH+DukRESxhDExmNeKsmtp5xISyJBRRUDZD3LXcMj3LivlzuGhjlQLv8V5ZsTCZbWZzi3o4NXdrSxpL6O3x4c4NzN9+FUEUFVGVW4A7ga+N9phnIKwOpvCvgO8Kr4IZMQwVflo8uX8f5lSxisRKJaO0JV0taQ8wNev3Ub94+NkzSGinOc3d7G1zasIReEWBGSRrhqZzdX795L7N+QmFgAqqDT1GlJXYb3L1vCw7FVrUpBNVSMz38AvC/m6iRImcHIJGLFPdsTcYGq2dTRztc2rGHcD5BDWL5QlXrPsr9Y4uV338vBciRyF3Qt4j9WH8twxaclmeDyHbv4QveeKHWI9YzYyABkLLook5EDpQoTQXhIk7+usYHeUlkHKhUXGxyjsAvYBDxUBWlmMDoGaDRAoMrS+jouX3ksxdDBIcBVKZkLQroyGa5Zv4a2VAqAO4eHGar4zEkmuWd4lC/FHHDx910NOE8EX5FFmQzXrFvLB5YeTdbaGJxM8lWBK1at4LennCCv6eywGoHzgWUxc9qqNLEzRDAfAN4mIqFnxF63fi0rGxvIh+GkoaFmIo2tIbHpL4QhG5uaGPN97hweYSwIeMG8uSyrr+Mr3XvYMjqGEcGIUG8t7ek0Wc9jIggiq6nQXSiyfXyCS49ZynuXLWbE99mVzyEIIfBPrXO5aHEX9Z7HuZ1tzE0kuX1wyCISAPPj48eAsdOc/BLgRiuSdKrmgq4uuXBxFyO+P0XvnCqIkDRmilkPnMMaw7gf8KnHdzJQqQDCrlyer+3dx5+Ghgnj98/r7OD649bx9sVdvKqznZe1zQeUhyZyGGDI9/l530HWNjbw64ODHKyUcUp4Xme7+dK61RgRKs5RCB1ntM4lIcJtg0NiwGmUjP8W2G+n6d+VBk5TcAvTaXP1ulWTyi81utYQm/ieYpE9hSK95RK+c7Qkk8xNJrh1YJDr9u6bpFpPqczBcgVfFQQ8K+zKF+gvlzmhuZnF9Rnmp1Js6mjn6LoMfxgcIlAlH4b8ou+g7iuWKoHDw4jpK5VZXp9ldUOWsnN4IuTDkBPnNHP74LD0lstqRDyFAvAbr8birADeiIhTVfO+pUfTnkkzXHmKe6FCUyLB7YNDXN29lwcnxidFq9HzOL6piUuXL+XHB/oisYjdyBSxVghCJSDkh7193Dk0wpfWrub5rS30lcu8bmEnWc/jgvu3E6gSoJy0qmn84Jg/t7unYAYrPu9+8GEWZNKsa2ygEIY4IG0Nr1/YwX1jY1VenAakbI14fsKInOpU3aqGrPn0ymMpOzdpNZ0qzYkEN+zdxzu3P8TuQoFi6Ag1koli6HiiUOD7PQfYmS9EBiSe6fkbW/j0O5bz1rMWsen57WTrLA93T+Ac5FzIz/v6WdWQZUNTI32lMsc3N+FU+dPQMIA01Cfqr710jdz5wAgjEz6+Kk8U8py3oBOHTroZTwzf6zlAoCoSeYPvVtF2AA8akRanyn+tWSlvWbSQ0ZrIo9Hz+EFvHxdvfygy76oYgSUL6jAi7NyfRxXERJxTp5y0dg4fftNSVi6up7UpSdlXjIGEZ7jjgWHe9/lH6O4pYIyQEcN3n7OBE1vmUAhDUOXMO+9hb7EIwB+uPpHQKWd/YCvlSohTuGHjOs5qn8+oH5AyhjE/4CV33UNPqYxAWeH5VTexycBcp6oL0ml56fz55MMwWiiQtpYni0U++ugORCJuLlmQ4UdXPYdfff4Efvn553LLlcexYXkj6iAMFadw0aYu/vm5rVgjDI/7FEoBE4WAobEKJ6+Zww+vfA7rljXgXKRvF29/mOFyhYwx9JfLNHixixDYua/A6RtbeOEJrcTxPf+zv5fQRdFRqEqdZ6nzvGralQSaq7HoK0VEUdXzF3bSlkoyFGftoSoZY/jGk/sZ8X2MCO1zk9x02UaWd2UZy/mIwPM2zOWHVzbxzV/u49Z7BzlpdTNnHDeXA0NR9mCmedzRnE97a5JvfXw9r/63++jeX6CnVOJt2x7EM/DA+AS5MCDhCX4Q5xkKSxdGlRBj4M/DIzySy7Eim424PrX4I4BXBZjROOAeqFRAIONZikFI2lr2Fovc3HNgknvvee1iVizO0j9UJpkwqMJYzscY4eJXL+Ydm7pIeIZ8KcSaQ9RErDBRCOlqy3D5Rcfyho9tI2GFu0am5pvOKZ4Vju6soxIoUSUDPDEUw5DbBodY09hIWpW0sZipoYhWp/+5UzUC7oYn9/O2+7fTXyrTnEzQlEjw075+BisVVGFRW5pzTm9ndCIg4ZlJy5j0hKZ6DyMQOhjLB0csCCWsMDoR8LyNLRy/somoOhGN1uYkp62bw4XnLOLbH1/PiqOyFMshB4amBuZ/GR4hZYTHc3k+9tjj7CsVAUKn6qoiKsA1wLkKJxqR4McH+u2fh4blXUcfxVntbdy0r3fSUb7hRZ3Mb0kyOuFjTaSj1gp+4PjMjU8wOObzjnO7WDAvTaniMEeof4lEXPrMu1fwnd/0UJe2nLa+hSUL6mhrSZFJGYJQGc8H1KXtpERUCx2PTuS44P7t/Kp/gEIYVlPIqn93VRGdAM4GrneqZ1kRBit+cNmOXfaL3Xtk3A+it4xw6roWgkCpBjbqlEzGctWNT/DVW/YCsKe3wLc/sT6OHuWIACu+Y/lRWTpb09y2dYgF89KccVwL4/mAUiWM3UBcLU48JTUAvaUyt/T2OUCsiIkziz7gJuAnXozYAAdjkO8NVS8VaBMRxvwgjGNpQqeM5CoR5+K1iwhBoNyxbRjPCiKw5dFRBkYqtDYn8WuIMdMIQ6WpweN7vzvAJ6/fCcCftg2zZEEdp61vIV8MMEYIXRQFJRNTar9OaipuoeqfgW8BPwMGmJYFV5fxBeB4hauc6rDE4FQhlTC0zUkThG5y0U4jI3DO6W0EoeIHyktOmc+8OSn8wB0WXDVgt8YwNBqlV6mYQ7t7CyQ8YVogRCSFTxXKFGyoerdGzDkDuD4GZ2pLFrVlC0tUlrsU+JrCRRIlksmmhgSd81L4oVJNnKwRCuWQC8/p4tiuevxQOX1DC87prArQ1gi5QsB5Z3bwp23D/HnbMBuXN3Lm8a3kSyFmmhLHBKh+/Ia4IHwjUKzZ2HHVhNebSWriBxNAN/BNQS5RVI9qS9OU9SScJnaqkaN90UnzEIkWHIR6RO5VdTAIlaasx/UfWceu/QW62tJk6zzKlRoJUDACC9syVYmzwF1xIdjUpHvhTBssM0lOGN8/VYQE4LraM1KX9ibLBdPHeD5gLOej8WKc6qw3ECq+I5U0rF3aQCpppoKbwvEpl6tqkvTwcDtIhxoOWF69aGtJHZYr1ggJa/CsECpkUpYgPDxIF4dayYThsT05Jgo+KIecJ5jqXpuOtK1mZkHfRdWTozszh9UqVUh4wmXX72TTB7ewY2+eeXOSuDhFcqpRUUkjYEGopJOW+ozlM9/p5mWX3MtP/3iQhjovspoziJU/1cikp9mPWQOUGl1cFL8tDfUeR5I6h7J1xxjbn5jgtR+5j6//5EmSntDSmCCTtCQ8IZkwZOs85jYl6BkoccHlD/Llm/dQqrhI/OXQilP2w6ezgTujkZlitIAmjVHVp21sHQ8BTpWkZ7n4VYt52xXbOThS4YNffowf/P4Ar3thJ+uOaaSlMUHFd+zrL/G7zQPc8oc+hsd9AFYeneXcM9qZKAR/ZT2rUHKFKQDzRwJ6JIAJgWSVa5mU5XAEtkaYyIecffp8Pjuxko9eu4Oy79j8yBibHxmjLm1pqPPwAzcJqjoWzk9zzYfWkM1YCjO4h6oKjOamvDc2223qIzYMiEQx55HsojEwUQh461kL+f7lGzlxdfPkvUIppH+4/FfgXnxSKz+44jhWHJWd0fc9BVAZmfpu7tmK6OTemyq4UGe1d2xEGJ3wOXnNHG6+4jhu2zrErZsHebh7gsGxCkaE1uYk649p5KWnzOPUdXNQB7ligD0EOGOEUsUxFAOMCT34rAEqhNVQLVcMETO7VgdrhYl4wS87ZR6vOG0+E4WAXCFEBLIZj2xd5EbyxXAymD/UIqwVcsWQ/ihdqsZwe58twDJQlHino3AY8TmUTlYDgOp1Y72Hxv5vZDyqBhgjR+5nEcgXA8ZyQTUG1ThBeEYAq7GeDwxUM6PRnP+MunJqOVN1/FWdns1QVaxn6R+ukCsGCogq4zUAn5Gjr97rrf5hd0/hWXfiiDCrGHU6tRNW6B0o4QeqsRSNAkPPBmB19FRPDgyVcY7/lyHCZLkipk//bKzobADuqPrBPb1F8oVDW7q/51CFXfvztdx6tCYheEYcrL60S1EHmJ7BEkPjFTwrqP7jwBkRyr5jd2+xtlqxdzbh2mwAdqsyJIKMTgS6u7cYlwr1H8Y5a4WB0TKP78tFFjSa+4Gn03B3uEhmEHgiLtfr9l3jeFYInP7duRg6xQ8czVmP+3eMc3CookbEqJIHth3JwMyGgybuWdsS+x3367sGCJ3SVJ+Y1EWn0WLCUKNfpzg3NT2aDadqvyMCjXUerU1JHt49wWe/040y2Vnyl7jaYKZ3VRyuEehwnb6iyvkiuN6BstnXX6KjNUU6bUgmLOmkoT7tUZexpJKWVMKQSBisjUv2NX5hOtjqLWujNKoubalLRwH37fcN8cWb9/DJr+9k38GSi+MNG/fR7TiSgZlNPlW9n4i7/J4nUFHwrBHpnJeSOQ0JOlpTdM5NM6cxQWtzkva5KeY2JchmPBrqPbIZSzplsGIwlqi8Hod/qhHHihXH4GiZvQdK3P3wCLduHuKxvblqVUFFsDFxrgPeMRvuMcu+y+qHlgA/AtYbI9W80M1AwcnWlGTCkM1Yshkr6ZQlkzKkk5ZkQqJOJqeUK458KSRXDBkarWi+FE4284hgq1t1qhyM+2E+XTOn/i0bZAHmxK2MjwqUjKDGiBojao2otdF5XNGffriaqtf0Y7JVTQS1ZrJhNgD+SNQQu/Dv0bM9EycBMjFHV8Qtx23AUfF5CzAXaBIhHXf6JiUWy0OZs7hXo6jKKPA4cDvwi7h/m6fTBPtMAc7UWH4oQtQD2Rjc/Bh4c0wYO+1fEMK412wkbl/ujfcWps/pnolI/h/+3iZffGrSmAAAAABJRU5ErkJggg==', 'rc': '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', 'class': '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', 'race': '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'}
+EXTRA_ICONS.update({'kbbinds': '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'})
 
 
 CHECK_ICONS = {   # Other Stuff / Checklist pictures (56 px; 'item' = the locked custom-checklist icon, 44 px)
@@ -7965,6 +10193,11 @@ class App:
         self.miner = AutoMiner(allowed=self.train_allowed, on_stop=lambda why: self.q.put(("pick_stopped", why)))
         self.tracker.pick_cb = self.pick_mine
         self.inputs = InputWatcher(self)
+        self.kb_map = {}                          # pressed key id -> what the tool presses instead (Extras > Keybinds)
+        self.apply_keybinds()
+        self.gate_open, self.gate_rects, self.gate_hits, self.gate_map = False, (), [], {}     # Gate: the shortcut boxes are up / the mouse hook's boxes / click boxes / gate keybinds
+        self.gate_menu, self._gate_sig = GateMenu(self.gates_data()["pinned"]), None
+        self.apply_gates()
         self.win_rect = None                      # screen rect of this window (for ignoring clicks on it)
         self.demo_until, self.demo_t0 = 0.0, 0.0
         self._sig, self._top_t = None, 0.0
@@ -8013,8 +10246,10 @@ class App:
         self.inv_err_t = 0.0
         self.mana_keep_until, self._mana_listen_off, self._mana_listen_next = 0.0, False, 0.0
         self.mana_absent, self._mana_gone, self._mana_seen_now = False, 0, True      # the game's mana bar isn't on screen
+        self.hp_missing = False                  # the HP bar has been gone for a moment (inventory / menu): the Autoclicker waits
         self.hp_absent, self._hp_seen, self._hp_gone = False, 0, 0          # the HP bar is not on screen (inventory / menu): coins hide
         self.inv_boxes, self.inv_boxes_t, self.inv_miss_t = [], 0.0, 0.0     # recognised items on the screen [(name, rect)] / when / log throttle
+        self.slow_drain = SlowDrain(self.cfg["settings"])                 # (a slow mana drain going on: .active; nothing uses it yet)
         self.mana_pct, self._boxes_now, self._pct_top = None, [], 0.0     # (time, mana %) / cast-mark boxes on the bar / raise timer
         self.pct_btn, self.pct_vars = None, {}
         self.kda_btn, self.kda_vars = None, {}
@@ -8067,6 +10302,8 @@ class App:
         self.inv_cd_ov = Overlay(r, self.append_log)                  # the cooldown boxes ON the inventory cards: the very same look as the hotbar's
         self.pct_ov = PctOverlay(r, self.append_log)
         self.bard_on = False
+        self.ac_on = True                                                  # the Autoclicker is not paused (the pause key flips this)
+        self.ac_badge = AutoclickBadge(r, self.append_log)                 # "Autoclicker: ON / OFF" + its pause key
         self.bard_badge = BardBadge(r, self.append_log)                # "Auto Bard is Active." under the mana bar (never hidden)
         BARD_LOG[0] = self.append_log
         self.autobard = AutoBard(self)
@@ -8074,6 +10311,7 @@ class App:
         self.kda_ov = KdaOverlay(r, self.append_log)                  # the KDA counters under the Auto Bard badge
         self.kda_hits, self.kda_rects, self._kda_sig, self._kda_top = [], (), None, 0.0
         self.check_ov = ChecklistOverlay(r, self.append_log)          # the checklist right of the mana bar
+        self.gate_ov = GateOverlay(r, self.append_log)                # the Gate shortcut boxes (right click with a Gate spell)
         self.mascot = Mascot(r, self.mascot_pop, self.mascot_moved)
         if self.cfg.pop("_dash_fresh", None):                          # first start: put the coins where the game has them
             for k_, v_ in default_dashpos(*screen_size(r)).items():       # (in place: the Move / resize buttons already hold these very dicts)
@@ -8107,6 +10345,9 @@ class App:
             threading.Thread(target=self.awk_loop, daemon=True).start()
         r.protocol("WM_DELETE_WINDOW", self.on_close)
         self.inputs.start()
+        self.ahk_guard = AhkChatGuard(self, self.inputs.game_active)      # (your own AutoHotkey scripts rest while you type in the Roblox chat)
+        if IS_WIN:
+            self.ahk_guard.start()
         if IS_WIN:
             threading.Thread(target=self._inv_loop, daemon=True).start()
             threading.Thread(target=self._hp_loop, daemon=True).start()
@@ -8471,7 +10712,7 @@ class App:
             pass
 
     def _wheel(self, e):
-        key = (self.extra_page if (self.cur_tab == "extras" and getattr(self, "extra_page", "") in ("dash", "class", "inv", "race", "brew", "sell", "gank", "check", "cview"))
+        key = (self.extra_page if (self.cur_tab == "extras" and getattr(self, "extra_page", "") in ("dash", "class", "inv", "race", "brew", "sell", "dayfarm", "gank", "check", "cview", "kbbinds", "gatepin", "gatekeys"))
                else self.cur_tab)
         cv = self.scroll_cvs.get(key)
         if cv is not None:
@@ -8842,8 +11083,11 @@ class App:
         missing_az = tuple(base for kind, base in AZURE_BASE.items() if not any(azure_kind(m["name"]) == kind for m in moves))
         has_dk = any(is_dark_charged_blow(m["name"]) for m in moves)
         missing_dk = tuple(label for kind, label in WK_CHARGES if not any(charge_kind(m["name"]) == kind for m in moves))
+        names = [m["name"] for m in moves] + [e["name"] for e in inv_of(self.cfg)]
+        has_ts = any(is_the_soul(n) for n in names)
+        missing_ts = tuple(l for l, f in (("Elegant Slash", is_elegant_slash), ("Needle's Eye", is_needles_eye)) if not any(f(n) for n in names))
         sig = (self.cfg["active"], has, missing if has else (), has_az, missing_az if has_az else (),
-               has_dk, missing_dk if has_dk else ())
+               has_dk, missing_dk if has_dk else (), has_ts, missing_ts if has_ts else ())
         if sig == self._charged_sig and not force:
             return                                         # (rebuilding while typing in a box would steal the focus)
         self._charged_sig = sig
@@ -8862,6 +11106,10 @@ class App:
             blocks.append(("Azure Ignition: the cooldown of each Azure move. While Azure Ignition is on, using the "
                            "normal move puts this cooldown on its slot (blue box), shared with the normal move.",
                            list(AZURES), missing_az))
+        if has_ts:
+            blocks.append(("The Soul (its own cooldown is the move's box, 30 s): while Soul Mode is on, Elegant Slash is Violent Slash (same cooldown) "
+                           "and Needle's Eye is Threading Needle (this cooldown, shared with Needle's Eye). Using either one ends Soul Mode.",
+                           list(SOUL_MODES), missing_ts))
         for text, rows, miss in blocks:
             self.label(self.charged_frame, text, font=self.fs, fg=DIM, justify="left",
                        wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(4, 2))
@@ -8904,6 +11152,12 @@ class App:
                     else:
                         m.pop("soul", None)
                     self.soul_rebuild_later(False)
+                if is_decompose(v) and "cd2" in m and not m.get("spell") and m.get("cd2") != DECOMPOSE_M2:
+                    m["cd2"], m["split"] = DECOMPOSE_M2, True      # Decompose: M2 is 31 s
+                    self.soul_rebuild_later(False)
+                if is_the_soul(v) and float(m.get("cd") or 0.0) <= 0:
+                    m["cd"] = THE_SOUL_CD                  # The Soul: 30 s to start with (change the box if you like)
+                    self.soul_rebuild_later(False)
                 if is_pick_name(v) != bool(m.get("pick")):
                     if is_pick_name(v):
                         m["pick"], m["cd"], m["cd2"] = True, 0.0, 0.0
@@ -8922,6 +11176,12 @@ class App:
                     else:
                         m.pop("bmove", None)
                     self.soul_rebuild_later(False)
+            if "cd2" not in m and ensure_snarv_pair(self.cfg, m):          # a snap Snarvindur brings the normal Snarvindur on the same key
+                try:
+                    self.root.after_cancel(self._snarv_rb)
+                except Exception:
+                    pass
+                self._snarv_rb = self.root.after(900, self.rebuild_moves)
             save_cfg(self.cfg)
             if m.get("ininv") and sync_inv_links(self.cfg):                 # (an inventory spell: its entry + marks follow the new name)
                 save_cfg(self.cfg)
@@ -8935,14 +11195,23 @@ class App:
             try:
                 if v:
                     m["cd"] = max(0.0, float(v))
+                    if m["cd"] <= 0 and "cd2" in m:
+                        m["zero"] = True                   # typed 0: a move with no cooldown (NOT a weapon)
+                    else:
+                        m.pop("zero", None)
                 elif "cd2" in m:                           # normal moves: blank = WEAPON (no main cooldown)
                     m["cd"] = 0.0
+                    m.pop("zero", None)
                 else:
                     return                                 # snap spells need a cooldown
             except ValueError:
                 return
             save_cfg(self.cfg)
         def set_cd2(v, m=mv):                              # M2: blank = off, a number = right-click cooldown
+            if is_decompose(m.get("name")) and not m.get("spell"):
+                m["cd2"] = DECOMPOSE_M2                    # (Decompose: hardcoded 31 s)
+                save_cfg(self.cfg)
+                return
             v = v.strip().replace(",", ".")
             try:
                 m["cd2"] = max(0.0, float(v)) if v else 0.0
@@ -8952,10 +11221,26 @@ class App:
         nb, _ = self.bound_entry(row, mv["name"], set_name, self.NAME_W, 24, "left")
         nb.pack(side="left", padx=(4, 0))
 
-        def paint_name(m=mv, e=nb.entry):                  # green = this move unequips after use
-            e.config(bg=GREEN_BOX if m.get("unequip") else TAN)
+        def paint_name(m=mv, e=nb.entry):                  # green = this move unequips after use; blue = Viribus key
+            e.config(bg=VIR_BOX if m.get("vir") else GREEN_BOX if m.get("unequip") else TAN)
 
         def flip_name(_e=None, m=mv):                      # right-click the name box
+            if m.get("spell") and "viribus" in str(m.get("name", "")).lower():      # Viribus: off -> blue (Viribus key) -> green (unequips) -> off
+                if m.get("vir"):
+                    m.pop("vir", None); m["unequip"] = True
+                elif m.get("unequip"):
+                    m["unequip"] = False
+                else:
+                    m["vir"] = True
+                save_cfg(self.cfg)
+                paint_name()
+                lab_ = self.cfg["settings"].get("vir_key_label") or "Right click"
+                self.say(f"'{m['name']}': {lab_} casts it (left click), then F is held (blue name box)." if m.get("vir")
+                         else f"'{m['name']}' unequips after use (green name box)." if m.get("unequip")
+                         else f"'{m['name']}': cast normally.",
+                         "Viribus key on" if m.get("vir") else "Unequips after use" if m.get("unequip") else "Cast normally")
+                self.root.after(10, self.rebuild_moves)          # (the key button under the spell appears / goes away)
+                return "break"
             m["unequip"] = not m.get("unequip")
             save_cfg(self.cfg)
             paint_name()
@@ -8966,8 +11251,33 @@ class App:
         for w_ in (nb.entry, nb):
             w_.bind("<Button-3>", flip_name)
         paint_name()
-        cb, _ = self.bound_entry(row, f"{mv['cd']:g}" if (mv["cd"] > 0 or "cd2" not in mv) else "", set_cd, self.CD_W, 24)
+        cb, _ = self.bound_entry(row, f"{mv['cd']:g}" if (mv["cd"] > 0 or "cd2" not in mv or mv.get("zero")) else "", set_cd, self.CD_W, 24)
         cb.pack(side="left", padx=(4, 0))
+        if "cd2" not in mv:                                # snap spells: right-click the cooldown box of snap Ignis = green = after the cast wait (green 0.15 s, white 0.01 s), hold G 0.05 s, then F 0.4 s
+            def paint_gf(m=mv, e=cb.entry):
+                ig = "ignis" in str(m.get("name", "")).lower()
+                e.config(bg="#ffffff" if (ig and m.get("gf") == "hold") else GREEN_BOX if (ig and m.get("gf")) else TAN)
+
+            def flip_gf(_e=None, m=mv):                    # right-click: off -> green -> white -> off
+                if "ignis" not in str(m.get("name", "")).lower():
+                    return "break"
+                cur = m.get("gf")
+                if cur == "hold":
+                    m.pop("gf", None)
+                else:
+                    m["gf"] = "hold" if cur else True
+                save_cfg(self.cfg)
+                paint_gf()
+                if m.get("gf") == "hold":
+                    self.say(f"'{m['name']}': after it is cast G is pressed for 50 ms (10 ms after the cast) and F held 0.4 s - and if you are holding G, the tool holds it for you (white cooldown box).", "G + F, holds G")
+                elif m.get("gf"):
+                    self.say(f"'{m['name']}': after it is cast G is pressed for 50 ms (150 ms after the cast) and F held 0.4 s - nothing while you hold G (green cooldown box).", "G + F on")
+                else:
+                    self.say(f"'{m['name']}': cast normally.", "G + F off")
+                return "break"
+            for w_ in (cb.entry, cb):
+                w_.bind("<Button-3>", flip_gf)
+            paint_gf()
         if "cd2" in mv and not mv.get("spell"):            # normal moves only (snap spells and Normal Spells have no M2)
             m2, _ = self.bound_entry(row, f"{mv['cd2']:g}" if mv["cd2"] > 0 else "", set_cd2, self.M2_W, 24)
             m2.pack(side="left", padx=(4, 0))
@@ -8996,6 +11306,8 @@ class App:
                     except Exception:
                         pass
         PixBtn(row, "x", lambda m=mv: self.delete_move(m), self.f, self.X_W, 24, bd=2).pack(side="right")
+        if mv.get("vir") and mv.get("spell") and "viribus" in str(mv.get("name", "")).lower():
+            self.build_vir_row(parent)                     # Viribus (blue name box): its key button sits under it
         if mv.get("soul"):
             self.build_soul_row(parent)                    # Soul Rip: the Soul Berserk row sits under it
         if mv.get("awk"):
@@ -9011,6 +11323,15 @@ class App:
         except Exception:
             pass
         self._soul_rb = self.root.after(900, self.rebuild_inv if inv else self.rebuild_moves)
+
+    def build_vir_row(self, parent):
+        """Under a Viribus spell with the blue name box: the button that picks the key that casts it and holds F."""
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        tk.Frame(row, bg=PARCH, width=self.KEY_W, height=24).pack(side="left")
+        self.label(row, "Viribus key:", font=self.fs, fg=DIM).pack(side="left", padx=(4, 6))
+        self.btn_vir_key = PixBtn(row, self.cfg["settings"].get("vir_key_label") or "Right click", self.pick_vir_key, self.f, 130, 24)
+        self.btn_vir_key.pack(side="left")
 
     def build_soul_row(self, parent):
         """Under the Soul Rip move: the Soul Berserk box. It is not a move - it holds the cooldown (under Cooldown) and
@@ -9166,13 +11487,31 @@ class App:
             return
         host = self.main_inner
         menu = tk.Frame(host, bg=BROWN)
-        for name in self.cfg["profiles"]:
-            PixBtn(menu, name, lambda n=name: self.set_profile(n), self.f, self.PROFILE_W, 21, bd=2).pack()
+        for name in self.profile_order():
+            b = PixBtn(menu, name, lambda n=name: self.set_profile(n), self.f, self.PROFILE_W, 21, bd=2)
+            b.set_on(name in self.cfg.get("pinned", []))      # white = pinned
+            b.lbl.bind("<ButtonRelease-3>", lambda e, n=name: self.toggle_pin(n))   # right-click: pin / unpin
+            b.pack()
         x = self.profile_btn.winfo_rootx() - host.winfo_rootx()
         y = self.profile_btn.winfo_rooty() - host.winfo_rooty() + self.profile_btn.winfo_height() - 1
         menu.place(x=px1(x), y=px1(y))                    # (real pixels in, the patched place() scales them)
         menu.lift()
         self.profile_menu = menu
+
+    def profile_order(self):
+        """Pinned profiles first (in the order they were pinned), then the rest."""
+        pins = [n for n in self.cfg.get("pinned", []) if n in self.cfg["profiles"]]
+        return pins + [n for n in self.cfg["profiles"] if n not in pins]
+
+    def toggle_pin(self, name):
+        pins = self.cfg.setdefault("pinned", [])
+        if name in pins:
+            pins.remove(name)
+        elif name in self.cfg["profiles"]:
+            pins.append(name)
+        save_cfg(self.cfg)
+        self.close_profile_menu()
+        self.toggle_profile_menu()                        # the same dropdown again, in the new order
 
     def close_profile_menu(self):
         if self.profile_menu is not None:
@@ -10338,6 +12677,7 @@ class App:
         self.cfg["charged"] = {(name if k == old else k): v for k, v in self.cfg["charged"].items()}
         self.cfg["popts"] = {(name if k == old else k): v for k, v in self.cfg["popts"].items()}
         self.cfg["inv"] = {(name if k == old else k): v for k, v in self.cfg["inv"].items()}
+        self.cfg["pinned"] = [(name if n == old else n) for n in self.cfg.get("pinned", [])]
         self.cfg["active"] = name
         self.name_var.set("")
         self.profile_btn.lbl.config(text=name + " v")
@@ -10365,6 +12705,7 @@ class App:
         self.cfg["charged"].pop(gone, None)
         self.cfg["popts"].pop(gone, None)
         self.cfg["inv"].pop(gone, None)
+        self.cfg["pinned"] = [n for n in self.cfg.get("pinned", []) if n != gone]
         self.cfg["active"] = next(iter(self.cfg["profiles"]))
         self.tracker.reset()
         self.profile_btn.lbl.config(text=self.cfg["active"] + " v")
@@ -10383,7 +12724,7 @@ class App:
         self.train_total = 0
         self.extra_pages = {}
         self.dash_btns, self.dash_vars = {}, {}
-        for name in ("menu", "auto", "snap", "brew", "sell", "dash", "rc", "class", "race", "inv", "other", "gank", "check", "cview", "kda", "imenu"):
+        for name in ("menu", "auto", "snap", "brew", "sell", "dash", "rc", "class", "race", "inv", "other", "gank", "check", "cview", "kda", "imenu", "dayfarm", "kbbinds", "gate", "gatepin", "gatekeys"):
             pg = tk.Frame(f, bg=PARCH)
             pg.place(x=0, y=0, relwidth=1, relheight=1)
             self.extra_pages[name] = pg
@@ -10392,6 +12733,11 @@ class App:
         self.build_snap(self.extra_pages["snap"])
         self.build_brew(self.extra_pages["brew"])
         self.build_sell(self.extra_pages["sell"])
+        self.build_dayfarm(self.extra_pages["dayfarm"])
+        self.build_kbbinds(self.extra_pages["kbbinds"])
+        self.build_gate(self.extra_pages["gate"])
+        self.build_gatepin(self.extra_pages["gatepin"])
+        self.build_gatekeys(self.extra_pages["gatekeys"])
         self.build_dash(self.extra_pages["dash"])
         self.build_rc(self.extra_pages["rc"])
         self.build_class(self.extra_pages["class"])
@@ -10429,7 +12775,7 @@ class App:
         self.label(pg, "Instant Menu", font=(self.family, -(UI_FONT_PX + 6))).pack(fill="x", padx=12, pady=(8, 0))
         box, p = self.panel(pg, "Instant Menu")
         box.pack(fill="x", padx=6, pady=6)
-        self.label(p, "Press the keybind to menu instantly... thats all.", font=self.fs, justify="left", fg=DIM,
+        self.label(p, "Press the keybind and it presses \\, Enter, \\ (backslash, Enter, backslash) for you, instantly.", font=self.fs, justify="left", fg=DIM,
                    wraplength=PAGE_W - 60).pack(fill="x", padx=8, pady=(0, 3))
         krow = tk.Frame(p, bg=PARCH)
         krow.pack(fill="x", padx=8, pady=(4, 6))
@@ -10447,7 +12793,7 @@ class App:
         big = (self.family, -(UI_FONT_PX + 6))
         self.extra_icons = {k: ui_img(_img(v)) for k, v in EXTRA_ICONS.items()}      # (kept alive here)
         self.other_menu_icon = ui_img(_img(CHECK_ICONS["other"]))
-        for i, (key, text) in enumerate((("auto", "Automation"), ("dash", "Dash/PB CD"), ("rc", "Race/Class"), ("inv", "Inventory"), ("other", "Other Stuff"))):
+        for i, (key, text) in enumerate((("auto", "Automation"), ("dash", "Dash/PB CD"), ("rc", "Race/Class"), ("inv", "Inventory"), ("kbbinds", "Keybinds"), ("other", "Other Stuff"))):
             row = tk.Frame(f, bg=PARCH)
             row.pack(fill="x", padx=12, pady=(14 if i == 0 else 6, 0))
             tk.Label(row, image=(self.other_menu_icon if key == "other" else self.extra_icons[key]), bg=PARCH, bd=0, width=62).pack(side="left")
@@ -10461,7 +12807,7 @@ class App:
         self.back_button(f)
         big = (self.family, -(UI_FONT_PX + 6))
         self.label(f, "Automation", font=big).pack(fill="x", padx=12, pady=(8, 0))
-        for i, (key, text, icon) in enumerate((("snap", "Snap Trainer", "snap"), ("brew", "Alchemy/Smith", "brew"), ("sell", "Appraise Sell", "sell"))):
+        for i, (key, text, icon) in enumerate((("snap", "Snap Trainer", "snap"), ("brew", "Alchemy/Smith", "brew"), ("sell", "Appraise Sell", "sell"), ("dayfarm", "Day Farm", "dayfarm"))):
             row = tk.Frame(f, bg=PARCH)
             row.pack(fill="x", padx=12, pady=(10 if i == 0 else 6, 0))
             tk.Label(row, image=self.extra_icons[icon], bg=PARCH, bd=0, width=62).pack(side="left")
@@ -10737,7 +13083,9 @@ class App:
                         ("Vind", "Add Tempest Soul to Moves or Inventory to turn this on"),
                         ("Rigan", "Add Flood to Moves or Inventory to turn this on"),
                         ("Construct", "Add Galvanize to Moves or Inventory to turn this on"),
-                        ("Haseldan", "Add Bloodline to Moves or Inventory to turn this on")):
+                        ("Haseldan", "Add Bloodline to Moves or Inventory to turn this on"),
+                        ("Metascroom/Scroom", "Add Decompose to Moves or Inventory to turn this on. Left click = in / out of Decompose; "
+                                              "M2 (31 s) only works while you are decomposed and doesn't get you out of it.")):
             box, p = self.panel(host, nm)
             box.pack(fill="x", padx=6, pady=(0, 6))
             self.label(p, txt, **small).pack(fill="x", padx=8, pady=(0, 3))
@@ -11203,6 +13551,21 @@ class App:
             return
         self._mana_seen_now = True
         v = self.read_mana_pct()
+        try:
+            if self.gate_open or getattr(self.tracker, "gate", None) is not None:
+                self.slow_drain.reset()                      # (the gate shortcut is up / a Gate waits for its name: casting it drains the mana too - no drain is looked for)
+            else:
+                self.slow_drain.feed(now, v)
+        except Exception:
+            pass
+        try:
+            self.inputs.rb_poll()                                    # (Block Run goes off while the mana drains slowly = climbing)
+        except Exception:
+            pass
+        try:
+            self._climb_notify(now, v)
+        except Exception:
+            pass
         if v is not None:
             prev, self._last_pct = self._last_pct, v
             if prev is not None and v > prev + 0.3 and (self.g_held or now - self.g_t <= MANA_G_KEEP):
@@ -11215,6 +13578,19 @@ class App:
                 self.mana_absent = True
         hide_ = self.mana_hidden(now)
         self.mana_pct = None if (v is None or not S.get("mana_pct_on") or hide_) else (now, v)
+
+    def _climb_notify(self, now, v):
+        """The status line says when a climb / a slow mana drain starts and ends."""
+        d, w = self.slow_drain, self.inputs
+        climb, pend, drain = bool(getattr(w, "_climb", False)), getattr(w, "_climb_pending", 0.0) > now, bool(d.blocking(now))
+        state = (drain, climb, pend)
+        last = getattr(self, "_cl_state", (False, False, False))
+        if state != last:
+            self._cl_state = state
+            if climb != last[1]:
+                self.say("Climbing: Block Run and the keybinds are paused" if climb else "Climb over: Block Run is back", "Climbing" if climb else "Climb over")
+            elif drain != last[0]:
+                self.say("Slow mana drain: Block Run and the keybinds are paused" if drain else "Mana drain over: Block Run is back", "Mana drain" if drain else "Drain over")
 
     def _pct_loop(self):
         while True:
@@ -11459,7 +13835,7 @@ class App:
         now = time.time()
         if not self.game_focused():
             self._hp_seen = self._hp_gone = 0
-            self.hp_absent = False
+            self.hp_absent = self.hp_missing = False
             return
         try:
             c_ = getattr(self, "_hp_mon_c", None)
@@ -11472,10 +13848,10 @@ class App:
                         m_ = dict(sct0.monitors[1])
                 c_ = self._hp_mon_c = (now, m_)
             mon = c_[1]
-            f = HP_BAR_FRAC
-            arr = self._grab_rgb({"left": mon["left"] + int(mon["width"] * f[0]), "top": mon["top"] + int(mon["height"] * f[1]),
-                                  "width": max(1, int(mon["width"] * (f[2] - f[0]))), "height": max(1, int(mon["height"] * (f[3] - f[1])))})
+            bx, by, bw, bh = hp_bar_box(mon["width"], mon["height"])
+            arr = self._grab_rgb({"left": mon["left"] + bx, "top": mon["top"] + by, "width": bw, "height": bh})
             seen = hp_bar_visible(arr)
+            self._hp_dbg = {"crop": arr, "bar": bool(seen), "size": (mon["width"], mon["height"]), "t": now}
         except Exception:
             return
         try:                                                         # the Songs' Error Meter (only when the profile has Songs)
@@ -11489,10 +13865,14 @@ class App:
         except Exception:
             pass
         try:                                                         # how full the bar is (Bloodline needs it nearly empty)
-            g = HP_FILL_AREA
-            frac = hp_fill_fraction(self._grab_rgb({"left": mon["left"] + int(mon["width"] * g[0]), "top": mon["top"] + int(mon["height"] * g[1]),
-                                                    "width": max(1, int(mon["width"] * (g[2] - g[0]))), "height": max(1, int(mon["height"] * (g[3] - g[1])))}))
+            gx, gy, gw, gh = hp_fill_box(mon["width"], mon["height"])
+            wide = self._grab_rgb({"left": mon["left"] + gx, "top": mon["top"] + gy, "width": gw, "height": gh})
+            frac = hp_fill_fraction(wide)
             self.tracker.hp_frac = (frac, now)
+            try:
+                self._hp_dbg.update(frac=frac, wide=wide)
+            except Exception:
+                pass
             if frac is not None:
                 seen = True                                          # (the wide look found the bar's red / empty strip WITH its frame: it is there)
             if seen and self.tracker.bloodline_passive(frac, now):
@@ -11501,11 +13881,12 @@ class App:
             pass
         if seen:
             self._hp_seen, self._hp_gone = self._hp_seen + 1, 0
-            self.hp_absent = False                                   # (the bar is there: the coins show at once)
+            self.hp_absent = self.hp_missing = False                 # (the bar is there: the coins show at once)
             if self._hp_seen >= 2 and self.inv_key_open and now - self.inv_key_t > 0.3:
                 self.inv_key_open = False
         else:
             self._hp_seen, self._hp_gone = 0, self._hp_gone + 1
+            self.hp_missing = self._hp_gone >= 4                     # (a few looks in a row: not a hiccup)
             if self._hp_gone >= 4 and self.cfg["settings"].get("always_show"):
                 self.hp_absent = False                               # ("Always show the coins and cooldowns": a missing HP bar hides nothing)
             elif self._hp_gone >= 4:
@@ -12150,8 +14531,13 @@ class App:
     def brew_pick_click(self, button, t, pt, over_window):
         """Input thread: while a spot is being picked, the next left click outside the macro window is that spot."""
         which, sw = getattr(self, "brew_pick", None), getattr(self, "sell_pick", None)
-        if not (which or sw) or button != "left" or over_window or not pt:
+        dfp = getattr(self, "df_pick", False)
+        if not (which or sw or dfp) or button != "left" or over_window or not pt:
             return False
+        if dfp:
+            self.df_pick = False
+            self.q.put(("df_point", (int(pt[0]), int(pt[1]))))
+            return True
         if sw:
             self.sell_pick = None
             self.q.put(("sell_point", sw, (int(pt[0]), int(pt[1]))))
@@ -12436,6 +14822,642 @@ class App:
             why = "ran out of the item"
         self.say(f"Appraise Sell stopped ({why}) - sold {n} time{'' if n == 1 else 's'}.", "Sell stopped")
 
+    # ---------- Extras > Automation > Day Farm ----------
+    def dayfarm_data(self):
+        d = self.cfg.get("dayfarm")
+        if not isinstance(d, dict):
+            d = self.cfg["dayfarm"] = clean_dayfarm(None)
+        return d
+
+    # ---------- Gate: the shortcut boxes, pinned gates, gate keybinds ----------
+    def gates_data(self):
+        g = self.cfg.get("gates")
+        if not isinstance(g, dict):
+            g = self.cfg["gates"] = clean_gates(None)
+        return g
+
+    def apply_gates(self):
+        self.gate_map = build_gatemap(self.gates_data())
+        try:
+            self.gate_menu.set_pinned(self.gates_data()["pinned"])
+        except Exception:
+            pass
+
+    def gate_close(self, why=""):
+        if self.gate_open and why:
+            self.append_log(f"GATE: the shortcut boxes closed ({why})")
+        self.gate_open = False
+        self.gate_rects, self.gate_hits, self._gate_sig = (), [], None
+        try:
+            self.gate_ov.hide()
+        except Exception:
+            pass
+
+    def gate_show(self):
+        self.gate_menu.set_pinned(self.gates_data()["pinned"])
+        self.gate_menu.reset()
+        self.gate_open, self._gate_sig = True, None
+        self._gate_seen, self._gate_t0 = False, time.time()
+        self._gate_draw()
+
+    def _gate_draw(self):
+        """(Re)draws the boxes when something changed (selection, scroll, area, window)."""
+        m = self.gate_menu
+        r = game_window_rect(str(self.cfg["settings"].get("game_title", "Roblox")))
+        if r is None:
+            self.gate_close("the game window wasn't found")                  # (the game isn't in front: nothing to show)
+            return
+        s = max(0.4, r[3] / 1080.0)
+        sig = (m.area, m.sel, m.off["L"], m.off["R"], tuple(m.pinned), r)
+        if sig == self._gate_sig and self.gate_ov.shown:
+            return
+        self._gate_sig = sig
+        self.gate_hits, self.gate_rects = self.gate_ov.show_menu(m, r, s, self.num_family)
+
+    GATE_FALLBACK = GATE_WAIT + 1.0               # (seconds the boxes stay when the tool never saw the cast)
+
+    def _gate_tick(self, now):
+        if self.gate_open:
+            if not self.inputs.game_active():
+                self.gate_close("the game isn't in front")
+                return
+            # the boxes go when the game's gate prompt does: the wait for the name (GATE_WAIT s after the cast) is over / Enter was pressed
+            if self.tracker.gate_waiting(now):
+                self._gate_seen = True
+            elif getattr(self, "_gate_seen", False) or now - getattr(self, "_gate_t0", now) > self.GATE_FALLBACK:
+                self.gate_close("the gate prompt is over" if getattr(self, "_gate_seen", False) else "no cast seen")
+                return
+            self._gate_draw()
+        elif self.gate_ov.shown:
+            self.gate_close()
+
+    def gate_do(self, name):
+        if name:
+            self.inputs.gate_go(name)
+
+    def gate_nav(self, dx, dy):
+        if self.gate_open:
+            self.gate_menu.move2(dx, dy)
+            self._gate_draw()
+
+    def gate_ctrl(self):
+        if self.gate_open:
+            self.gate_do(self.gate_menu.press())
+            if self.gate_open:
+                self._gate_draw()
+
+    def gate_back(self):
+        if self.gate_open:
+            self.gate_menu.back()
+            self._gate_draw()
+
+    def gate_click(self, x, y):
+        if not self.gate_open:
+            return
+        for x0, y0, x1, y1, idx in self.gate_hits:
+            if x0 <= x < x1 and y0 <= y < y1:
+                m = self.gate_menu
+                ring = m.ring()
+                if 0 <= idx < len(ring):
+                    m.sel = idx
+                    self.gate_do(m.activate(ring[idx]))
+                break
+        if self.gate_open:
+            self._gate_draw()
+
+    def gate_wheel(self, col, delta):
+        if self.gate_open:
+            self.gate_menu.scroll(col, -1 if delta > 0 else 1)
+            self._gate_draw()
+
+    def build_gate(self, f):
+        self.back_button(f, "other")
+        big = (self.family, -(UI_FONT_PX + 6))
+        self.label(f, "Gate", font=big).pack(fill="x", padx=12, pady=(8, 0))
+        self.label(f, "Right click with a Gate spell and boxes with the gates come up: click one, or use W A S D to move and Ctrl to pick. "
+                      "Needs the tracker on and the Gate in the Snap Spells list.", font=self.fs, fg=DIM, justify="left",
+                   wraplength=PAGE_W - 40).pack(fill="x", padx=12, pady=(4, 0))
+        for i, (key, text) in enumerate((("gatepin", "Pinned Gates"), ("gatekeys", "Gates Keybinds"))):
+            row = tk.Frame(f, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(14 if i == 0 else 8, 0))
+            PixBtn(row, text, lambda k=key: self.show_extra(k), big, 260, 44).pack(side="left", padx=(8, 0))
+
+    # ----- Pinned Gates page -----
+    def build_gatepin(self, f):
+        self.gp_host = self.scroll_page(f, "gatepin", PAGE_W - 12)
+        self.gp_del = (None, 0.0)
+        self._rebuild_gatepin()
+
+    def _rebuild_gatepin(self):
+        self._keep_scroll("gatepin", self._gatepin_now)
+
+    def _gatepin_now(self):
+        host = self.gp_host
+        for w in host.winfo_children():
+            w.destroy()
+        self.back_button(host, "gate")
+        big = (self.family, -(UI_FONT_PX + 6))
+        self.label(host, "Pinned Gates", font=big).pack(fill="x", padx=12, pady=(8, 0))
+        self.label(host, "Right click a gate twice to pin it, right click a pinned gate twice to unpin it. The pinned ones are the boxes on the "
+                         "left side of the gate shortcut.", font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=12, pady=(4, 4))
+        pinned = list(self.gates_data()["pinned"])
+        now = time.time()
+        pend = self.gp_del[0] if now < self.gp_del[1] else None
+
+        def grid(names, pinned_style):
+            g = tk.Frame(host, bg=PARCH)
+            g.pack(fill="x", padx=10, pady=(2, 4))
+            cols = 1 if pinned_style else 2                       # (a pinned gate is a row of its own, like the boxes on the screen)
+            for i, nm in enumerate(names):
+                b = PixBtn(g, nm, lambda: None, self.fs, 250 if pinned_style else 124, 26, bd=2)
+                b.grid(row=i // cols, column=i % cols, padx=2, pady=2)
+                if pinned_style:
+                    b.lbl.config(bg="#8ee05a")
+                    b.lbl.bind("<Enter>", lambda e: None)
+                    b.lbl.bind("<Leave>", lambda e: None)
+                if pend == nm:
+                    b.lbl.config(bg=RED, fg="#ffffff")
+                    b.lbl.bind("<Enter>", lambda e: None)
+                    b.lbl.bind("<Leave>", lambda e: None)
+                b.lbl.bind("<ButtonRelease-3>", lambda e, n=nm: self.gate_pin_rclick(n))
+        self.label(host, "Pinned", font=self.fs).pack(anchor="w", padx=12)
+        if pinned:
+            grid(pinned, True)
+        self.label(host, "Unpinned Gates Location", font=big).pack(fill="x", padx=12, pady=(10, 2))
+        base = [n for n in GATE_BASE if n not in pinned]
+        if base:
+            grid(base, False)
+        for a in GATE_PAGE_ORDER:
+            names = [n for n in gate_spots(a) if n not in pinned]
+            if names:
+                self.label(host, a, font=self.fs).pack(anchor="w", padx=12)
+                grid(names, False)
+
+    def gate_pin_rclick(self, name):
+        now = time.time()
+        if self.gp_del[0] == name and now < self.gp_del[1]:
+            self.gp_del = (None, 0.0)
+            g = self.gates_data()
+            if name in g["pinned"]:
+                g["pinned"].remove(name)
+            else:
+                g["pinned"].append(name)
+            save_cfg(self.cfg)
+            self.apply_gates()
+        else:
+            self.gp_del = (name, now + 3.0)
+            self.root.after(3100, self._rebuild_gatepin)
+        self._rebuild_gatepin()
+
+    # ----- Gates Keybinds page -----
+    def build_gatekeys(self, f):
+        self.gk_host = self.scroll_page(f, "gatekeys", PAGE_W - 12)
+        self.gk_cap, self.gk_del, self.gk_search = None, (None, 0.0), ""
+        self.back_button(self.gk_host, "gate")
+        big = (self.family, -(UI_FONT_PX + 6))
+        self.label(self.gk_host, "Gates Keybinds", font=big).pack(fill="x", padx=12, pady=(8, 0))
+        self.label(self.gk_host, "Click a box and press the key for that gate. Right click a box twice to remove the key. It works while a Gate "
+                                 "spell is armed (or the gate boxes are up). The random gate key only works while the gate boxes are up.", font=self.fs, fg=DIM, justify="left",
+                   wraplength=PAGE_W - 40).pack(fill="x", padx=12, pady=(4, 4))
+        self.gk_top = tk.Frame(self.gk_host, bg=PARCH)
+        self.gk_top.pack(fill="x")
+        srow = tk.Frame(self.gk_host, bg=PARCH)
+        srow.pack(fill="x", padx=12, pady=(6, 4))
+        self.label(srow, "Search", font=self.fs).pack(side="left")
+        box, _v = self.bound_entry(srow, "", self._gk_search, 220, 26, justify="left")
+        box.pack(side="left", padx=8)
+        self.gk_body = tk.Frame(self.gk_host, bg=PARCH)
+        self.gk_body.pack(fill="x")
+        self._rebuild_gk_top()
+        self._gk_fill()
+
+    def _gk_search(self, text):
+        self.gk_search = str(text).strip().lower()
+        self._gk_fill()
+
+    def _gk_row(self, parent, text, spec, ref, pad=36):
+        row = tk.Frame(parent, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=2)
+        self.label(row, text, font=self.fs, width=16).pack(side="left", padx=(pad, 0))
+        waiting = self.gk_cap == ref
+        armed = self.gk_del[0] == ref and time.time() < self.gk_del[1]
+        b = PixBtn(row, "press a key..." if waiting else (spec["label"] if spec else ""), lambda r=ref: self.gk_pick(r), self.f, 100, 24, bd=2)
+        b.pack(side="right", padx=(0, 18))
+        b.lbl.bind("<ButtonRelease-3>", lambda e, r=ref: self.gk_rclick(r))
+        if armed:
+            b.lbl.config(bg=RED, fg="#ffffff")
+            b.lbl.bind("<Enter>", lambda e: None)
+            b.lbl.bind("<Leave>", lambda e: None)
+
+    def _rebuild_gk_top(self):
+        for w in self.gk_top.winfo_children():
+            w.destroy()
+        self._gk_row(self.gk_top, "Random gate", self.gates_data().get("rand"), ("grand",))
+
+    def _gk_fill(self):
+        for w in self.gk_body.winfo_children():
+            w.destroy()
+        keys, q = self.gates_data()["keys"], self.gk_search
+        for nm in GATE_ALL:
+            if q and q not in nm.lower():
+                continue
+            self._gk_row(self.gk_body, nm, keys.get(nm), ("gate", nm))
+
+    def _gk_rebuild(self):
+        self._keep_scroll("gatekeys", lambda: (self._rebuild_gk_top(), self._gk_fill()))
+
+    def gk_pick(self, ref):
+        if self.gk_cap == ref:
+            self.gk_cap, self.inputs.kb_capture = None, None
+            self._gk_rebuild()
+            return
+        self.gk_cap = ref
+        self.kb_cap = None
+        self.inputs.kb_capture = lambda kid, label: self.q.put(("gatecap", kid, label))
+        self._gk_rebuild()
+        self.say("Press the key you want to use (Esc = cancel).", "Press a key...")
+
+    def finish_gk_cap(self, kid, label):
+        ref, self.gk_cap, self.inputs.kb_capture = self.gk_cap, None, None
+        g = self.gates_data()
+        if ref is not None and kid is not None:
+            spec = {"id": int(kid), "label": str(label or "KEY")[:16]}
+            if ref[0] == "grand":
+                g["rand"] = spec
+            elif ref[0] == "gate":
+                g["keys"][ref[1]] = spec
+            save_cfg(self.cfg)
+            self.apply_gates()
+        self._gk_rebuild()
+
+    def gk_rclick(self, ref):
+        now = time.time()
+        g = self.gates_data()
+        if self.gk_del[0] == ref and now < self.gk_del[1]:
+            self.gk_del = (None, 0.0)
+            if ref[0] == "grand":
+                g["rand"] = None
+            elif ref[0] == "gate":
+                g["keys"].pop(ref[1], None)
+            save_cfg(self.cfg)
+            self.apply_gates()
+        else:
+            self.gk_del = (ref, now + 3.0)
+            self.root.after(3100, self._gk_rebuild)
+        self._gk_rebuild()
+
+    # ---------- Extras tab: Keybinds ----------
+    def apply_keybinds(self):
+        """(Re)loads the keybind table into the input hook."""
+        kb = self.cfg.get("keybinds")
+        if not isinstance(kb, dict):
+            kb = self.cfg["keybinds"] = clean_keybinds(None)
+        self.kb_map = build_kbmap(kb)
+
+    def build_kbbinds(self, f):
+        host = self.scroll_page(f, "kbbinds", PAGE_W - 12)
+        self.back_button(host)
+        self.kb_cap, self.kb_del = None, (None, 0.0)
+        self.label(host, "Click a box and press the key you want to use for that slot. Blank = the normal key. Right-click a box twice to "
+                         "remove it. Only works while Roblox is in front (and not while you type in the chat). LAlt + Tab always works. "
+                         "Not shared with configs.", font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=10, pady=(6, 4))
+        self.kb_body = tk.Frame(host, bg=PARCH)
+        self.kb_body.pack(fill="x")
+        self._rebuild_kb()
+
+    def _rebuild_kb(self):
+        self._keep_scroll("kbbinds", self._rebuild_kb_now)
+
+    def _rebuild_kb_now(self):
+        if getattr(self, "kb_body", None) is None:
+            return
+        for w in self.kb_body.winfo_children():
+            w.destroy()
+        kb = self.cfg.setdefault("keybinds", clean_keybinds(None))
+        for slot, lab in KB_SLOTS:
+            self._kb_row(lab, kb["map"].get(slot), ("slot", slot))
+        for i, e in enumerate(kb["custom"]):
+            self._kb_row(e["send"]["label"], e.get("key"), ("custom", i))
+        PixBtn(self.kb_body, "Add keybinds", self.kb_add, self.f, 130, 26, bd=2).pack(pady=(12, 12))
+
+    def _kb_row(self, text, spec, ref):
+        row = tk.Frame(self.kb_body, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=3)
+        self.label(row, text, font=self.fs, width=16).pack(side="left", padx=(36, 0))
+        waiting = self.kb_cap == ref
+        armed = self.kb_del[0] == ref and time.time() < self.kb_del[1]
+        b = PixBtn(row, "press a key..." if waiting else (spec["label"] if spec else ""), lambda r=ref: self.kb_pick(r), self.f, 100, 24, bd=2)
+        b.pack(side="right", padx=(0, 18))
+        b.lbl.bind("<ButtonRelease-3>", lambda e, r=ref: self.kb_rclick(r))
+        if armed:
+            b.lbl.config(bg=RED, fg="#ffffff")
+            b.lbl.bind("<Enter>", lambda e: None)
+            b.lbl.bind("<Leave>", lambda e: None)
+
+    def kb_pick(self, ref):
+        if self.kb_cap == ref:                                  # click again = cancel
+            self.kb_cap, self.inputs.kb_capture = None, None
+            self._rebuild_kb()
+            return
+        self.kb_cap = ref
+        self.inputs.kb_capture = lambda kid, label: self.q.put(("kbcap", kid, label))      # (runs in the input thread: only queues)
+        self._rebuild_kb()
+        self.say("Press the key you want to use (Esc = cancel).", "Press a key...")
+
+    def kb_add(self):
+        self.kb_pick(("new",))
+        self.say("Press the key this keybind should PRESS in the game. Then click its box and press the key you will use.", "Press a key...")
+
+    def finish_kb_cap(self, kid, label):
+        ref, self.kb_cap, self.inputs.kb_capture = self.kb_cap, None, None
+        kb = self.cfg.setdefault("keybinds", clean_keybinds(None))
+        if ref is not None and kid is not None:
+            spec = {"id": int(kid), "label": str(label or "KEY")[:16]}
+            if ref[0] == "slot":
+                kb["map"][ref[1]] = spec
+            elif ref[0] == "custom" and ref[1] < len(kb["custom"]):
+                kb["custom"][ref[1]]["key"] = spec
+            elif ref[0] == "new":
+                kb["custom"].append({"send": spec, "key": None})
+            save_cfg(self.cfg)
+            self.apply_keybinds()
+        self._rebuild_kb()
+
+    def kb_rclick(self, ref):
+        now = time.time()
+        kb = self.cfg.setdefault("keybinds", clean_keybinds(None))
+        if self.kb_del[0] == ref and now < self.kb_del[1]:
+            self.kb_del = (None, 0.0)
+            if ref[0] == "slot":
+                kb["map"].pop(ref[1], None)
+            elif ref[0] == "custom" and ref[1] < len(kb["custom"]):
+                del kb["custom"][ref[1]]
+            save_cfg(self.cfg)
+            self.apply_keybinds()
+        else:
+            self.kb_del = (ref, now + 3.0)
+            self.root.after(3100, self._rebuild_kb)
+        self._rebuild_kb()
+
+    def build_dayfarm(self, f):
+        host = self.scroll_page(f, "dayfarm", PAGE_W - 12)
+        self.back_button(host, "auto")
+        box, p = self.panel(host, "Day Farm")
+        box.pack(fill="x", padx=6, pady=6)
+        self.dayfarmer = None
+        self.df_pick = False
+        irow = tk.Frame(p, bg=PARCH)
+        irow.pack(fill="x", padx=8, pady=(0, 2))
+        self.df_icon = tk.Label(irow, image=self.img_train_off, bg=PARCH, bd=0)
+        self.df_icon.pack(side="left")
+        self.df_state = self.label(irow, "OFF")
+        self.df_state.pack(side="left", padx=6)
+        self._df_icon_on = False
+        krow = tk.Frame(p, bg=PARCH)
+        krow.pack(fill="x", padx=8, pady=2)
+        self.label(krow, "Start / stop key", font=self.fs).pack(side="left")
+        self.btn_dayfarm = PixBtn(krow, self.key_name("dayfarm"), lambda: self.start_capture("dayfarm"), self.f, 110, 24)
+        self.btn_dayfarm.pack(side="right")
+        self.key_btns["dayfarm"] = self.btn_dayfarm
+        self.label(p, "Presses Play, equips the chair and clicks the screen, waits, then presses \\ Enter \\ and starts over, until you "
+                      "turn it off.", font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(4, 4))
+        self.hook_row(p, "dayfarm_webhook", "dayfarm", "df_hook_lbl", "Day Farm")
+        self.label(p, "While Day Farm is on it posts a screenshot of the game every 30 minutes (only after 30 minutes with the health bar on the "
+                      "screen, so the menu never counts and is never shown).", font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(0, 2))
+        self.df_body = tk.Frame(p, bg=PARCH)
+        self.df_body.pack(fill="x")
+        self.rebuild_dayfarm()
+
+    def rebuild_dayfarm(self):
+        if getattr(self, "df_body", None) is not None:
+            self._keep_scroll("dayfarm", self._rebuild_dayfarm)
+
+    def _rebuild_dayfarm(self):
+        for w in self.df_body.winfo_children():
+            w.destroy()
+        d, p = self.dayfarm_data(), self.df_body
+        lrow = tk.Frame(p, bg=PARCH)
+        lrow.pack(fill="x", padx=8, pady=(6, 2))
+        btn = PixBtn(lrow, "Select Play button position", self.dayfarm_pick_start, self.f, 190, 26, bd=2)
+        btn.pack(side="left")
+        pt = d.get("play")
+        self.label(lrow, "..." if self.df_pick else (f"({pt[0]}, {pt[1]})" if pt else "NOT SET"), font=self.fs).pack(side="left", padx=(8, 0))
+        if self.df_pick:
+            btn.lbl.config(text="Click it in the game...")
+        crow = tk.Frame(p, bg=PARCH)
+        crow.pack(fill="x", padx=8, pady=(6, 2))
+        self.label(crow, "Chair keybind", font=self.fs).pack(side="left")
+        waiting = self.capturing and self.capturing[0] == "dfchair"
+        self.btn_dfchair = PixBtn(crow, "press a key..." if waiting else d["chair"], self.capture_dayfarm_chair, self.f, 110, 24)
+        self.btn_dfchair.pack(side="right")
+        self.label(p, "Chair key: 1-0, - or = (the hotbar slot of the chair). On a Turkish keyboard the * key is the - slot and the - key "
+                      "is the = slot: just press the key you use.", font=self.fs, fg=DIM, justify="left",
+                   wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(2, 2))
+        self.label(p, "Timing (the defaults are fine for most):", font=self.fs, fg=DIM).pack(fill="x", padx=8, pady=(8, 0))
+        self.entry_row(p, "Wait after Play (s)", "dayfarm_play_wait", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Wait after the chair key (s)", "dayfarm_chair_wait", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Wait before going back to the menu (s)", "dayfarm_wait", float, w=64, h=22, wrap=190)
+        self.entry_row(p, "Wait after the menu keys (s)", "dayfarm_menu_wait", float, w=64, h=22, wrap=190)
+        self.label(p, "It only ever clicks / types while the game window is in front (it stops by itself if you switch away). "
+                      "The click after the chair goes to the middle of the game window.", font=self.fs, fg=DIM, justify="left",
+                   wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(4, 2))
+
+    def dayfarm_pick_start(self):
+        self.df_pick = not self.df_pick
+        if self.df_pick:
+            self.brew_pick = self.sell_pick = None
+        self.rebuild_dayfarm()
+        if self.df_pick:
+            self.say("Click the Play button in the game (left click).", "Click it in game")
+
+    def on_df_point(self, pt):
+        self.dayfarm_data()["play"] = [pt[0], pt[1]]
+        save_cfg(self.cfg)
+        self.rebuild_dayfarm()
+        self.say(f"Play button set to {pt[0]}, {pt[1]}.", "Spot saved")
+
+    def capture_dayfarm_chair(self):
+        if self.capturing and self.capturing[0] == "dfchair":
+            self.cancel_move_capture()                              # click again = cancel
+            self.rebuild_dayfarm()
+            return
+        self.cancel_move_capture()
+        token = ("dfchair", time.time())
+        self.capturing = token
+
+        def cb(name):                    # runs in the input thread; True = key accepted
+            if name == "esc" or name in DAYFARM_CHAIR_KEYS:
+                self.q.put(("dfchair", token, name))
+                return True
+            return False
+        self.inputs.capture_cb = cb
+        self.rebuild_dayfarm()
+        self.say("Press the hotbar key of the chair (1-0, - or =). Esc = cancel.", "Press the key...")
+
+    def finish_dayfarm_chair(self, token, name):
+        if token != self.capturing:
+            return
+        self.capturing = None
+        self.inputs.capture_cb = None
+        if name != "esc":
+            self.dayfarm_data()["chair"] = name
+            save_cfg(self.cfg)
+            self.say(f"Chair key is now {name}", f"Chair: {name}")
+        self.rebuild_dayfarm()
+
+    def dayfarm_hook_tick(self, now):
+        """The Day Farm webhook: a screenshot of the game after every 30 minutes IN the game. Only the time the health bar is on the
+        screen counts (the menu / loading is not the character being in the game, its age doesn't go up), and the screenshot is only taken
+        with the health bar there."""
+        try:
+            last, self._df_last = getattr(self, "_df_last", None), now
+            if not (getattr(self, "dayfarmer", None) and self.dayfarmer.running):
+                return
+            in_game = getattr(self, "_hp_seen", 0) >= 2 and not getattr(self, "hp_absent", False)
+            if in_game and last is not None:
+                self._df_ingame = getattr(self, "_df_ingame", 0.0) + min(1.0, max(0.0, now - last))
+            if getattr(self, "_df_ingame", 0.0) < DAYFARM_HOOK_SECS or not in_game:
+                return
+            self._df_ingame = 0.0
+            if not str(self.cfg["settings"].get("dayfarm_webhook", "")).strip():
+                return
+            rect = game_window_rect(str(self.cfg["settings"].get("game_title", "Roblox")))
+            if rect is None:
+                self._df_ingame = DAYFARM_HOOK_SECS            # (the game isn't in front right now: send as soon as it is)
+                return
+            png = screenshot_png(rect)
+            self.hook_post("dayfarm_webhook", "dayfarm", png=png, name="Day Farm")
+        except Exception as ex:
+            self.append_log(f"Day Farm webhook: {ex}")
+
+    def disconnect_tick(self, now):
+        """'Disconnected' window in the game while an automation with a webhook is on: a screenshot goes to that webhook (once per disconnect)."""
+        try:
+            if now - getattr(self, "_dc_t", 0.0) < 2.0:
+                return
+            S = self.cfg["settings"]
+            feats = []
+            for runner, key in ((getattr(self, "brewer", None), "brew_webhook"), (getattr(self, "dayfarmer", None), "dayfarm_webhook"),
+                                (getattr(self, "train", None), "snap_webhook")):
+                if runner is not None and runner.running and str(S.get(key, "")).strip():
+                    feats.append(key)
+            if not feats:
+                self._dc_seen = 0
+                return
+            self._dc_t = now
+            rect = game_window_rect(str(S.get("game_title", "Roblox")))
+            if rect is None:
+                return
+            cx, cy, cw, ch = rect[0] + rect[2] // 5, rect[1] + rect[3] // 5, rect[2] * 3 // 5, rect[3] * 3 // 5
+            shown = disconnect_visible(self._grab_rgb({"left": cx, "top": cy, "width": cw, "height": ch}))
+            if not shown:
+                self._dc_seen = 0
+                if getattr(self, "_dc_gone", 0) >= 2:
+                    self._dc_sent = False
+                self._dc_gone = getattr(self, "_dc_gone", 0) + 1
+                return
+            self._dc_gone = 0
+            self._dc_seen = getattr(self, "_dc_seen", 0) + 1
+            if self._dc_seen < 2 or getattr(self, "_dc_sent", False):
+                return                                           # (seen twice in a row, and only one post per disconnect)
+            self._dc_sent = True
+            png = screenshot_png(rect)
+            urls = set()
+            for key in feats:
+                u = str(S.get(key, "")).strip()
+                if u not in urls:
+                    urls.add(u)
+                    self.hook_post(key, "dced", png=png, name="Disconnect")
+            self.say("Disconnected from the game - a screenshot was sent to your webhook.", "Disconnected")
+        except Exception as ex:
+            self.append_log(f"Disconnect check: {ex}")
+
+    def hp_status_tick(self, now):
+        """Settings tab: what the health bar look sees right now (so a user can tell whether the Tool finds the bar)."""
+        try:
+            if getattr(self, "_hp_st_t", 0.0) + 0.5 > now or getattr(self, "hp_status_lbl", None) is None:
+                return
+            self._hp_st_t = now
+            d = getattr(self, "_hp_dbg", None)
+            if not d or now - d["t"] > 3.0:
+                txt = "Health bar: not looking (the game isn't the window in front)"
+            else:
+                txt = (f"Health bar: SEEN ({d['size'][0]}x{d['size'][1]})" if self._hp_seen >= 2
+                       else f"Health bar: NOT seen ({d['size'][0]}x{d['size'][1]})")
+            if txt != getattr(self, "_hp_st_txt", None):
+                self._hp_st_txt = txt
+                self.hp_status_lbl.config(text=txt)
+        except Exception:
+            pass
+
+    def hp_debug_save(self):
+        """Saves the two pictures the health bar look is made from (the last ones it took) next to the program, to show what it sees."""
+        d = getattr(self, "_hp_dbg", None)
+        if not d:
+            self.say("Nothing to save yet: click into the game, wait a second, then press the button again.", "No picture yet")
+            return
+        try:
+            names = []
+            for key in ("crop", "wide"):
+                if d.get(key) is not None:
+                    fn = os.path.join(APP_DIR, f"health_bar_{key}.png")
+                    Image.fromarray(np.asarray(d[key])[..., :3].astype(np.uint8)).save(fn)
+                    names.append(fn)
+            self.say(f"Saved {len(names)} pictures ({d['size'][0]}x{d['size'][1]}, bar seen: {d['bar']}): " + ", ".join(names), "Saved")
+        except Exception as ex:
+            self.say(f"Couldn't save: {ex}", "Not saved")
+
+    def dayfarm_refresh(self):
+        on = bool(getattr(self, "dayfarmer", None) and self.dayfarmer.running)
+        if on != self._df_icon_on:
+            self._df_icon_on = on
+            self.df_icon.config(image=self.img_train_on if on else self.img_train_off)
+            self.df_state.config(text="ON" if on else "OFF")
+
+    def toggle_dayfarm(self):
+        if getattr(self, "dayfarmer", None) is not None and self.dayfarmer.running:
+            self.dayfarmer.stop("stopped by you")
+            return
+        d = self.dayfarm_data()
+        if not IS_WIN:
+            self.say("Day Farm only works on Windows", "Windows only")
+            return
+        for nm, label in (("brewer", "Alchemy/Smith"), ("seller", "Appraise Sell")):
+            r = getattr(self, nm, None)
+            if r is not None and r.running:
+                self.say(f"Day Farm: {label} is running - stop it first.", "Busy")
+                return
+        if not d.get("play"):
+            self.say("Day Farm: select the Play button position first (Extras > Automation > Day Farm).", "Set the Play button")
+            return
+        if not self.train_allowed():
+            self.say("Day Farm: click into the game first", "Game not active")
+            return
+
+        def waits():
+            S = self.cfg["settings"]
+
+            def num(k, dflt):
+                try:
+                    return max(0.0, float(S.get(k, dflt)))
+                except (TypeError, ValueError):
+                    return dflt
+            return (num("dayfarm_play_wait", 1.0), num("dayfarm_chair_wait", 0.5), num("dayfarm_wait", 110.0), num("dayfarm_menu_wait", 15.0))
+
+        def center():
+            r = game_window_rect(str(self.cfg["settings"].get("game_title", "Roblox")))
+            return (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0) if r else None
+        self.dayfarmer = DayFarmer(waits=waits, center_fn=center, allowed=self.train_allowed, move_fn=lambda x, y: move_cursor(x, y, False),
+                                   delays=lambda: (0.15, 0.25, 1.5, 0.05, 0.06),
+                                   on_stop=lambda n, why: self.q.put(("df_stopped", n, why)))
+        self._df_ingame, self._df_last = 0.0, None                  # (the in-game time for the webhook starts at 0)
+        self.dayfarmer.start(d)
+        self.say(f"Day Farm started. Press {self.key_name('dayfarm')} to stop.", "Day Farm on")
+
+    def on_df_stopped(self, n, why):
+        self.dayfarm_refresh()
+        self.say(f"Day Farm stopped ({why}) - {n} round{'' if n == 1 else 's'} done.", "Day Farm stopped")
+
     # ---------- Extras > Other Stuff > Checklist ----------
     def cl_data(self):
         return self.cfg.setdefault("checklists", default_checklists())
@@ -12663,8 +15685,10 @@ class App:
         big = (self.family, -(UI_FONT_PX + 6))
         self.label(f, "Other Stuff", font=big).pack(fill="x", padx=12, pady=(8, 0))
         self.other_icons = {k: ui_img(_img(v)) for k, v in CHECK_ICONS.items()}      # (kept alive here)
+        self.other_icons["gate"] = ui_img(gate_icon())
         for i, (key, text, icon) in enumerate((("gank", "Gank Ping", self.other_icons["gank"]), ("check", "Checklist", self.other_icons["check"]),
-                                              ("kda", "KDA", self.other_icons["kda"]), ("imenu", "Instant Menu", self.other_icons["imenu"]))):
+                                              ("kda", "KDA", self.other_icons["kda"]), ("imenu", "Instant Menu", self.other_icons["imenu"]),
+                                              ("gate", "Gate", self.other_icons["gate"]))):
             row = tk.Frame(f, bg=PARCH)
             row.pack(fill="x", padx=12, pady=(10 if i == 0 else 6, 0))
             tk.Label(row, image=icon, bg=PARCH, bd=0, width=62).pack(side="left")
@@ -13043,22 +16067,20 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def instant_menu(self):
-        """The Instant Menu key: the mouse goes onto the Menu button and clicks it (Shiftlock is turned off first if it is on)."""
+        """The Instant Menu key: presses \\, Enter, \\ (only while the game window is in front)."""
         now = time.time()
-        if now - getattr(self, "_imenu_t", 0.0) < 0.8:
+        if now - getattr(self, "_imenu_t", 0.0) < 0.3:
             return
         if not IS_WIN:
             self.say("Instant Menu only works on Windows", "Windows only")
             return
-        rect = game_window_rect(str(self.cfg["settings"].get("game_title", "Roblox")))
-        if rect is None or not self.train_allowed():
-            return                                            # (only ever clicks while the Roblox game itself is in front)
+        if not self.train_allowed():
+            return
         self._imenu_t = now
 
         def work():
             try:
-                msg = instant_menu_run(rect, find_menu_button, self.crosshair_visible, send_key, lambda x, y: move_cursor(x, y, True),
-                                       send_click, cursor_pos, self.train_allowed)
+                msg = instant_menu_run(send_key, self.train_allowed)
             except Exception as ex:
                 msg = f"{type(ex).__name__}: {ex}"
             if msg:
@@ -13113,6 +16135,44 @@ class App:
                       "is posted to that channel so your friends know where to come.", font=self.fs, fg=DIM, justify="left",
                    wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(2, 4))
 
+    def hook_post(self, setting, kind, n=0, png=None, test=False, name="Webhook", lbl=None):
+        """Posts to a Discord webhook (in the background, a picture attached when `png` is given). `test`: the result is shown under the entry."""
+        url = str(self.cfg["settings"].get(setting, "")).strip()
+        if not url:
+            if test:
+                self.q.put(("hook_lbl", lbl, False, "Paste your webhook link first"))
+            return False
+
+        def work():
+            try:
+                payload = webhook_payload(kind, n)
+                ok, msg = discord_send_image(url, payload, png, "screenshot.png") if png else discord_send(url, payload)
+            except Exception as ex:
+                ok, msg = False, f"{type(ex).__name__}: {ex}"
+            if test:
+                self.q.put(("hook_lbl", lbl, ok, "Works - check your channel" if ok else msg))
+            elif not ok:
+                self.q.put(("msg", f"{name} webhook: {msg}"))
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def on_hook_lbl(self, lbl, ok, msg):
+        w = getattr(self, lbl or "", None)
+        try:
+            if w is not None and w.winfo_exists():
+                w.config(text=msg, fg="#2e7d32" if ok else "#b3261e")
+        except Exception:
+            pass
+
+    def hook_row(self, p, setting, kind, lbl_attr, name):
+        self.label(p, "Discord webhook (optional)", font=self.fs).pack(anchor="w", padx=8, pady=(4, 0))
+        wrow = tk.Frame(p, bg=PARCH)
+        wrow.pack(fill="x", padx=8, pady=2)
+        self.make_entry(wrow, setting, str, 196, 24).pack(side="left")
+        PixBtn(wrow, "Test", lambda: self.hook_post(setting, "test", test=True, lbl=lbl_attr, name=name), self.f, 52, 24, bd=2).pack(side="left", padx=(6, 0))
+        setattr(self, lbl_attr, self.label(p, "", font=self.fs))
+        getattr(self, lbl_attr).pack(anchor="w", padx=8)
+
     def on_brew_hook(self, ok, msg):
         self.say(f"Alchemy/Smith webhook: {msg}", "Webhook")
         lbl = getattr(self, "brew_hook_lbl", None)
@@ -13166,6 +16226,9 @@ class App:
                                 self.f, 110, 24)
         self.btn_train.pack(side="right")
         self.key_btns["snaptrain"] = self.btn_train
+        self.hook_row(inner, "snap_webhook", "snap", "snap_hook_lbl", "Snap Training")
+        self.label(inner, f"It posts to the webhook every {SNAP_HOOK_EVERY} casts trained (the trainer keeps going).", font=self.fs, fg=DIM,
+                   justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(0, 2))
         self.train_lbl = self.label(inner, self.train_text(), justify="left", wraplength=PAGE_W - 40)
         self.train_lbl.pack(fill="x", padx=8, pady=(6, 4))
         self.ms_row(inner, "G SPAM: hold each press for (milliseconds)", "train_g_hold_ms", 200.0)
@@ -13287,12 +16350,20 @@ class App:
         return (f"{'TRAINING...  ' if run else ''}Trained {self.train_total} time"
                 f"{'' if self.train_total == 1 else 's'}")
 
-    def pick_mine(self, key):
-        """Tracker callback (from the input thread): Pickaxe Auto Mining on (its key) / off (None)."""
+    def pick_other_key(self, key):
+        """A hotbar key that is NOT the tool's: the first other move of the profile, else the next slot."""
+        for m in self.cfg["profiles"].get(self.cfg["active"], []):
+            k = m.get("key")
+            if k in HOTBAR_KEYS and k != key and not m.get("ininv"):
+                return k
+        return next((k for k in HOTBAR_KEYS if k != key), None)
+
+    def pick_mine(self, key, finish=False):
+        """Tracker callback (from the input thread): Pickaxe / Frying Pan Auto Mining on (its key) / off (None)."""
         if key is None:
-            self.miner.stop()
+            self.miner.stop(finish)
         elif not self.miner.running:
-            self.miner.start(key)
+            self.miner.start(key, self.pick_other_key(key))
             if not self.miner.running:
                 self.tracker.mining = None
 
@@ -13369,6 +16440,8 @@ class App:
         self.train_lbl.config(text=self.train_text())
         if self.train_total % TRAIN_MILESTONE == 0:
             self.say(f"Trained {self.train_total} times", f"Trained {self.train_total}")
+        if self.train_total % SNAP_HOOK_EVERY == 0:
+            self.hook_post("snap_webhook", "snap", self.train_total, name="Snap Training")        # (it never stops the trainer)
 
     def install_audio_lib(self):
         """Running as a script and PyAudioWPatch is missing: install it for this Python in the background."""
@@ -13416,7 +16489,7 @@ class App:
         self.label(inner, "Keybinds  (click a button, then press the new key)", font=self.fs
                    ).pack(fill="x", padx=8, pady=(2, 2))
         for action, text in HOTKEY_ACTIONS:
-            if action in ("snaptrain", "brew", "sell", "gank", "imenu"):
+            if action in ("snaptrain", "brew", "sell", "gank", "imenu", "dayfarm"):
                 continue                                   # (their keys are picked in the Extras tab)
             row = tk.Frame(inner, bg=PARCH)
             row.pack(fill="x", padx=8, pady=1)
@@ -13428,16 +16501,33 @@ class App:
         self.check_row(inner, "Show Cooldown Numbers On Non Hotkey/Inventory (Potions/Buffs etc)", "buff_numbers", wrap=250)
         self.check_row(inner, "Keep this window on top", "topmost",
                        extra=lambda v: self.root.attributes("-topmost", v))
-        self.check_row(inner, "Block Run: hold W and press F to block-run (W, F, W, super fast; holding F doesn't repeat it)", "block_run", wrap=230)
+        self.check_row(inner, "Block Run (all directions): double-tap / hold W, A, S, D to run, F blocks while running, Q dashes. Off while the mana drains at a climbing speed, and after Space twice + that drain", "block_run", wrap=230)
         self.check_row(inner, "Only show the cooldown boxes, Mana Overlay, Decorations and Dash / PB coins while the game window is in front", "mana_only_focused", wrap=230)
         self.check_row(inner, "Cast Run: casting a held spell (left click) while holding W keeps you running (W, click, W, super fast)", "cast_run", wrap=230)
+        self.hp_status_lbl = self.label(inner, "Health bar: -", font=self.fs, justify="left", wraplength=PAGE_W - 40)
+        self.hp_status_lbl.pack(fill="x", padx=8, pady=(4, 0))
+        PixBtn(inner, "Save health bar picture", self.hp_debug_save, self.f, 190, 24, bd=2).pack(anchor="w", padx=8, pady=(2, 2))
         self.check_row(inner, "Always show the cooldown boxes and coins (don't hide them when the HP bar isn't recognised)", "always_show", wrap=230)
         self.check_row(inner, "Autoclicker: hold the left mouse button in the game to click every 30 ms (off while you hold a spell)", "autoclick", wrap=230)
+        row = tk.Frame(inner, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=1)
+        self.label(row, "Autoclicker pause key (click, then press a key or mouse button; M3 = middle mouse)", justify="left", wraplength=190).pack(side="left")
+        self.btn_ac_key = PixBtn(row, self.cfg["settings"].get("autoclick_key_label") or "M3", self.pick_ac_key, self.f, 110, 24)
+        self.btn_ac_key.pack(side="right")
+        self.check_row(inner, "While you type in the Roblox chat (after /) pause my own AutoHotkey scripts, until Enter / Esc / a click", "ahk_chat_suspend", wrap=230)
+        self.check_row(inner, "Moves that unequip after use (green name box): their cooldown starts when the slot turns normal, not white", "unequip_wait", wrap=230)
+        self.entry_row(inner, "Viribus: milliseconds between the left click and F", "vir_wait_ms", float, w=56, h=24, wrap=230)
+        self.entry_row(inner, "Viribus: milliseconds F is held", "vir_hold_ms", float, w=56, h=24, wrap=230)
+        self.entry_row(inner, "Climbing: Space twice within this many seconds (plus a climbing-speed mana drain)", "climb_window", float, w=56, h=24, wrap=230)
+        self.entry_row(inner, "Slow mana drain: slowest fall (% per second)", "climb_rate_lo", float, w=56, h=24, wrap=230)
+        self.entry_row(inner, "Slow mana drain: fastest fall (% per second)", "climb_rate_hi", float, w=56, h=24, wrap=230)
+        self.entry_row(inner, "Slow mana drain: it must last this many seconds", "climb_rate_win", float, w=56, h=24, wrap=230)
+        self.entry_row(inner, "Snap Gate: cooldown after Enter (seconds)", "gate_cd", float, w=56, h=24, wrap=230)
+        self.entry_row(inner, "Snarvindur (left click): seconds every snap spell is on cooldown after it", "snarv_snap_cd", float, w=56, h=24, wrap=230)
         self.entry_row(inner, "Cast Run: seconds the same spell can't be clicked again after a Cast Run (0 = no lock)", "cast_run_lock", float, w=56, h=24, wrap=230)
         self.entry_row(inner, "Game window title contains", "game_title", str, w=100, h=24, wrap=150)
         self.check_row(inner, "Show the little Scroom while this window is hidden and the game isn't in front", "mascot_on", wrap=230)
-        for text, key, cast in (("Armed timeout (sec, 0 = never)", "arm_timeout", float),
-                                ("Click grace near the end (sec)", "grace", float),
+        for text, key, cast in (("Click grace near the end (sec)", "grace", float),
                                 ("Red box strength (0.1 - 1)", "opacity", float),
                                 ("Show tenths under (sec, 0 = off)", "tenths_under", float),
                                 ("Box padding (px, can be negative)", "box_grow", int)):
@@ -13700,9 +16790,50 @@ class App:
         self.update_key_texts()
         self.say(f"{dict(HOTKEY_ACTIONS)[action]} key is now {hk.upper()}", f"Key: {hk.upper()}")
 
+    # ---- the Autoclicker's pause key ----
+    def pick_ac_key(self):
+        if self.inputs.ac_capture is not None:                       # click again = cancel
+            self.inputs.ac_capture = None
+            self.btn_ac_key.lbl.config(text=self.cfg["settings"].get("autoclick_key_label") or "M3")
+            return
+        self.btn_ac_key.lbl.config(text="press a key...")
+        self.say("Press the key or mouse button (middle mouse, side buttons, any key) that pauses the Autoclicker. Esc = cancel.", "Press a key...")
+        self.inputs.ac_capture = lambda spec, label: self.q.put(("ackey", spec, label))      # (runs in the input thread: only queues)
+
+    def _vir_btn_text(self, text=None):
+        try:
+            self.btn_vir_key.lbl.config(text=text or self.cfg["settings"].get("vir_key_label") or "Right click")
+        except Exception:
+            pass                                                     # (the button is not on screen: no Viribus row)
+
+    def pick_vir_key(self):
+        if self.inputs.vir_capture is not None:                      # click again = cancel
+            self.inputs.vir_capture = None
+            self._vir_btn_text()
+            return
+        self._vir_btn_text("press a key...")
+        self.say("Press the key or mouse button (right click, middle mouse, side buttons, any key) that casts Viribus and holds F. Esc = cancel.", "Press a key...")
+        self.inputs.vir_capture = lambda spec, label: self.q.put(("virkey", spec, label))
+
+    def finish_vir_key(self, spec, label):
+        S = self.cfg["settings"]
+        if spec != "esc":
+            S["vir_key"], S["vir_key_label"] = spec, label
+            save_cfg(self.cfg)
+            self.say(f"Viribus key is now {label}", f"Key: {label}")
+        self._vir_btn_text()
+
+    def finish_ac_key(self, spec, label):
+        S = self.cfg["settings"]
+        if spec != "esc":
+            S["autoclick_key"], S["autoclick_key_label"] = spec, label
+            save_cfg(self.cfg)
+            self.say(f"Autoclicker pause key is now {label}", f"Key: {label}")
+        self.btn_ac_key.lbl.config(text=S.get("autoclick_key_label") or "M3")
+
     # ---- picking the hotbar key of a move ----
     def cancel_move_capture(self):
-        if self.capturing and self.capturing[0] in ("move", "mark"):
+        if self.capturing and self.capturing[0] in ("move", "mark", "dfchair"):
             self.capturing = None
             self.inputs.capture_cb = None
 
@@ -13792,6 +16923,40 @@ class App:
         if kind == "movekey":
             self.finish_move_key(item[1], item[2])
             return
+        if kind == "virkey":
+            self.finish_vir_key(item[1], item[2])
+            return
+        if kind == "ackey":
+            self.finish_ac_key(item[1], item[2])
+            return
+        if kind == "kbcap":
+            self.finish_kb_cap(item[1], item[2])
+            return
+        if kind == "gatecap":
+            self.finish_gk_cap(item[1], item[2])
+            return
+        if kind == "gate_show":
+            self.gate_show()
+            return
+        if kind == "gate_hide":
+            if not self.gate_open:
+                self.gate_close("a key / click / Esc closed it")
+            return
+        if kind == "gate_nav":
+            self.gate_nav(item[1], item[2])
+            return
+        if kind == "gate_ctrl":
+            self.gate_ctrl()
+            return
+        if kind == "gate_back":
+            self.gate_back()
+            return
+        if kind == "gate_click":
+            self.gate_click(item[1], item[2])
+            return
+        if kind == "gate_wheel":
+            self.gate_wheel(item[1], item[2])
+            return
         if kind == "msg":
             self.say(item[1])
             return
@@ -13844,6 +17009,12 @@ class App:
             self.on_sell_stopped(item[1], item[2])
         if kind == "sell_point":
             self.on_sell_point(item[1], item[2])
+        if kind == "df_point":
+            self.on_df_point(item[1])
+        if kind == "df_stopped":
+            self.on_df_stopped(item[1], item[2])
+        if kind == "dfchair":
+            self.finish_dayfarm_chair(item[1], item[2])
             return
         if kind == "cl_click":
             self.cl_click(item[1], item[2])
@@ -13860,12 +17031,15 @@ class App:
         if kind == "brew_hook":
             self.on_brew_hook(item[1], item[2])
             return
+        if kind == "hook_lbl":
+            self.on_hook_lbl(item[1], item[2], item[3])
+            return
         if kind == "brew_point":
             self.on_brew_point(item[1], item[2])
             return
-        if self.chat_open and kind in ("hide", "area", "area_manual", "test", "mana", "snaptrain", "brew", "sell", "gank", "imenu"):
+        if keys_off(self) and kind in ("hide", "area", "area_manual", "test", "mana", "snaptrain", "brew", "sell", "gank", "imenu", "dayfarm"):
             return                       # typing in the Roblox chat: no keybind works
-        if self.capturing and kind in ("hide", "area", "area_manual", "test", "mana", "snaptrain", "brew", "sell", "gank", "imenu"):
+        if self.capturing and kind in ("hide", "area", "area_manual", "test", "mana", "snaptrain", "brew", "sell", "gank", "imenu", "dayfarm"):
             return                       # ignore hotkeys while a new key is being picked
         if kind == "area":
             self.pick_area(manual=False)
@@ -13881,6 +17055,8 @@ class App:
             self.toggle_brew()
         elif kind == "sell":
             self.toggle_sell()
+        elif kind == "dayfarm":
+            self.toggle_dayfarm()
         elif kind == "gank":
             self.gank_ping()
         elif kind == "imenu":
@@ -13925,7 +17101,9 @@ class App:
         charge = self.tracker.charge_text()
         txt = " | ".join(([f"Armed: {armed}"] if armed else []) + ([f"Running: {running}"] if running else [])
                          + ([f"Charge: {charge.replace(' Charge', '')}"] if charge else [])
-                         + (["Azure: on"] if self.tracker.azure_text() else [])) or "Armed: Fist"
+                         + (["Azure: on"] if self.tracker.azure_text() else [])
+                         + (["Soul Mode"] if self.tracker.soul_mode_text() else [])
+                         + (["Decompose"] if self.tracker.decomp_text() else [])) or "Armed: Fist"
         if getattr(self, "train", None) and self.train.running:
             self.sound_text()
         if hasattr(self, "train_icon"):
@@ -13934,6 +17112,11 @@ class App:
             self.brew_refresh()
         if hasattr(self, "sell_icon"):
             self.sell_refresh()
+        if hasattr(self, "df_icon"):
+            self.dayfarm_refresh()
+        self.dayfarm_hook_tick(time.time())
+        self.disconnect_tick(time.time())
+        self.hp_status_tick(time.time())
         if txt != self.armed_lbl.cget("text"):
             self.armed_lbl.config(text=txt)
         lt = "Last used: " + (self.tracker.last_text(now) or "-")
@@ -13975,6 +17158,10 @@ class App:
             self._check_tick(time.time())
         except Exception:
             self.append_log("CHECKLIST ERROR:\n" + traceback.format_exc())
+        try:
+            self._gate_tick(time.time())
+        except Exception:
+            self.append_log("GATE ERROR:\n" + traceback.format_exc())
         try:
             self._kda_tick(time.time())
         except Exception:
@@ -14093,8 +17280,29 @@ class App:
         except Exception as ex:
             self.append_log(f"Auto Bard badge: {ex}")
 
+    def _ac_tick(self, now):
+        """'Autoclicker: ON / OFF' on the right of the game, shown while the Autoclicker setting is on and the game is in front."""
+        try:
+            S = self.cfg["settings"]
+            focused = self.game_focused()                  # (refreshes the focus look)
+            if str(S.get("game_title", "")).strip():
+                focused = bool(getattr(self, "_fg_title", False))      # strict: gone the moment Roblox is not the window in front (no grace period)
+            if not S.get("autoclick") or not focused:
+                self.ac_badge.hide()
+                return
+            L, T, Wc, Hc = self._cl_client(now)
+            k = max(0.5, Hc / 1080.0)
+            self.ac_badge.show(L + Wc - 40 * k, T + 520 * k, k, self.num_family, getattr(self, "ac_on", True),
+                               S.get("autoclick_key_label") or "M3")
+            if now - getattr(self, "_ac_top", 0.0) > 0.5:
+                self._ac_top = now
+                self.ac_badge.raise_top()
+        except Exception as ex:
+            self.append_log(f"Autoclicker badge: {ex}")
+
     def _overlay_tick(self):
         now = time.time()
+        self._ac_tick(now)
         if self.chat_open and not self.game_focused():
             self.chat_open = False                              # (left the game: the chat isn't being typed in)
         self._bard_tick(now)
@@ -14324,10 +17532,15 @@ class App:
         except Exception:
             pass
         self.inputs.stop()
+        try:
+            self.ahk_guard.stop()
+        except Exception:
+            pass
         self.hotbar.stop()
         try:
             self.autobard.stop()
             self.bard_badge.hide()
+            self.ac_badge.hide()
         except Exception:
             pass
         try:
