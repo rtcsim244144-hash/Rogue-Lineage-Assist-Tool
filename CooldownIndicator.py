@@ -82,7 +82,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -148,8 +148,6 @@ DEFAULT_SETTINGS = {
     "song_switch_cd": 3.0,   # Songs: leaving a song before its Error Meter is empty puts the other songs on this cooldown (placeholder)
     "kda_kill": False, "kda_death": False, "kda_assist": False, "kda_knock": False,     # Other Stuff > KDA: which counters are shown
     "kda_n_kill": 0, "kda_n_death": 0, "kda_n_assist": 0, "kda_n_knock": 0,           # ...and their numbers
-    "auto_bard": True,       # play the Song minigame by itself while the Error Meter is up (needs opencv-python)
-    "bard_offset_ms": -12.0, # Auto Bard click timing: negative = a bit before the ring closes
     "song_fail_cd": 10.0,    # ...the Error Meter running empty (Song Fail) puts them on this one (placeholder)
     "shard_cd": 15.0,        # Sapphire / Opal / Ruby Shard: using one puts all of them on this cooldown
     "flood_dur": 30.0, "flood_cd": 6000.0,      # Flood (Flood Infinite): the buff, then a 15 s Flood Finite debuff; it resets when the hotbar disappears
@@ -182,6 +180,12 @@ DEFAULT_SETTINGS = {
     "always_show": False,    # never hide the cooldown boxes / coins just because the game's HP bar isn't recognised (menus / loading included)
     "inv_equip": True,       # clicking a known item (Fire Protection, ...) in the inventory = equipping it
     "potion_cd": 6.0,             # every potion: this long a cooldown for ALL potions, from the moment a drink is finished
+    "potion_keys": {"Feather Feet": {"id": 0x15, "label": "Y"}, "Fire Protection": {"id": 0x16, "label": "U"},
+                    "Health Potion": {"id": 0x23, "label": "H"}},            # a key per potion: potion name -> {"id", "label"} (opens the inventory, drinks it, closes the inventory again)
+    "helm_swap": True,            # a Health Potion key takes the helmet off first and puts it back on after the drink
+    "helm_color": "#4aa8ff",      # the helmet card's own border (shown on the open inventory)
+    "helm_need_bright": False,    # only take the helmet off when its card is highlighted (= worn); off = a seen helmet card is always clicked
+    "potion_wait_ms": 100.0,      # the wait between the steps of a potion key (milliseconds)
     "fire_dur": 120.0,            # Fire Protection (potion) lasts this many seconds
     "feather_dur": 30.0,         # Feather Feet (potion)
     "inv_box_color": "#46e060",   # the outline around the recognised inventory cards
@@ -1266,6 +1270,14 @@ def default_popts():
 
 
 BREW_PREFIX = "brew#"                  # the name a Potion Brewer sequence's learned inventory card has (brew#<id>)
+HELMET_ID = "helmet"
+HELMET_CARD = BREW_PREFIX + HELMET_ID    # the helmet's learned inventory card (Extras > Inventory > Potions, under Health Potion)
+
+
+def is_health_potion_name(name):
+    return _norm_name(name).startswith("health")
+
+
 
 
 def new_brew_seq(used=()):
@@ -2719,6 +2731,19 @@ class Tracker:
             return f"{name} (inventory) - " + ("put away" if same else "equipped: click the screen to drink it")
 
     DRINK_TIME = 2.0
+
+    def potion_wait(self, now):
+        """Seconds left of the cooldown all potions share (0 = a potion can be drunk)."""
+        with self.lock:
+            self._live_item(now)
+            return max(0.0, self.potion_until - now)
+
+    def holding_potion(self, name, now):
+        """True while this potion is equipped (in hand, waiting for the click that drinks it)."""
+        with self.lock:
+            it = self._live_item(now)
+            return bool(it and it[2] and _norm_name(it[0]) == _norm_name(name))
+
 
     def _live_item(self, now):
         S = self.cfg["settings"]
@@ -5729,6 +5754,124 @@ class Brewer:
                 self.on_stop(self.count, why)
 
 
+class PotionDrinker(Brewer):
+    """A potion key: opens the inventory (when it is closed), takes the helmet off (Health Potion only, when it is worn), equips the potion,
+    clicks the screen to drink it, waits for the drink, puts the helmet back on and closes the inventory again (when this opened it).
+    The same machinery as the Brewer (allowed() before every step; everything injectable for tests). The cleanup at the end runs
+    whatever happened, so a helmet that was taken off always goes back on (while the game is still in front)."""
+
+    def __init__(self, scan_fn=None, toggle_inv=None, neutral_fn=None, cursor_fn=None, equip_fn=None, drink_fn=None,
+                 in_hand=lambda n: False, drink_time=2.0, step=0.25, note=None, **kw):
+        super().__init__(**kw)
+        self.note = note or (lambda t: None)
+        self.scan_fn, self.toggle_inv, self.neutral_fn, self.cursor_fn = scan_fn, toggle_inv, neutral_fn, cursor_fn
+        self.equip_fn, self.drink_fn, self.in_hand, self.drink_time, self.step = equip_fn, drink_fn, in_hand, drink_time, step
+        self.job, self.helm_state = {}, "-"
+
+    def start(self, job):
+        if self.running:
+            return False
+        self.job = dict(job)
+        self.count, self.reason, self.running, self.helm_state = 0, None, True, "-"
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return True
+
+    def _park(self):
+        """The cursor goes to a spot above the inventory: the game's own cursor must not cover a card, and a click there drinks."""
+        pt = self.neutral_fn()
+        self._ok()
+        self.move_fn(pt[0], pt[1])
+        self._wait(max(0.12, tuple(self.delays())[3] if len(tuple(self.delays())) > 3 else 0.0))
+        return pt
+
+    def _run(self):
+        why, opened, off_pt, orig = "done", False, None, None
+        name = self.job["name"]
+        try:
+            try:
+                orig = self.cursor_fn() if self.cursor_fn else None
+            except Exception:
+                orig = None
+            self._ok()
+            if not self.inv_open():
+                self.note("opening the inventory")
+                self.toggle_inv(True)
+                opened = True
+                self._wait(self.step + 0.1)
+            self._park()
+            pot = None
+            if not self.in_hand(name):                            # (the potion is looked for FIRST: when it isn't there, the helmet is never touched)
+                pot = self.scan_fn(name, 2.0)
+                self._ok()
+                if pot is None:
+                    raise _BrewStop(f"couldn't find {name} in the inventory (is it learned, and in the inventory?)")
+                self.note(f"{name} card seen at {int(pot[0][0])},{int(pot[0][1])}")
+            if self.job.get("helmet"):
+                hit = self.scan_fn(HELMET_CARD, 1.2)
+                self._ok()
+                if hit is None:
+                    self.helm_state = "not seen"                  # (not in the inventory / hidden: it is drunk with whatever is on)
+                    self.note("helmet card NOT seen (Redo it, or check its blue border)")
+                elif hit[1] or not self.job.get("need_bright"):   # a highlighted card = the helmet is worn: take it off (unless the highlight is not asked for)
+                    self.note(f"helmet off (card at {int(hit[0][0])},{int(hit[0][1])})")
+                    self._click_at(hit[0])                        # (the card arms the helmet: a click on the screen then puts it on / takes it off)
+                    off_pt, self.helm_state = hit[0], "off"
+                    self._wait(self.step * 0.6)
+                    self.note("helmet: click on the screen")
+                    self._click_at(self.neutral_fn())
+                    self._wait(self.step)
+                    self._park()
+                    if pot is not None:                           # (the cards may have moved: the potion's card is looked at again)
+                        again = self.scan_fn(name, 0.6)
+                        pot = again or pot
+                else:
+                    self.helm_state = "was off"                   # (not worn: nothing to take off - and nothing to put back)
+            if pot is not None:
+                self.note(f"equipping {name}")
+                self._click_at(pot[0])
+                self.equip_fn(name)
+                self._wait(self.step * 0.6)
+                self._park()
+            self._click_at(self.neutral_fn())                    # a click on the screen drinks the potion in hand
+            self.drink_fn()
+            self._wait(self.drink_time + 0.3)
+            self.count = 1
+        except _BrewStop as e:
+            why = str(e)
+        except Exception as e:
+            why = f"error: {type(e).__name__}: {e}"
+        finally:
+            try:
+                self._cleanup(off_pt, opened, orig)
+            finally:
+                self.running = False
+                if self.on_stop:
+                    self.on_stop(self.count, why)
+
+    def _cleanup(self, off_pt, opened, orig):
+        """Helmet back on, inventory closed (only when this opened it), cursor back where it was. Nothing is clicked unless the game is in front."""
+        try:
+            self._stop.clear()
+            self._ok()                                            # (raises when the game isn't in front: then nothing is sent to another window)
+            if off_pt is not None:
+                self.note("helmet back on")
+                self._click_at(off_pt)
+                self._wait(self.step * 0.6)
+                self.note("helmet: click on the screen")
+                self._click_at(self.neutral_fn())
+                self.helm_state = "back on"
+                self._wait(self.step)
+            if opened and self.inv_open():
+                self.toggle_inv(False)
+                self._wait(0.1)
+            if orig is not None:
+                self.move_fn(orig[0], orig[1])
+        except Exception:
+            pass
+
+
 SELL_ID = "sell"                       # the id of the one learned inventory card of Appraise Sell (stored as brew#sell)
 
 
@@ -6381,7 +6524,7 @@ KDA_GOLD = "#ffd23f"
 
 
 class KdaOverlay(Overlay):
-    """'Grip 10  Death 0  Assist 3  Knocked 9' under the Auto Bard badge. Click-through like the checklist: the mouse hook catches the
+    """'Grip 10  Death 0  Assist 3  Knocked 9' at the bottom left of the game. Click-through like the checklist: the mouse hook catches the
     clicks on the numbers (hit boxes returned by show()). The selected counter is golden."""
 
     def __init__(self, root, log):
@@ -7031,6 +7174,18 @@ def error_meter_read(rgb, sh=1080.0):
     return None
 
 
+def _get_or_make(d, key, make):
+    """d.setdefault(key, make(None)) that builds the default only when the key is missing (setdefault builds it every time)."""
+    if key in d:
+        return d[key]
+    d[key] = make(None)
+    return d[key]
+
+
+class _SkipLook(Exception):
+    """Raised to leave a look out (nothing needs it right now)."""
+
+
 def _longest_runs(m):
     """Per row of a boolean picture: the longest unbroken run of True (all rows at once)."""
     H, W = m.shape
@@ -7066,6 +7221,8 @@ def hp_bar_visible(rgb):
     # others), so a line counts when a good stretch of the grab is unbroken light colour - not a share of the whole grab's width.
     need = min(0.30 * W, 120.0)                                      # (pixels: the bar is ~400 px long when full)
     light = (longest(_near(pr, pg, pb, HP_FRAME, 70)) >= need) | (longest(_near(pr, pg, pb, HP_FRAME_BRIGHT, 40)) >= need)
+    if not light.any():
+        return False                                                  # (no light frame line at all: no bar - the dark outline needn't be looked for)
     # (the dark outline is only a pixel or two thick and gets blended with the red / the frame when the screen isn't 1080p: any DARK
     # row - every channel low - counts, not only the exact outline colour)
     dark = (longest(_near(pr, pg, pb, HP_DARK, 30)) >= need * 0.8) | (longest(np.maximum(np.maximum(pr, pg), pb) <= 125) >= need * 0.8) \
@@ -7763,6 +7920,15 @@ class InputWatcher(threading.Thread):
                 send_raw_key(ALT_L, 0, False, TRAIN_TAG)                    # (LAlt itself was taken: hand it to the system now)
                 self._alt_inj = True
             return False
+        pm = getattr(app, "potion_map", None)
+        if pm and kid in pm:                                               # a potion key: opens the inventory and drinks it (see App.potion_press)
+            if kid in held:
+                return True
+            if not self.game_active():
+                return False
+            held[kid] = ("potion",)
+            app.potion_press(pm[kid])
+            return True
         km = getattr(app, "kb_map", None)
         if not km:
             return False
@@ -9360,643 +9526,6 @@ def pick_family(root):
     return "TkDefaultFont", False
 
 
-# ----------------------------------------------------------------------------
-# Auto Bard: plays the Songs' rhythm minigame (the numbered circles with a shrinking ring) while a Song is being played, i.e. while
-# the Error Meter is on the screen. It only looks at the screen and clicks - and while it runs "Auto Bard is Active." is shown
-# under the mana bar, always on top and never hidden by any setting. Needs opencv-python (the rest of the tool doesn't).
-# ----------------------------------------------------------------------------
-BARD_ICON_PNG = "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"
-BV_GAP_PX = 1.5           # "closed" = ring centre this many px outside the border (at 1080p; all the pixel sizes below scale with BV_K)
-BV_K = [1.0]              # screen height / 1080: set by Auto Bard when it starts, so it works on every resolution
-
-
-def bvk():
-    return BV_K[0]
-BV_IGNORE_TOP, BV_IGNORE_BOTTOM = 0.12, 0.17      # fractions of the screen height not looked at (top bar / hotbar)
-_bv_cv = [None, False]
-
-
-def _bv_cv2():
-    """The opencv module (imported the first time it is needed); None when it isn't installed."""
-    if not _bv_cv[1]:
-        _bv_cv[1] = True
-        try:
-            import cv2
-            _bv_cv[0] = cv2
-        except Exception:
-            _bv_cv[0] = None
-    return _bv_cv[0]
-
-
-BARD_LOG = [None]
-
-
-def bard_log(msg, quiet=False):
-    if not quiet and BARD_LOG[0]:
-        try:
-            BARD_LOG[0](msg)
-        except Exception:
-            pass
-
-
-BV_RAYS = 64
-BV_ANGLES = np.linspace(0, 2 * math.pi, BV_RAYS, endpoint=False)
-BV_COS, BV_SIN = np.cos(BV_ANGLES).astype(np.float32), np.sin(BV_ANGLES).astype(np.float32)
-BV_STEP = 0.5          # sample every half pixel along each ray
-BV_DARK = 70           # border pixels are darker than this (brightest channel)
-BV_DARK_FIND = 105     # looser version, for borders lit by the coloured lights
-BV_FILL_SPREAD = 60    # how coloured (tinted by lighting) the circle's light fill may be
-BV_BRIGHT = 200        # ring pixels are brighter than this (darkest channel)
-BV_MAX_RING = 3.4      # biggest ring we look for, as a multiple of the circle size
-BV_BORDER_RATIO = 1.20 # outer edge of the dark border / inner edge (measured from the game)
-
-
-def bv_prep(img):
-    """BGR image -> (brightest channel, darkest channel)."""
-    cv2 = _bv_cv2()
-    b, g, r = cv2.split(img)
-    mx = cv2.max(cv2.max(b, g), r)
-    mn = cv2.min(cv2.min(b, g), r)
-    return mx, mn
-
-
-def bv_discover(img, known=(), min_r=None, max_r=None):
-    """Fast search for NEW circles: works on a half-size copy, skips spots in `known`
-    (list of (x, y, radius) already being tracked), then measures candidates at full size."""
-    cv2 = _bv_cv2()
-    k = bvk()
-    min_r = 15 * k if min_r is None else min_r
-    max_r = 120 * k if max_r is None else max_r
-    small = cv2.resize(img, (img.shape[1] // 2, img.shape[0] // 2), interpolation=cv2.INTER_AREA)
-    mx, mn = bv_prep(small)
-    spread = cv2.subtract(mx, mn)
-    # circle fill is light grey; the white rings are brighter, so leave them out (they'd glue
-    # neighbouring circles together), and cut away any thin lines still touching the fill
-    # (the challenge has coloured lighting, so the fill can be tinted and quite bright; the thin
-    # white rings are removed by the "open" step below instead of by brightness)
-    fill = cv2.bitwise_and(cv2.inRange(spread, 0, BV_FILL_SPREAD), cv2.inRange(mx, 126, 255))
-    fill = cv2.morphologyEx(fill, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    fill = cv2.morphologyEx(fill, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    n, _, stats, _ = cv2.connectedComponentsWithStats(fill, 8)
-    H, W = img.shape[:2]
-    out = []
-    for i in range(1, n):
-        bx, by, bw, bh, area = stats[i]
-        if bw < min_r or bh < min_r or bw > max_r or bh > max_r:
-            continue
-        if not 0.75 < bw / bh < 1.33:
-            continue
-        r = (bw + bh) / 2.0                      # full-size radius
-        if area * 4 < 0.5 * math.pi * r * r:
-            continue
-        cx, cy = (bx + bw / 2.0) * 2, (by + bh / 2.0) * 2
-        if any((cx - kx) ** 2 + (cy - ky) ** 2 < (kr * 0.6) ** 2 for kx, ky, kr in known):
-            continue
-        # quick check for the dark border before the full measurement
-        darkn = 0
-        for a in range(0, 360, 45):
-            px = int(cx + math.cos(math.radians(a)) * r * 1.12)
-            py = int(cy + math.sin(math.radians(a)) * r * 1.12)
-            if 0 <= px < W and 0 <= py < H and img[py, px].max() < BV_DARK_FIND:
-                darkn += 1
-        if darkn < 6:
-            continue
-        res = bv_measure_bgr(img, cx, cy, r)
-        if res:
-            out.append(res)
-    return out
-
-
-def bv_measure_bgr(img, cx, cy, r):
-    """Measure one circle straight from the BGR frame (only processes a small crop around it).
-    The centre is corrected automatically, so a rough starting position is fine.
-    Returned x, y are in the coordinates of `img`."""
-    cv2 = _bv_cv2()
-    res = None
-    for _ in range(3):
-        res = bv_measure_at(img, cx, cy, r)
-        if res is None or res["off"] is None:
-            return res
-        dx, dy = res["off"]
-        if dx * dx + dy * dy > (r * 0.5) ** 2:
-            return res            # fit is nonsense (something covering the circle) - keep as is
-        if dx * dx + dy * dy < 0.25 * bvk() ** 2:
-            return res            # centred to within half a pixel
-        cx, cy = cx + dx, cy + dy
-    return res
-
-
-def bv_measure_at(img, cx, cy, r):
-    cv2 = _bv_cv2()
-    H, W = img.shape[:2]
-    R = int(r * BV_MAX_RING) + 3
-    x0, y0 = max(0, int(cx) - R), max(0, int(cy) - R)
-    x1, y1 = min(W, int(cx) + R + 1), min(H, int(cy) + R + 1)
-    mx, mn = bv_prep(img[y0:y1, x0:x1])
-    res = bv_measure(mx, mn, cx - x0, cy - y0, r)
-    if res:
-        res["x"], res["y"] = float(cx), float(cy)
-    return res
-
-
-
-def bv_measure(mx, mn, cx, cy, r):
-    """Measure one circle whose centre/size is already roughly known."""
-    cv2 = _bv_cv2()
-    cx, cy, r = float(cx), float(cy), float(r)
-    radii = np.arange(r * 0.7, r * BV_MAX_RING, BV_STEP, dtype=np.float32)
-    # crop around the circle and convert to float so interpolation keeps sub-pixel detail
-    H, W = mx.shape
-    R = int(radii[-1]) + 2
-    x0, y0 = max(0, int(cx) - R), max(0, int(cy) - R)
-    x1, y1 = min(W, int(cx) + R + 1), min(H, int(cy) + R + 1)
-    cmx = mx[y0:y1, x0:x1].astype(np.float32)
-    cmn = mn[y0:y1, x0:x1].astype(np.float32)
-    mapx = (cx - x0 + np.outer(BV_COS, radii)).astype(np.float32)
-    mapy = (cy - y0 + np.outer(BV_SIN, radii)).astype(np.float32)
-    pmx = cv2.remap(cmx, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=128)
-    pmn = cv2.remap(cmn, mapx, mapy, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=128)
-
-    limit_dark = int((r * 1.35 - radii[0]) / BV_STEP)
-    merge_lo, merge_hi = int((r * 0.95 - radii[0]) / BV_STEP), int((r * 1.4 - radii[0]) / BV_STEP)
-    # 1) the inner edge of the dark border (light fill -> dark) is always crisp, whatever the
-    #    background, so measure that; the border's OUTER edge can't be seen on dark backgrounds,
-    #    so it is worked out from the inner edge using the circle's fixed proportions
-    edges, edge_ang, merged, hits = [], [], 0, 0
-    for a in range(BV_RAYS):
-        row_mx, row_mn = pmx[a], pmn[a]
-        d = np.flatnonzero(row_mx[:limit_dark] < BV_DARK_FIND)
-        if d.size == 0 or d[0] == 0:
-            if (row_mn[merge_lo:merge_hi] > BV_BRIGHT).any():
-                merged += 1      # white ring is sitting right on the border
-            continue
-        hits += 1
-        # sub-pixel position where brightness crosses BV_DARK (or BV_DARK_FIND if the border is lit up)
-        i = d[0]
-        thr = BV_DARK_FIND
-        dd = np.flatnonzero(row_mx[i:i + 8] < BV_DARK)
-        if dd.size:
-            i, thr = i + dd[0], BV_DARK
-        lo, hi = row_mx[i - 1], row_mx[i]
-        frac = (lo - thr) / (lo - hi) if lo != hi else 0.0
-        edges.append(radii[i - 1] + min(1.0, max(0.0, frac)) * BV_STEP)
-        edge_ang.append(a)
-    if hits + merged < BV_RAYS * 0.55 or not edges:
-        return None
-    r_edge = float(np.median(edges))
-    # where the true centre is, from a circle fitted to the fill's edge (outliers removed)
-    off = None
-    if len(edges) >= BV_RAYS * 0.5:
-        e = np.array(edges)
-        ca, sa = BV_COS[edge_ang], BV_SIN[edge_ang]
-        keep = np.ones(len(e), bool)
-        for _ in range(3):
-            if keep.sum() < BV_RAYS * 0.4:
-                break
-            px, py = (e * ca)[keep], (e * sa)[keep]
-            A = np.column_stack([2 * px, 2 * py, np.ones_like(px)])
-            sol, *_ = np.linalg.lstsq(A, px * px + py * py, rcond=None)
-            fr = np.sqrt(max(1e-6, sol[2] + sol[0] ** 2 + sol[1] ** 2))
-            res = np.abs(np.hypot(e * ca - sol[0], e * sa - sol[1]) - fr)
-            keep = res < max(1.5, 2.5 * float(np.median(res)))
-            off = (float(sol[0]), float(sol[1]))
-    r_border = r_edge * BV_BORDER_RATIO
-
-    # 2) the ring: first bright band from just inside the border's outer edge outwards
-    start = max(0, int((r_border - 2.5 * bvk() - radii[0]) / BV_STEP))
-    rings = []
-    nr = len(radii)
-    for a in range(BV_RAYS):
-        row_mn = pmn[a]
-        b = np.flatnonzero(row_mn[start:] > BV_BRIGHT)
-        if b.size == 0:
-            continue
-        b = start + b[0]
-        s, t = max(start, b - 6), min(nr, b + 10)
-        w = np.clip(row_mn[s:t] - 150.0, 0, None)
-        # only the first bright band (stop where it drops back down)
-        drop = np.flatnonzero(row_mn[b:t] < 150)
-        if drop.size:
-            w[b - s + drop[0]:] = 0
-        if w.sum() > 0:
-            rings.append(float((w * radii[s:t]).sum() / w.sum()))
-
-    ring = None
-    if len(rings) >= BV_RAYS * 0.3:
-        rs = np.array(rings)
-        med = np.median(rs)
-        good = rs[np.abs(rs - med) < 3 * bvk()]          # drop rays that hit something else
-        if good.size >= BV_RAYS * 0.25:
-            ring = float(good.mean())
-    return dict(x=float(cx), y=float(cy), r_fill=float(r), r_edge=r_edge, r_border=r_border, ring=ring,
-                merged=merged >= BV_RAYS * 0.4, off=off)
-
-
-class BardTrack:
-    def __init__(self, tid, d, t):
-        self.id = tid
-        self.x, self.y, self.r_fill = d["x"], d["y"], d["r_fill"]
-        self.samples = []          # (time, ring radius) - only frames where the ring moved
-        self.borders = []
-        self.done = None           # None, "clicked" or "skipped"
-        self.done_t = None
-        self.seen_ring = False
-        self.born = t
-        self.last = t              # last time the circle itself was seen
-        self.last_ring = None      # last time its ring was seen
-        self.ring_now = False
-        self.merged = False
-        self.add(d, t)
-
-    @property
-    def border(self):
-        return float(np.median(self.borders[-30:]))
-
-    def add(self, d, t):
-        self.last = t
-        self.x, self.y = d["x"], d["y"]
-        self.borders.append(d["r_border"])
-        self.borders = self.borders[-40:]
-        self.ring_now = d["ring"] is not None
-        self.merged = d["merged"]
-        if self.ring_now:
-            self.seen_ring = True
-            self.last_ring = t
-            # the game only redraws ~60 times a second: keep only frames where the ring actually moved
-            if self.samples and abs(self.samples[-1][1] - d["ring"]) < 0.08 * bvk():
-                return
-            self.samples.append((t, d["ring"]))
-            self.samples = self.samples[-60:]
-
-    def gap(self):
-        return self.samples[-1][1] - self.border - BV_GAP_PX * bvk() if self.samples else None
-
-    def confirmed(self):
-        """True once the ring has actually been seen shrinking. Anything round and white on screen
-        that doesn't shrink (UI, lights, decorations) never qualifies, so it can't be clicked."""
-        if len(self.samples) < 3:
-            return False
-        shrink = self.samples[0][1] - self.samples[-1][1]
-        span = self.samples[-1][0] - self.samples[0][0]
-        k = bvk()
-        return shrink >= 2.0 * k and span > 0 and 3.0 * k <= shrink / span <= 600.0 * k
-
-    def gap_at(self, t):
-        """Ring-to-border gap now, moving the last measurement forward by the ring's speed
-        (circles that aren't being watched closely are only measured every ~40 ms)."""
-        g = self.gap()
-        if g is None:
-            return None
-        if len(self.samples) >= 3:
-            s = self.samples[-6:]
-            ts = np.array([a for a, _ in s])
-            if ts[-1] - ts[0] > 0.02:
-                slope = np.polyfit(ts - ts[-1], np.array([b for _, b in s]), 1)[0]
-                if slope < 0:
-                    g += slope * min(0.1, t - ts[-1])
-        return g
-
-    def finish(self, how, t):
-        self.done, self.done_t = how, t
-
-    def predict(self):
-        """Time at which the ring reaches the border (None if it can't tell yet)."""
-        if len(self.samples) < 2:
-            return None
-        t_last = self.samples[-1][0]
-        recent = [s for s in self.samples if t_last - s[0] <= 0.15]
-        if len(recent) < 4:
-            recent = [s for s in self.samples if t_last - s[0] <= 0.35][-12:]
-        if len(recent) < 2:
-            return None
-        ts = np.array([s[0] for s in recent]) - t_last
-        rs = np.array([s[1] for s in recent])
-        if ts[-1] - ts[0] < 0.012:
-            return None
-        slope, icept = np.polyfit(ts, rs, 1)
-        if slope > -1.0 * bvk():      # px/s - not shrinking
-            return None
-        target = self.border + BV_GAP_PX * bvk()
-        dt = (target - icept) / slope
-        # lots of fresh samples: also allow for the ring speeding up / slowing down
-        q = [s for s in self.samples if t_last - s[0] <= 0.25]
-        if len(q) >= 6 and q[-1][0] - q[0][0] > 0.06:
-            qt = np.array([s[0] for s in q]) - t_last
-            qr = np.array([s[1] for s in q])
-            a, b, c = np.polyfit(qt, qr, 2)
-            disc = b * b - 4 * a * (c - target)
-            if abs(a) > 1e-6 and disc >= 0:
-                roots = [(-b - disc ** 0.5) / (2 * a), (-b + disc ** 0.5) / (2 * a)]
-                roots = [x for x in roots if x > -0.05 and abs(x - dt) < 0.15]
-                if roots:
-                    dt = min(roots)
-        return t_last + dt
-
-
-class BardBot:
-    """Auto Bard: tracks every circle on screen, but clicks strictly in the order they appeared - it never
-    switches away from the current circle until that one is clicked or gone."""
-
-    def __init__(self):
-        self.tracks = []
-        self.next_id = 1
-        self.frame_no = 0
-
-    def _new(self, d, t):
-        tr = BardTrack(self.next_id, d, t)
-        self.next_id += 1
-        self.tracks.append(tr)
-        ring = f"ring gap {d['ring'] - d['r_border']:.1f}px" if d["ring"] is not None else "no ring"
-        bard_log(f"  found #{tr.id} at ({int(d['x'])},{int(d['y'])} in capture area) size {d['r_fill']:.0f} {ring}",
-            quiet=True)
-        return tr
-
-    def process(self, frame, t):
-        """Feed one full-screen frame: update every circle and look for new ones."""
-        self.frame_no += 1
-        for tr in list(self.tracks):
-            if tr.done and t - tr.done_t > 0.6:
-                self.tracks.remove(tr)       # finished circle long gone - forget it
-        # update every circle we know about (the measurement also re-centres it, so a circle first
-        # spotted while half-hidden behind another one ends up at its true centre)
-        for tr in self.tracks:
-            if not tr.done:
-                m = bv_measure_bgr(frame, tr.x, tr.y, tr.r_fill)
-                if m is not None:
-                    tr.add(m, t)
-        # two tracks that ended up on the same circle -> keep the older one
-        live = sorted((tr for tr in self.tracks if not tr.done), key=lambda k: k.id)
-        for i, a in enumerate(live):
-            for b in live[i + 1:]:
-                if b in self.tracks and (a.x - b.x) ** 2 + (a.y - b.y) ** 2 < (a.r_fill * 0.5) ** 2:
-                    self.tracks.remove(b)
-        # look for circles we aren't tracking yet
-        known = [(tr.x, tr.y, tr.r_fill) for tr in self.tracks if not tr.done]
-        for d in bv_discover(frame, known):
-            near_done = [tr for tr in self.tracks if tr.done and
-                         (tr.x - d["x"]) ** 2 + (tr.y - d["y"]) ** 2 < (tr.r_fill * 1.2) ** 2]
-            if near_done:
-                # same spot as a circle we just finished: only count it if it has a fresh, big ring
-                # (otherwise it's the old circle still fading out - clicking it again would be wrong)
-                if d["ring"] is None or d["ring"] - d["r_border"] < 12 * bvk():
-                    continue
-                for tr in near_done:
-                    self.tracks.remove(tr)
-            self._new(d, t)
-        # drop circles that have vanished
-        for tr in list(self.tracks):
-            if not tr.done and t - tr.last > 0.3:
-                if tr.seen_ring:
-                    bard_log(f"  missed #{tr.id}: it disappeared before it could be clicked")
-                self.tracks.remove(tr)
-            elif not tr.done and not tr.seen_ring and t - tr.born > 1.5:
-                self.tracks.remove(tr)   # a circle that never showed a ring (already finished / decoration)
-
-    def current(self, t):
-        """The circle to work on now. Normally the oldest one; but a circle that was spotted late
-        (hidden under another one) can be older than its number says, so if another circle's ring
-        is clearly closer to closing, that one goes first. Once a circle is close to closing it is
-        locked in - the bot will not move away from it until it's clicked."""
-        cands = []
-        for tr in sorted(self.tracks, key=lambda k: k.id):
-            if tr.done or not tr.seen_ring:
-                continue
-            if not tr.confirmed():
-                if t - tr.born > 0.6 and not getattr(tr, "ignored", False):
-                    tr.ignored = True
-                    bard_log(f"  ignoring #{tr.id}: round thing whose ring isn't shrinking (not a challenge circle)",
-                        quiet=True)
-                continue
-            if t - tr.last_ring > 0.25 and not tr.merged:
-                g = tr.gap()
-                if g is not None and g < 6 * bvk():
-                    cands.append(tr)     # ring vanished into the border: click it straight away
-                    continue
-                tr.finish("skipped", t)   # ring lost while still far out - don't let it block the rest
-                bard_log(f"  skipped #{tr.id}: lost sight of its ring (gap was {g + BV_GAP_PX * bvk():.0f}px)")
-                continue
-            cands.append(tr)
-        if not cands:
-            self.locked = None
-            return None
-        if getattr(self, "locked", None) in cands:
-            return self.locked
-        best = cands[0]
-        bg = best.gap_at(t)
-        for tr in cands[1:]:
-            g = tr.gap_at(t)
-            if g is not None and bg is not None and g < bg - 8 * bvk():
-                best, bg = tr, g
-        if bg is not None and bg < 15 * bvk():
-            self.locked = best
-        return best
-
-    @staticmethod
-    def when(tr, t, offset_s):
-        """'now', a time to click at, or None if not predictable yet."""
-        g = tr.gap()
-        if tr.merged or (tr.ring_now and g is not None and g <= 0) or \
-                (not tr.ring_now and g is not None and g < 6 * bvk()):
-            return "now" if offset_s <= 0 else (tr.last_ring or t) + offset_s
-        due = tr.predict()
-        return None if due is None else due + offset_s
-
-
-class AutoBard(threading.Thread):
-    """Runs while a Song is played (the Error Meter is up), the game is in front and 'Auto Bard' is on. One background thread that
-    sleeps when nothing is going on."""
-
-    def __init__(self, app):
-        super().__init__(daemon=True)
-        self.app = app
-        self.quit = False
-        self._warned = False
-        self._parked = None
-
-    def stop(self):
-        self.quit = True
-
-    def want(self):
-        a = self.app
-        try:
-            return bool(a.cfg["settings"].get("auto_bard", True)) and a.tracker.song_active() and a.game_focused()
-        except Exception:
-            return False
-
-    def _park(self, x, y):
-        """Put the mouse on the circle ahead of time so the click itself is instant."""
-        p = (int(round(x)), int(round(y)))
-        if self._parked == p or not IS_WIN:
-            return
-        _mouse_move_abs(p[0], p[1])
-        _mouse_move_rel(1, 0)
-        _mouse_move_rel(-1, 0)
-        self._parked = p
-
-    def _click(self, x, y):
-        self._park(x, y)
-        send_click(False)
-        time.sleep(0.006)
-        send_click(True)
-
-    def run(self):
-        bot, sct, mon, last_full, st = None, None, None, 0.0, {}
-        while not self.quit:
-            try:
-                if not self.want():
-                    self.app.bard_on = False
-                    bot, self._parked = None, None
-                    time.sleep(0.05)
-                    continue
-                if _bv_cv2() is None:
-                    self.app.bard_on = False
-                    if not self._warned:
-                        self._warned = True
-                        self.app.q.put(("msg", "Auto Bard needs the opencv-python package (pip install opencv-python) - it stays off."))
-                    time.sleep(0.5)
-                    continue
-                if sct is None:
-                    sct = mss.mss()
-                    m0 = sct.monitors[1]
-                    top = int(m0["height"] * BV_IGNORE_TOP)
-                    bottom = int(m0["height"] * (1 - BV_IGNORE_BOTTOM))
-                    mon = dict(left=m0["left"], top=m0["top"] + top, width=m0["width"], height=bottom - top)
-                    BV_K[0] = self._screen_k(m0["height"])
-                    ox, oy = mon["left"], mon["top"]
-                    st = dict(ox=ox, oy=oy, W=mon["width"], H=mon["height"])
-                if bot is None:
-                    bot = BardBot()
-                    st["focus"], last_full = None, 0.0
-                self.app.bard_on = True
-                self._step(bot, sct, mon, st, last_full)
-                last_full = st.get("last_full", last_full)
-            except Exception as ex:
-                self.app.bard_on = bool(self.want())
-                if not self._warned:
-                    self._warned = True
-                    self.app.q.put(("msg", f"Auto Bard error: {type(ex).__name__}: {ex}"))
-                time.sleep(0.2)
-
-    def _screen_k(self, mon_h):
-        """Screen height / 1080 (the game window's height when it is smaller than the screen): the circles' size and speed scale with it."""
-        h = float(mon_h or 1080)
-        try:
-            L, T, Wc, Hc = self.app._cl_client(time.time())
-            if 200 < Hc <= h * 1.02:
-                h = float(Hc)
-        except Exception:
-            pass
-        return max(0.4, min(4.0, h / 1080.0))
-
-    def _grab(self, sct, box):
-        t0 = time.perf_counter()
-        img = np.asarray(sct.grab(box))[:, :, :3]
-        return img, (t0 + time.perf_counter()) / 2
-
-    def _step(self, bot, sct, mon, st, last_full):
-        W, H, ox, oy = st["W"], st["H"], st["ox"], st["oy"]
-        offset = float(self.app.cfg["settings"].get("bard_offset_ms", -12.0)) / 1000.0
-        now = time.perf_counter()
-        tr = bot.current(now)
-        due = bot.when(tr, now, offset) if tr else None
-        closing_soon = due == "now" or (due is not None and due - now < 0.07)
-        if tr is None or (now - last_full > 0.04 and not closing_soon):
-            frame, t = self._grab(sct, mon)                      # a full look every ~40 ms: finds new circles
-            bot.process(frame, t)
-            st["last_full"] = t
-        else:                                                    # a close-up of the current circle only (~1 ms)
-            R = int(tr.r_fill * BV_MAX_RING) + 4
-            x0, y0 = max(0, int(tr.x) - R), max(0, int(tr.y) - R)
-            x1, y1 = min(W, int(tr.x) + R + 1), min(H, int(tr.y) + R + 1)
-            img, t = self._grab(sct, dict(left=ox + x0, top=oy + y0, width=x1 - x0, height=y1 - y0))
-            m = bv_measure_bgr(img, tr.x - x0, tr.y - y0, tr.r_fill)
-            if m is not None:
-                m["x"] += x0
-                m["y"] += y0
-                tr.add(m, t)
-        now = time.perf_counter()
-        tr = bot.current(now)
-        st["focus"] = tr
-        if tr is None:
-            return
-        self._park(ox + tr.x, oy + tr.y)                         # sit on the current circle until it is done
-        due = bot.when(tr, now, offset)
-        if due == "now":
-            self._click(ox + tr.x, oy + tr.y)
-            tr.finish("clicked", time.perf_counter())
-        elif due is not None and due - now < 0.003:
-            while time.perf_counter() < due:                     # closes before the next look: hit it exactly
-                if due - time.perf_counter() > 0.003:
-                    time.sleep(0.001)
-            self._click(ox + tr.x, oy + tr.y)
-            tr.finish("clicked", time.perf_counter())
-
-
-class BardBadge(Overlay):
-    """'Auto Bard is Active.' with a guitar under the mana bar. Its own always-on-top, click-through window: no setting, focus state,
-    menu or other overlay hides it - it is there for exactly as long as Auto Bard is running."""
-
-    def __init__(self, root, log):
-        self.root, self.log = root, log
-        self.win, self.cv = self._make()
-        self.red = self.num = (self.win, self.cv)
-        self.shown, self.alpha, self.geom = False, None, None
-        self._photo = None
-        self._key = None
-
-    def hide(self):
-        if self.shown:
-            try:
-                self.win.withdraw()
-            except Exception:
-                pass
-        self.shown = False
-        self._key = None
-
-    def show(self, x, y, s, family):
-        s = max(0.6, float(s))
-        key = (int(x), int(y), round(s, 2), family)
-        if key != self._key:
-            self._key = key
-            icon = _img(BARD_ICON_PNG).convert("RGBA")
-            ih = int(round(42 * s))
-            iw = max(1, int(round(icon.width * ih / float(icon.height))))
-            self._photo = ImageTk.PhotoImage(keyed_image(icon, iw, ih))
-            fnt = (family, -max(9, int(round(13 * s))), "bold")
-            tw = max(60, int(round(len(BARD_TEXT) * 8.2 * s)))
-            W, H = iw + int(8 * s) + tw + 4, ih + 4
-            cv = self.cv
-            cv.delete("all")
-            cv.config(width=W, height=H)
-            self.win.geometry(f"{W}x{H}+{int(x)}+{int(y)}")
-            cv.create_image(0, 2, image=self._photo, anchor="nw")
-            tx, ty = iw + int(8 * s), 2 + ih // 2
-            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
-                cv.create_text(tx + dx, ty + dy, text=BARD_TEXT, font=fnt, fill="#000000", anchor="w")
-            cv.create_text(tx, ty, text=BARD_TEXT, font=fnt, fill="#ffffff", anchor="w")
-        try:
-            self.win.attributes("-alpha", 1.0)
-            if self.win.state() != "normal":
-                self.win.deiconify()
-            self._click_through(self.win)
-            self.win.attributes("-topmost", True)
-            self.win.lift()
-        except Exception:
-            pass
-        self.shown = True
-
-    def raise_top(self):
-        if self.shown:
-            try:
-                self.win.attributes("-topmost", True)
-                self.win.lift()
-            except Exception:
-                pass
-
-
-BARD_TEXT = "Auto Bard is Active."
-
-
 class AutoclickBadge(Overlay):
     """'Autoclicker: ON / OFF' with the pause key under it, on the right of the screen. Click-through, always on top."""
 
@@ -10282,6 +9811,8 @@ class App:
         self.gate_open, self.gate_rects, self.gate_hits, self.gate_map = False, (), [], {}     # Gate: the shortcut boxes are up / the mouse hook's boxes / click boxes / gate keybinds
         self.gate_menu, self._gate_sig = GateMenu(self.gates_data()["pinned"]), None
         self.apply_gates()
+        self.potion_map, self.potion_job, self.pk_cap, self.pk_del = {}, None, None, (None, 0.0)     # potion keys: pressed key id -> potion name / the running drink / key being picked / right-click delete
+        self.apply_potion_keys()
         self.win_rect = None                      # screen rect of this window (for ignoring clicks on it)
         self.demo_until, self.demo_t0 = 0.0, 0.0
         self._sig, self._top_t = None, 0.0
@@ -10385,14 +9916,9 @@ class App:
         self.inv_ov = InvBoxOverlay(r, self.append_log)
         self.inv_cd_ov = Overlay(r, self.append_log)                  # the cooldown boxes ON the inventory cards: the very same look as the hotbar's
         self.pct_ov = PctOverlay(r, self.append_log)
-        self.bard_on = False
         self.ac_on = True                                                  # the Autoclicker is not paused (the pause key flips this)
         self.ac_badge = AutoclickBadge(r, self.append_log)                 # "Autoclicker: ON / OFF" + its pause key
-        self.bard_badge = BardBadge(r, self.append_log)                # "Auto Bard is Active." under the mana bar (never hidden)
-        BARD_LOG[0] = self.append_log
-        self.autobard = AutoBard(self)
-        self.autobard.start()
-        self.kda_ov = KdaOverlay(r, self.append_log)                  # the KDA counters under the Auto Bard badge
+        self.kda_ov = KdaOverlay(r, self.append_log)                  # the KDA counters (bottom left of the game)
         self.kda_hits, self.kda_rects, self._kda_sig, self._kda_top = [], (), None, 0.0
         self.check_ov = ChecklistOverlay(r, self.append_log)          # the checklist right of the mana bar
         self.gate_ov = GateOverlay(r, self.append_log)                # the Gate shortcut boxes (right click with a Gate spell)
@@ -10423,6 +9949,9 @@ class App:
                 if valid_anchor(self.cfg.get("dash_anchor")):          # (the other coins already follow the hotbar: so does the new one)
                     move_item(self.cfg["dashpos"][k_], A_, self.cfg["dash_anchor"], left=(k_ == "rune"))
             save_cfg(self.cfg)
+        self._perf = None
+        if self.cfg["settings"].get("perf_log"):                       # hidden: "perf_log": true in the settings file -> the log shows where the time goes every 5 s
+            self.perf_start()
         if IS_WIN:
             threading.Thread(target=self._probe_loop, daemon=True).start()
             threading.Thread(target=self._pct_loop, daemon=True).start()
@@ -10808,6 +10337,40 @@ class App:
         if cap:
             self.cap_text, self.cap_until = cap, time.time() + 2.5
 
+    PERF_JOBS = (("health bar", "hp_failsafe"), ("mana %", "_pct_once"), ("mana dash", "_probe_once"), ("Awakened", "awk_look"),
+                 ("inventory", "inv_step"), ("overlays", "overlay_tick"), ("window", "refresh"))
+
+    def perf_start(self):
+        """Measures how long every repeating job runs (seconds of work per second = its share of ONE core)."""
+        self._perf = {"t": time.time(), "busy": {}, "calls": {}}
+
+        def wrap(owner, label, name):
+            fn = getattr(owner, name)
+
+            def timed(*a, **k):
+                t0 = time.perf_counter()
+                try:
+                    return fn(*a, **k)
+                finally:
+                    d = time.perf_counter() - t0
+                    p = self._perf
+                    if p is not None:
+                        p["busy"][label] = p["busy"].get(label, 0.0) + d
+                        p["calls"][label] = p["calls"].get(label, 0) + 1
+            setattr(owner, name, timed)
+        for label, name in self.PERF_JOBS:
+            wrap(self, label, name)
+        wrap(self.hotbar, "hotbar scan", "scan")
+
+    def perf_report(self, now):
+        p = self._perf
+        if p is None or now - p["t"] < 5.0:
+            return
+        span, busy, calls = now - p["t"], p["busy"], p["calls"]
+        p["t"], p["busy"], p["calls"] = now, {}, {}
+        parts = [f"{k} {busy[k] / span * 100:.1f}% ({calls[k] / span:.0f}/s, {busy[k] / max(1, calls[k]) * 1000:.1f} ms)" for k in sorted(busy, key=busy.get, reverse=True)]
+        self.append_log("PERF (share of one core): " + " | ".join(parts) + f" | total {sum(busy.values()) / span * 100:.1f}%")
+
     def append_log(self, msg):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
         try:
@@ -11155,7 +10718,7 @@ class App:
         self.rebuild_inv()                                 # (the Inventory page belongs to the profile too)
 
     def charged_cds(self):
-        return self.cfg["charged"].setdefault(self.cfg["active"], clean_charged(None))
+        return _get_or_make(self.cfg["charged"], self.cfg["active"], clean_charged)
 
     def refresh_charged(self, force=False):
         """Solan: while the profile has a 'Charged Blow' move, show four extra rows - one cooldown per Charge.
@@ -12953,6 +12516,7 @@ class App:
             if e.get("builtin"):
                 self._inv_row(p, e)
         self.label(p, "lol drinking potion shows u it's duration lol", **small).pack(fill="x", padx=8, pady=(2, 3))
+        self._potion_keys_ui(p, lst, small)
         box, p = self.panel(self.inv_body, f"Moves in '{self.cfg['active']}'")
         box.pack(fill="x", padx=6, pady=(0, 6))
         hdr = tk.Frame(p, bg=PARCH)
@@ -13217,9 +12781,6 @@ class App:
         self.label(p, "Add a song to Moves or Inventory to turn this on: " + ", ".join(SONGS) + ".", **small).pack(fill="x", padx=8, pady=(0, 3))
         self.entry_row(p, "Song Switch cooldown (seconds)", "song_switch_cd", float, w=56, h=22)
         self.entry_row(p, "Song Fail cooldown (seconds)", "song_fail_cd", float, w=56, h=22)
-        self.check_row(p, "Auto Bard",
-                       "auto_bard", wrap=420)
-        self.entry_row(p, "Auto Bard click timing (ms, negative = earlier)", "bard_offset_ms", float, w=56, h=22)
         box, p = self.panel(host, "Lapidarist")
         box.pack(fill="x", padx=6, pady=(0, 6))
         self.label(p, "Add Hammer to Moves or Inventory to turn this on: Sapphire, Opal and Ruby Shard are added to the Inventory. "
@@ -13330,7 +12891,7 @@ class App:
         return bool(self.cfg["popts"].get(self.cfg["active"], {}).get(key))
 
     def set_popt(self, key, v):
-        self.cfg["popts"].setdefault(self.cfg["active"], default_popts())[key] = bool(v)
+        _get_or_make(self.cfg["popts"], self.cfg["active"], lambda _x=None: default_popts())[key] = bool(v)
 
     def mana_dash_on(self):
         """Dragon Sage / Faceless Dashes."""
@@ -13952,6 +13513,9 @@ class App:
         except Exception:
             pass
         try:                                                         # how full the bar is (Bloodline needs it nearly empty)
+            if seen and now - getattr(self, "_hp_fill_t", 0.0) < 1.0 and self.tracker.bloodline_key() is None:
+                raise _SkipLook                                      # (the bar is there and nothing needs its fill: once a second is enough for the picture the Settings button saves)
+            self._hp_fill_t = now
             gx, gy, gw, gh = hp_fill_box(mon["width"], mon["height"])
             wide = self._grab_rgb({"left": mon["left"] + gx, "top": mon["top"] + gy, "width": gw, "height": gh})
             frac = hp_fill_fraction(wide)
@@ -13964,6 +13528,8 @@ class App:
                 seen = True                                          # (the wide look found the bar's red / empty strip WITH its frame: it is there)
             if seen and self.tracker.bloodline_passive(frac, now):
                 self.q.put(("msg", f"Bloodline: below {BLOODLINE_PASSIVE_HP * 100:g}% HP - {BM_TITLE['bloodline']} for {BLOODLINE_PASSIVE_SECS:g}s (passive)."))
+        except _SkipLook:
+            pass
         except Exception:
             pass
         if seen:
@@ -14095,7 +13661,7 @@ class App:
     def inv_templates(self):
         """{inventory move name: signature} for the ACTIVE profile's inventory (the learned pictures are the user's own, shared by all profiles)."""
         raw = self.cfg["settings"].get("inv_items") or {}
-        names = tuple(e["name"] for e in inv_of(self.cfg)) + tuple(BREW_PREFIX + q["id"] for q in self.brew_recipe()["seq"]) + (BREW_PREFIX + SELL_ID,)
+        names = tuple(e["name"] for e in inv_of(self.cfg)) + tuple(BREW_PREFIX + q["id"] for q in self.brew_recipe()["seq"]) + (BREW_PREFIX + SELL_ID, HELMET_CARD)
         key = (names, tuple(sorted((k, hash(v)) for k, v in raw.items())))      # (hash: learning a card AGAIN must refresh the picture too)
         if self._inv_sigs is None or self._inv_sigs[0] != key:
             built = {_norm_name(k): v for k, v in INV_BUILTIN.items()}
@@ -14179,7 +13745,7 @@ class App:
 
     @staticmethod
     def _ll(name):
-        return "the ingredient" if str(name).startswith(BREW_PREFIX) else str(name)
+        return "your helmet" if name == HELMET_CARD else ("the ingredient" if str(name).startswith(BREW_PREFIX) else str(name))
 
     def inv_renamed(self, old, new, entry, btn):
         """An inventory move got a new name: the Learn / Redo button follows it (it was filed under the old name, so it stopped
@@ -14197,6 +13763,196 @@ class App:
             if k_old is not None and not used and not taken and k_old not in INV_BUILTIN:
                 items[new] = items.pop(k_old)
                 self._inv_sigs = None
+
+    # ---------- potion keys (Extras > Inventory > Potions) ----------
+    def apply_potion_keys(self):
+        """(Re)loads the potion keys into the input hook: {pressed key id: potion name}."""
+        pk = self.cfg["settings"].get("potion_keys")
+        m = {}
+        for nm, spec in (pk.items() if isinstance(pk, dict) else ()):
+            try:
+                if isinstance(spec, dict) and 0 < int(spec.get("id")) < 0x200:
+                    m[int(spec["id"])] = str(nm)
+            except (TypeError, ValueError):
+                pass
+        self.potion_map = m
+
+    def _potion_keys_ui(self, p, lst, small):
+        pk = self.cfg["settings"].setdefault("potion_keys", {})
+        self.label(p, "Potion Keybind, yeah you bind your potion to a key then u press that key to drink it lol.", **small).pack(fill="x", padx=8, pady=(4, 2))
+        for e in lst:
+            if not e.get("potion"):
+                continue
+            nm = e["name"]
+            row = tk.Frame(p, bg=PARCH)
+            row.pack(fill="x", padx=8, pady=2)
+            self.label(row, nm, font=self.fs, width=14).pack(side="left", padx=(4, 0))
+            spec = pk.get(nm)
+            waiting = self.pk_cap == nm
+            armed = self.pk_del[0] == nm and time.time() < self.pk_del[1]
+            b = PixBtn(row, "press a key..." if waiting else (spec["label"] if isinstance(spec, dict) else ""),
+                       lambda n=nm: self.pk_pick(n), self.f, 100, 24, bd=2)
+            b.pack(side="right", padx=(0, 18))
+            b.lbl.bind("<ButtonRelease-3>", lambda ev, n=nm: self.pk_rclick(n))
+            if armed:
+                b.lbl.config(bg=RED, fg="#ffffff")
+                b.lbl.bind("<Enter>", lambda ev: None)
+                b.lbl.bind("<Leave>", lambda ev: None)
+            if is_health_potion_name(nm):
+                hrow = tk.Frame(p, bg=PARCH)
+                hrow.pack(fill="x", padx=8, pady=(0, 2))
+                lb = PixBtn(hrow, "Learn", lambda: self.inv_start_learn(HELMET_CARD), self.f, self.INV_LEARN_W, 24, bd=2)
+                lb.pack(side="left", padx=(4, 0))
+                self.inv_status[HELMET_CARD] = lb
+                self.label(hrow, "Your helmet", font=self.fs).pack(side="left", padx=(6, 0))
+                sw = tk.Frame(hrow, bg=BROWN, width=self.INV_SW_W, height=24)
+                sw.pack(side="left", padx=(6, 0))
+                sw.pack_propagate(False)
+                inner = tk.Frame(sw, bg=clean_hex(self.cfg["settings"].get("helm_color")) or "#4aa8ff", cursor="hand2")
+                inner.place(x=3, y=3, width=self.INV_SW_W - 6, height=18)
+
+                def pick_helm(_e=None, inner=inner):
+                    try:
+                        from tkinter import colorchooser
+                        res = colorchooser.askcolor(color=clean_hex(self.cfg["settings"].get("helm_color")) or "#4aa8ff", title="Helmet border colour")
+                    except Exception as ex:
+                        self.say(f"The colour picker didn't open: {ex}", "No picker")
+                        return "break"
+                    if res and res[1]:
+                        self.cfg["settings"]["helm_color"] = clean_hex(res[1]) or "#4aa8ff"
+                        inner.config(bg=self.cfg["settings"]["helm_color"])
+                        save_cfg(self.cfg)
+                    return "break"
+                for w_ in (sw, inner):
+                    w_.bind("<Button-1>", pick_helm)
+        self.check_row(p, "Health Potion key: take the helmet off first, put it back on after the drink", "helm_swap", wrap=230)
+        self.check_row(p, "...only when the helmet card is highlighted (worn)", "helm_need_bright", wrap=230)
+        self.label(p, "Helmet: unequip helm hp pot tech yea yea", **small
+                   ).pack(fill="x", padx=8, pady=(0, 2))
+        self.entry_row(p, "Potion key: wait between steps (ms)", "potion_wait_ms", float, w=56, h=22)
+
+    def pk_pick(self, name):
+        if self.pk_cap == name:                                 # click again = cancel
+            self.pk_cap, self.inputs.kb_capture = None, None
+            self.rebuild_inv()
+            return
+        self.pk_cap, self.kb_cap, self.gk_cap = name, None, None
+        self.inputs.kb_capture = lambda kid, label: self.q.put(("potcap", kid, label))      # (runs in the input thread: only queues)
+        self.rebuild_inv()
+        self.say("Press the key you want to use for this potion (Esc = cancel).", "Press a key...")
+
+    def finish_pk_cap(self, kid, label):
+        name, self.pk_cap, self.inputs.kb_capture = self.pk_cap, None, None
+        if name is not None and kid is not None:
+            pk = self.cfg["settings"].setdefault("potion_keys", {})
+            for n_ in [n_ for n_, v in pk.items() if isinstance(v, dict) and v.get("id") == int(kid)]:
+                pk.pop(n_, None)                                # (one key = one potion)
+            pk[name] = {"id": int(kid), "label": str(label or "KEY")[:16]}
+            save_cfg(self.cfg)
+            self.apply_potion_keys()
+        self.rebuild_inv()
+
+    def pk_rclick(self, name):
+        now = time.time()
+        if self.pk_del[0] == name and now < self.pk_del[1]:
+            self.pk_del = (None, 0.0)
+            self.cfg["settings"].setdefault("potion_keys", {}).pop(name, None)
+            save_cfg(self.cfg)
+            self.apply_potion_keys()
+        else:
+            self.pk_del = (name, now + 3.0)
+            self.root.after(3100, self.rebuild_inv)
+        self.rebuild_inv()
+
+    def potion_delays(self):
+        """The automation's click timing, but never faster than a safe minimum: the cursor waits >= 60 ms on a spot and a click is held >= 60 ms."""
+        d = list(self.brew_delays())
+        d[3], d[4] = max(d[3], 0.06), max(d[4], 0.06)
+        return tuple(d)
+
+    def potion_neutral(self):
+        """A spot above the inventory panel (the cursor waits there; a click there drinks the potion in hand)."""
+        with mss.mss() as sct:
+            mon = sct.monitors[1]
+        return (mon["left"] + mon["width"] // 2, mon["top"] + int(mon["height"] * 0.2))
+
+    def potion_scan(self, name, timeout=1.5):
+        """((x, y) of the card's centre, highlighted) of an inventory card on the open inventory, else None after `timeout` seconds."""
+        t0, want = time.time(), _norm_name(name)
+        while True:
+            try:
+                items, _n = self.inv_cards(self.inv_panel_rect())
+            except Exception:
+                items = []
+            for nm, r, bright in items:
+                if _norm_name(nm) == want:
+                    return ((r[0] + r[2]) / 2.0, (r[1] + r[3]) / 2.0), bool(bright)
+            if time.time() - t0 >= timeout:
+                return None
+            time.sleep(0.1)
+
+    def potion_inv_toggle(self, want):
+        """The ` key (the tool's own key press, so the hook doesn't see it): the tool's idea of 'inventory open' is set here."""
+        send_raw_scan(KB_SLOT_SCAN["inv"], False, False, TRAIN_TAG)
+        time.sleep(0.03)
+        send_raw_scan(KB_SLOT_SCAN["inv"], False, True, TRAIN_TAG)
+        self.inv_key_open, self.inv_key_t = bool(want), time.time()
+
+    def potion_press(self, name):
+        """A potion key was pressed (input thread: only starts a worker). Pressing it again while it works stops it."""
+        S = self.cfg["settings"]
+        try:
+            job = self.potion_job
+            if job is not None and job.running:
+                job.stop("stopped by you")
+                return
+            if not IS_WIN:
+                return
+            ent = next((e for e in inv_of(self.cfg) if e.get("potion") and _norm_name(e["name"]) == _norm_name(name)), None)
+            if ent is None:
+                self.q.put(("msg", f"Potion key: '{name}' isn't one of this profile's potions."))
+                return
+            name = ent["name"]
+            if not self.inv_have(name):
+                self.q.put(("msg", f"Potion key: teach the tool the {name} card first (Extras > Inventory > Learn)."))
+                return
+            left = self.tracker.potion_wait(time.time())
+            if left > 0.05:
+                self.q.put(("msg", f"Potions are on cooldown ({left:.0f}s left)"))
+                return
+            helmet = bool(S.get("helm_swap", True) and is_health_potion_name(name))
+            note = ""
+            if helmet and not self.inv_have(HELMET_CARD):
+                helmet, note = False, " (teach it your helmet to have it taken off: Extras > Inventory)"
+
+            def num(k, d):
+                try:
+                    return max(0.0, float(S.get(k, d)))
+                except (TypeError, ValueError):
+                    return d
+            step = num("potion_wait_ms", 100.0) / 1000.0
+            box = []
+
+            def done(why):
+                hs = box[0].helm_state if box else "-"
+                self.q.put(("msg", (f"Drank {name}." if why == "done" else f"Potion key: {why}")
+                            + (f" Helmet: {hs}." if helmet and hs != "-" else "")))
+            pd = PotionDrinker(
+                allowed=self.train_allowed, inv_open=lambda: self.inv_is_open(), step=step, drink_time=self.tracker.DRINK_TIME,
+                delays=self.potion_delays, note=lambda t: self.append_log("POTION KEY: " + t),
+                move_fn=lambda x, y: move_cursor(x, y, True),          # (the 1 px wiggle: the game notices the cursor on the card)
+                scan_fn=self.potion_scan, toggle_inv=self.potion_inv_toggle, neutral_fn=self.potion_neutral, cursor_fn=cursor_pos,
+                in_hand=lambda n: self.tracker.holding_potion(n, time.time()),
+                equip_fn=lambda n: self.q.put(("msg", self.tracker.equip_item(n, time.time()))),
+                drink_fn=lambda: self.q.put(("msg", self.tracker.click(time.time(), "left") or "")),
+                on_stop=lambda n, why: done(why))
+            box.append(pd)
+            self.potion_job = pd
+            pd.start({"name": name, "helmet": helmet, "need_bright": bool(S.get("helm_need_bright", False))})
+            if note:
+                self.q.put(("msg", f"Potion key: {name}{note}"))
+        except Exception as ex:
+            self.q.put(("msg", f"Potion key error: {type(ex).__name__}: {ex}"))
 
     def inv_start_learn(self, name):
         self.inv_learn = None if self.inv_learn == name else name
@@ -14232,6 +13988,9 @@ class App:
         tenths = self.cfg["settings"].get("tenths_under", 0)
         out = []
         for nm, r in self.inv_boxes:
+            if nm == HELMET_CARD:                                 # (the helmet card: its own border colour, no cooldown)
+                out.append((nm, r, "", clean_hex(self.cfg["settings"].get("helm_color")) or "#4aa8ff"))
+                continue
             if nm.startswith(BREW_PREFIX):
                 continue
             c = cds.get(_norm_name(nm))
@@ -14301,7 +14060,7 @@ class App:
                  "4. Select where you want to put the item in (Cauldron or Anvil)\n5. Select where the Wooden Spoon/Hammer is")
 
     def brew_recipe(self):
-        b = self.cfg.setdefault("brew", clean_brew(None))
+        b = _get_or_make(self.cfg, "brew", clean_brew)
         if b.get("active") not in b["recipes"]:
             b["active"] = next(iter(b["recipes"]))
         return b["recipes"][b["active"]]
@@ -14674,6 +14433,19 @@ class App:
             except Exception:
                 pass
 
+    def brew_delays(self):
+        """The click timing of the automation (Extras > Automation): (between clicks, after choosing an item, before the spoon,
+        after the cursor arrives, how long a click is held, after the spoon) in seconds. The potion keys click with the same numbers."""
+        S = self.cfg["settings"]
+
+        def num(k, d):
+            try:
+                return max(0.0, float(S.get(k, d)))
+            except (TypeError, ValueError):
+                return d
+        return (num("brew_click_ms", 100.0) / 1000.0, num("brew_pick_ms", 20.0) / 1000.0, num("brew_wait_s", 0.25),
+                num("brew_arrive_ms", 20.0) / 1000.0, num("brew_hold_ms", 5.0) / 1000.0, num("brew_after_s", 0.3))
+
     def toggle_brew(self):
         if self.brewer is not None and self.brewer.running:
             self.brewer.stop("stopped by you")
@@ -14692,16 +14464,7 @@ class App:
             self.say("Potion Brewer: click into the game first", "Game not active")
             return
 
-        def delays():
-            S = self.cfg["settings"]
-
-            def num(k, d):
-                try:
-                    return max(0.0, float(S.get(k, d)))
-                except (TypeError, ValueError):
-                    return d
-            return (num("brew_click_ms", 100.0) / 1000.0, num("brew_pick_ms", 20.0) / 1000.0, num("brew_wait_s", 0.25),
-                    num("brew_arrive_ms", 20.0) / 1000.0, num("brew_hold_ms", 5.0) / 1000.0, num("brew_after_s", 0.3))
+        delays = self.brew_delays
         self.brewer = Brewer(allowed=self.train_allowed, find_card=self.brew_card, delays=delays, inv_open=lambda: self.inv_is_open(),
                              move_fn=lambda x, y: move_cursor(x, y, bool(self.cfg["settings"].get("brew_nudge", False))),
                              on_stop=lambda n, why: self.q.put(("brew_stopped", n, why)))
@@ -15220,7 +14983,7 @@ class App:
             return
         for w in self.kb_body.winfo_children():
             w.destroy()
-        kb = self.cfg.setdefault("keybinds", clean_keybinds(None))
+        kb = _get_or_make(self.cfg, "keybinds", clean_keybinds)
         for slot, lab in KB_SLOTS:
             self._kb_row(lab, kb["map"].get(slot), ("slot", slot))
         for i, e in enumerate(kb["custom"]):
@@ -15257,7 +15020,7 @@ class App:
 
     def finish_kb_cap(self, kid, label):
         ref, self.kb_cap, self.inputs.kb_capture = self.kb_cap, None, None
-        kb = self.cfg.setdefault("keybinds", clean_keybinds(None))
+        kb = _get_or_make(self.cfg, "keybinds", clean_keybinds)
         if ref is not None and kid is not None:
             spec = {"id": int(kid), "label": str(label or "KEY")[:16]}
             if ref[0] == "slot":
@@ -15272,7 +15035,7 @@ class App:
 
     def kb_rclick(self, ref):
         now = time.time()
-        kb = self.cfg.setdefault("keybinds", clean_keybinds(None))
+        kb = _get_or_make(self.cfg, "keybinds", clean_keybinds)
         if self.kb_del[0] == ref and now < self.kb_del[1]:
             self.kb_del = (None, 0.0)
             if ref[0] == "slot":
@@ -15591,7 +15354,10 @@ class App:
 
     # ---------- Extras > Other Stuff > Checklist ----------
     def cl_data(self):
-        return self.cfg.setdefault("checklists", default_checklists())
+        cl = self.cfg.get("checklists")
+        if cl is None:                                             # (built only when it is missing: this runs about 60 times a second)
+            cl = self.cfg["checklists"] = default_checklists()
+        return cl
 
     def cl_by_id(self, lid):
         for l in self.cl_data()["lists"]:
@@ -15638,18 +15404,13 @@ class App:
         return False
 
     def fixed_scale(self, now=None):
-        """(left, bottom, k) of the game window: k = its height / 1080. The Auto Bard badge and the KDA counters are placed from the
+        """(left, bottom, k) of the game window: k = its height / 1080. The KDA counters are placed from the
         bottom-left corner of the game window with this, so they stay put (no mana bar / menu / HP changes move them)."""
         L, T, Wc, Hc = self._cl_client(time.time() if now is None else now)
         return L, T + Hc, max(0.3, Hc / 1080.0)
 
-    def bard_spot(self, now=None):
-        """Fixed place of 'Auto Bard is Active.' (x, y, scale)."""
-        L, B, k = self.fixed_scale(now)
-        return L + 12 * k, B - 168 * k, 1.33 * k
-
     def kda_follow_rect(self):
-        """Where the counters sit until you move them: fixed, under the Auto Bard badge (x, y, w, h)."""
+        """Where the counters sit until you move them: fixed, bottom left of the game (x, y, w, h)."""
         L, B, k = self.fixed_scale()
         sc = 1.33 * k
         return L + 8 * k, B - 108 * k, 280 * sc, int(24 * sc * 1.5) + 6
@@ -15705,7 +15466,7 @@ class App:
         save_cfg(self.cfg)
 
     def _kda_tick(self, now):
-        """Grip / Death / Assist / Knocked counters under the Auto Bard badge (only the ones ticked in Other Stuff > KDA)."""
+        """Grip / Death / Assist / Knocked counters at the bottom left of the game (only the ones ticked in Other Stuff > KDA)."""
         S = self.cfg["settings"]
         items = [(k, f"{lab} {int(S.get('kda_n_' + k, 0))}") for k, lab in KDA_ORDER if S.get("kda_" + k)]
         hidden_by_focus = (S.get("mana_only_focused", True) and self.mana_edit is None and now >= self.demo_until
@@ -17046,6 +16807,8 @@ class App:
             self.refresh()
         except Exception:
             self.append_log("UI ERROR:\n" + traceback.format_exc())
+        if getattr(self, "_perf", None) is not None:
+            self.perf_report(time.time())
         self.root.after(60, self.poll)
 
     def handle(self, item):
@@ -17067,6 +16830,9 @@ class App:
             return
         if kind == "gatecap":
             self.finish_gk_cap(item[1], item[2])
+            return
+        if kind == "potcap":
+            self.finish_pk_cap(item[1], item[2])
             return
         if kind == "gate_show":
             self.gate_show()
@@ -17399,21 +17165,6 @@ class App:
                 pass
             self._wd = (self.slot_scans, now)
 
-    def _bard_tick(self, now):
-        """'Auto Bard is Active.' + guitar under the mana bar for exactly as long as Auto Bard is running. Nothing else decides this:
-        not the game focus, not the mana-bar toggles, not a menu - it is drawn on top of everything else."""
-        try:
-            if not self.bard_on:
-                self.bard_badge.hide()
-                return
-            x, y, s = self.bard_spot(now)
-            self.bard_badge.show(x, y, s, self.num_family)
-            if now - getattr(self, "_bard_top", 0.0) > 0.5:
-                self._bard_top = now
-                self.bard_badge.raise_top()
-        except Exception as ex:
-            self.append_log(f"Auto Bard badge: {ex}")
-
     def _ac_tick(self, now):
         """'Autoclicker: ON / OFF' on the right of the game, shown while the Autoclicker setting is on and the game is in front."""
         try:
@@ -17439,7 +17190,6 @@ class App:
         self._ac_tick(now)
         if self.chat_open and not self.game_focused():
             self.chat_open = False                              # (left the game: the chat isn't being typed in)
-        self._bard_tick(now)
         self.hotbar_watchdog(now)
         k_ = (tuple(sorted(self.slot_cx)), int(now))
         if k_ != getattr(self, "_slot_note", None):
@@ -17672,8 +17422,6 @@ class App:
             pass
         self.hotbar.stop()
         try:
-            self.autobard.stop()
-            self.bard_badge.hide()
             self.ac_badge.hide()
         except Exception:
             pass
