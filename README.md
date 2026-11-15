@@ -10,7 +10,6 @@ A free, open-source overlay and helper for **Rogue Lineage** (Roblox) on Windows
 - **Mana overlay:** cast marks, mana % and dash / PB coins.
 - **Class and race pages:** per-profile options for Fischeran dodges, Whisperer double jump, Dragon Sage / Faceless dashes and others.
 - **Profiles:** save, share and import profiles with a share code. Default profiles for most classes are included.
-- **Auto Bard:** plays the song minigame while a song is being played. While it runs, **"Auto Bard is Active."** is always shown on screen. It cannot be hidden or moved.
 - **KDA counters:** Grip / Death / Assist / Knocked counters. Left click adds, right click subtracts. You can move and resize them.
 - **Instant Menu:** press a key (default `[`) and the mouse jumps to the game's Menu button and clicks it.
 - **Alchemy / Smith** and **Snap Training** automation.
@@ -33,7 +32,7 @@ pip install -r requirements.txt
 python CooldownIndicator.py
 ```
 
-Needs Python 3.10+ on Windows. `opencv-python` is only needed for Auto Bard and Instant Menu.
+Needs Python 3.10+ on Windows. `opencv-python` 
 
 ## Build the exe
 
@@ -42,13 +41,11 @@ Double-click `build_exe.bat` (see `README_BUILD.txt`). The exe appears in `dist\
 ## Known limits
 
 - Made and tested at **1920x1080**. Windowed mode and other resolutions are only partly supported.
-- Auto Bard's circle detection is tuned for 1080p fullscreen.
 - Cooldown timings are set by hand. If the game changes, edit them in the tool.
 
 ## Safety and fair use
 
 - The tool only **reads the screen** and **sends normal mouse / keyboard input**. It does not read or change game memory.
-- Auto Bard is added with the knowledge of a game moderator and always shows an on-screen notice while it is running.
 - Roblox and game rules can change. You are responsible for how you use this.
 
 ## Reporting problems
