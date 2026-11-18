@@ -30,7 +30,7 @@ Needs:    pip install mss numpy pillow keyboard      (Windows - run as administr
 Files:    scroom_assets.py must sit next to this file. Put Manufaktur.ttf next to it too (optional).
 """
 import uuid
-import collections, ast, subprocess, base64, ctypes, hashlib, urllib.request, zlib, glob, io, json, math, os, queue, re, sys, threading, time, traceback
+import collections, types, ast, subprocess, base64, ctypes, hashlib, urllib.request, zlib, glob, io, json, math, os, queue, re, sys, threading, time, traceback
 import urllib.error
 import http.client
 import tkinter as tk
@@ -50,6 +50,20 @@ if IS_WIN:
 import numpy as np
 import mss
 import keyboard
+
+
+def apply_grab_mode(layered=False):
+    """mss grabs the screen with BitBlt(SRCCOPY | CAPTUREBLT). CAPTUREBLT also copies the layered windows (and makes Windows take the mouse cursor / those windows
+    off the screen for a moment), which shows as the cursor (or the picture) blinking for a frame, about ten times a second the tool looks. Without it the grab
+    leaves the layered windows out (the tool's own boxes too) and nothing blinks. "grab_layered": true in the settings file brings the old way back."""
+    try:
+        import mss.windows as mw
+        if not hasattr(mw, "_CAPTUREBLT_ORIG"):
+            mw._CAPTUREBLT_ORIG = getattr(mw, "CAPTUREBLT", 0x40000000)
+        mw.CAPTUREBLT = mw._CAPTUREBLT_ORIG if layered else 0
+        return mw.CAPTUREBLT
+    except Exception:
+        return None
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
 import scroom_assets as ART
 pyaudio_error = ""
@@ -82,7 +96,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -95,6 +109,47 @@ VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
 # The hotbar's last two slots are found by their PLACE on the keyboard (scan codes 0x0C / 0x0D, the keys right of 0), not by what they type:
 # on a Turkish (and other non-US) layout the key at that place is not "-" / "=" (a Turkish keyboard has "?" there), so its virtual key differs.
 SCAN_HOTBAR = {0x0C: "-", 0x0D: "="}
+SCAN_HOTBAR_US = dict(SCAN_HOTBAR)
+
+
+def hotbar_layout_for(vk_of_scan):
+    """The scan-code -> hotbar-key map for the CURRENT keyboard layout. vk_of_scan(scan) = the layout's virtual key at that place.
+    The game's slots "-" and "=" follow what the keys TYPE, so the keys are found by that: the place whose virtual key is VK_OEM_MINUS (0xBD) is the "-"
+    slot and the place with VK_OEM_PLUS (0xBB) the "=" slot (US: the two right of 0; Finnish / Swedish / Norwegian / Danish: "+" right of 0 and "-" right of ".";
+    Turkish: "-" at the second place, and so on). A layout that has no such key keeps the usual place (0x0C / 0x0D) for what is missing."""
+    found = {}
+    try:
+        for sc in range(0x02, 0x36):                         # (the main block of the keyboard; the numpad has other scan codes and virtual keys)
+            vk = vk_of_scan(sc)
+            if vk == 0xBD and "-" not in found.values():
+                found[sc] = "-"
+            elif vk == 0xBB and "=" not in found.values():
+                found[sc] = "="
+    except Exception:
+        found = {}
+    for name, place in (("-", 0x0C), ("=", 0x0D)):
+        if name not in found.values():
+            for pl in (place, 0x0C if place == 0x0D else 0x0D):
+                if pl not in found:
+                    found[pl] = name
+                    break
+    return found
+
+
+def refresh_hotbar_layout(vk_of_scan=None):
+    """Re-reads the layout in place (SCAN_HOTBAR is shared, never rebound). Cheap: two lookups."""
+    try:
+        if vk_of_scan is None:
+            if not IS_WIN:
+                return
+            vk_of_scan = lambda sc: u32.MapVirtualKeyW(sc, 1)
+        new = hotbar_layout_for(vk_of_scan)
+        if new != SCAN_HOTBAR:
+            SCAN_HOTBAR.clear()
+            SCAN_HOTBAR.update(new)
+    except Exception:
+        pass
+
 
 
 def hotbar_scan_name(scan, flags=0):
@@ -162,6 +217,8 @@ DEFAULT_SETTINGS = {
     "cast_run": True,        # Cast Run: casting a held spell (left click) while running does W up, W down, W up, click, W down so the run is not lost
     "cast_run_lock": 1.0,    # seconds after a Cast Run in which clicks on the same spell are dismissed (0 = no lock)
     "ahk_chat_suspend": True,   # while the Roblox chat is typed in, your own AutoHotkey scripts are paused (File > Suspend Hotkeys)
+    "grab_layered": False,   # hidden: true = the screen grab also copies layered windows (CAPTUREBLT): can make the mouse cursor / screen blink for a frame
+    "gate_mode": "popup",    # Gate (Extras): "popup" = the boxes come up on a right click with a Gate spell, "off", "shortcut" = type d / f / df / c / t / s and a number (the Gate keybinds work in every mode)
     "gate_cd": 6.5,          # Snap Gate: the cooldown (seconds) that starts when Enter is pressed
     "vir_key": "m2",         # Viribus (a Normal Spell with the blue name box): this key / mouse button casts it (left click), waits, then holds F ("m2" = right click)
     "vir_key_label": "Right click",
@@ -175,13 +232,17 @@ DEFAULT_SETTINGS = {
     "autoclick": False,      # Autoclicker (AutoClick.ahk): holding the left mouse button in the game clicks every 30 ms; off while a spell is held
     "autoclick_key": "m3",   # the key / mouse button that pauses and resumes the Autoclicker ("m3" = middle mouse, "m4" / "m5" = side buttons, "vk:n" = a keyboard key)
     "autoclick_key_label": "M3",
-    "block_run": True,       # Block Run (all-directional, from the AutoHotkey script): double-tap / hold-W run with W A S D, dash, G and F blocking
+    "block_run": True,       # Block Run: hold W and press F = W up, W down, W up, F down, W down (with all_dir_run on: the all-directional AutoHotkey script instead; F blocks there)
+    "all_dir_run": True,     # All directional run: with Block Run = the all-directional script (double-tap / hold W A S D run, dash, F blocking); with Cast Run = casting keeps you running in any direction
     "climb_window": 0.5,     # two Space presses this close together AND a climbing-speed mana drain = climbing (Block Run is off until Space is pressed again)
     "always_show": False,    # never hide the cooldown boxes / coins just because the game's HP bar isn't recognised (menus / loading included)
     "inv_equip": True,       # clicking a known item (Fire Protection, ...) in the inventory = equipping it
     "potion_cd": 6.0,             # every potion: this long a cooldown for ALL potions, from the moment a drink is finished
     "potion_keys": {"Feather Feet": {"id": 0x15, "label": "Y"}, "Fire Protection": {"id": 0x16, "label": "U"},
                     "Health Potion": {"id": 0x23, "label": "H"}},            # a key per potion: potion name -> {"id", "label"} (opens the inventory, drinks it, closes the inventory again)
+    "kb_accept_injected": True,   # keybinds also take keys that another program sends (mouse software of a 12-button mouse: Razer Synapse, Logitech G Hub...)
+    "kb_inj_v2": False,           # (set once: the option above became ON by default - an older saved "off" is switched on one time)
+    "inv_keys": {},               # a key per inventory item (nothing is bound by default): item name -> {"id", "label"} (opens the inventory, equips the item, closes it)
     "helm_swap": True,            # a Health Potion key takes the helmet off first and puts it back on after the drink
     "helm_color": "#4aa8ff",      # the helmet card's own border (shown on the open inventory)
     "helm_need_bright": False,    # only take the helmet off when its card is highlighted (= worn); off = a seen helmet card is always clicked
@@ -286,11 +347,11 @@ CHARGE_LIFETIME = 30.0      # a Charge is forgotten this many seconds after it w
 # the same 5 s limit. For both, the cooldown starts DIVE_CD_DELAY seconds after you come back down / up.
 BLADE_CRASH_NAME = "blade crash"
 DIVE_CD_DELAY = 1.0
-# WITHSTAND works like Rift Dive: the first click puts you in a stance for 3 s (a click ends it early), then the move goes on cooldown (8 s unless a
-# cooldown is typed in its box). The autoclicker stays off while it is in your hand.
+# WITHSTAND works like Rift Dive: the first click puts you in a stance for 2 s (a click ends it early), then the move goes on cooldown (6 s, fixed).
+# The autoclicker clicks ONCE when you switch to it while holding the button (that click starts the stance), then waits until you switch away.
 WITHSTAND_NAME = "withstand"
-WITHSTAND_MAX = 3.0         # seconds the stance lasts when you don't end it
-WITHSTAND_CD = 8.0          # its cooldown when the move's box is blank
+WITHSTAND_MAX = 2.0         # seconds the stance lasts when you don't end it (fixed)
+WITHSTAND_CD = 6.0          # its cooldown (fixed: a cooldown typed in the move's box is not used)
 WITHSTAND_LOCK = 0.25       # a click in the first moments of the stance can't end it (spam failsafe, shorter than Rift Dive's)
 # VANGUARD: "Azure Ignition" (a left click, like a Charge) turns on the Azure variants of Brandish, Puncture and
 # Blade Crash. While it is on, using one of those moves puts the typed Azure cooldown on the move's slot in the blue
@@ -303,6 +364,7 @@ AZURE_BASE = {"brandish": "Brandish", "puncture": "Puncture", "blade crash": "Bl
 # becomes Violent Slash (same cooldown) and Needle's Eye becomes Threading Needle (its own cooldown, shared with Needle's Eye). Using either
 # one ends Soul Mode and The Soul is gone.
 THE_SOUL_NAME, THE_SOUL_CD = "the soul", 30.0
+INK_BLOT_NAME, INK_BLOT_CD = "ink blot", 12.0          # Desendra's Ink Blot: a move with a fixed 12 s cooldown (whatever is typed in its box)
 SOUL_MODES = (("threading needle", "Threading Needle"),)
 SNARVINDUR_NAME = "snarvindur"
 AZURE_LIFETIME = 30.0       # Azure Ignition is forgotten this many seconds after it was activated
@@ -422,6 +484,10 @@ def is_the_soul(name):
     return _norm_name(name) == THE_SOUL_NAME
 
 
+def is_ink_blot(name):
+    return _norm_name(name) == INK_BLOT_NAME
+
+
 def is_elegant_slash(name):
     return _norm_name(name) == "elegant slash"
 
@@ -443,7 +509,7 @@ def ensure_snarv_pair(cfg, snap):
     if any(m["key"] == snap["key"] and not m.get("ininv") for m in lst):
         return False
     lst.append({"key": snap["key"], "name": "Snarvindur", "cd": 0.0, "cd2": 0.0, "split": False, "unequip": False, "spell": True})
-    lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+    lst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"])))
     return True
 
 
@@ -539,6 +605,8 @@ def clean_moves(moves, m2=False):
                 d["zero"] = True                           # the cooldown box says 0 (not blank): a move without a cooldown, no weapon
             if m2 and is_decompose(nm) and not d.get("spell"):
                 d["cd2"], d["split"] = DECOMPOSE_M2, True     # Decompose: M2 is always 31 s, and M1 / M2 never share a cooldown
+            if m2 and is_ink_blot(nm) and not d.get("spell"):
+                d["cd"] = INK_BLOT_CD                      # Ink Blot: always 12 s
             if m2 and is_the_soul(nm) and not d.get("spell") and d["cd"] <= 0:
                 d["cd"] = THE_SOUL_CD                      # The Soul: 30 s unless the user typed another number
             if m2 and is_soul_name(nm) and not d.get("spell"):
@@ -625,9 +693,10 @@ def read_share_code(code):
 
 
 # The default profiles that come with a version. DEFAULT_PACK_CODE is a share code (Profile > Share > "all profiles") of the profiles
-# every user should have. The FIRST time a config that hasn't got this DEFAULT_PACK_VERSION yet is opened (an old config after
-# an update, or a brand-new one), the profiles of the code whose names are missing are added - nothing that exists is ever
-# changed, and the active profile stays. Raise DEFAULT_PACK_VERSION whenever the code changes so everyone gets the new ones once.
+# every user should have. The FIRST time a config that has had NO pack yet is opened (an old config after an update, or a brand-new
+# one), the profiles of the code whose names are missing are added - ONCE: a config that has any pack version recorded (1.2.0, or
+# whatever it was when it got the pack) never gets them again, in any later version. Nothing that exists is ever
+# changed, and the active profile stays. DEFAULT_PACK_VERSION is only written into the config as the 'got the pack' marker.
 DEFAULT_PACK_VERSION = "1.2.0"
 DEFAULT_PACK_CODE = (
     "CDI1-eNrtWd9P4zgQ_lcsv9xLhNJCyw_pHmihC7fdAzVoeUA8uImbWHXtyHHodRH_-804Ldt2IU5Z7WkF9wC0Yca_vm--GU8e6QM"
@@ -652,12 +721,22 @@ DEFAULT_PACK_CODE = (
 )
 
 
+# More default profiles, added later: (pack id, (share codes)). Each id is applied once per config (see merge_extra_packs). To change one of
+# these profiles later, put its new share code into a NEW pack with a new id: configs where it was never changed get the update.
+DEFAULT_EXTRA_PACKS = (
+    ("1.3.3", (
+        "CDI1-eNqFkj9vgzAQxb-KdbMVQVKQylapY4eqDJUaMVzgwFaME_lP0gjlu_ecJlGHJB2wz4_fO44HE-ygyiVsoVpOYKGCV-oxmiBq1Db4_cZZkDDy7SXkXOE3gcxmmVzw1aPx9Hdt5BLmTH0Rmk304i3agfm8mBUn003Dgg31qMO_4FMCWwxK20HUwel1sswfWQq2vPAMRnzgAeQ8m5X34ZLhTx2UD2g7kCVzd9lnZt9xpz2PUGaPyCyRmz05UUc3nNO7TTcSPCfN2_p3a6GaIKhoO3JQJRPsFScleu3oLPQGx0ut20u1cvwO2qvzcRttG-LVszLYkWgdXgEewJAVRg8qWM6X_4qMg4UO3fr0BLGKzgeWyyTrccvduMOBwzKs5qlJUI6wS1_HEnWGTnpxPDbHHweEu6s",
+        "CDI1-eNp9kc1uwjAQhF_F2rOFSGkQza0_Uq-VOPSAOJh4E1sYBznr0grx7p1QQK1EOSReT75Zb8Z7-qCq0LSlarGnSBW9cGNyEPUUus4GFuFEmjb4vqAC1eMnkx6PxnqCpzGh59_vpV7QHajnLkc4xaVuR7qYjcqj5yo_Af-asm3RuJiC-pe8BzmvjTgfWzWX5NeD5e5W8xKWP79SlLdOmAF_9-J6MdGSvjnNA9i3bsdJzXNqT6lcp5eaeiSIZf2z1FTtSVyOFjNVg4l2zgurxic-CU0wm3Pt63O1SpjM9-603eZYS754VsFYVnUyFwADBI4q-NZJRG647jECI2vS-niCWuXUC-TpIPvNFt3Q4QsRBKjF0AT3yMYOqUdmRHnUy8NhefgGNEGxEg",
+    )),
+)
+
+
 def merge_default_pack(cfg, code=None, version=None):
     """Adds the default pack's missing profiles to cfg (see above). Returns the names added ([] when nothing / already done)."""
     code = DEFAULT_PACK_CODE if code is None else code
     version = DEFAULT_PACK_VERSION if version is None else version
-    if not code or cfg.get("pack") == version:
-        return []
+    if not code or cfg.get("pack"):
+        return []                                            # (a config that has had the pack - from ANY version - never gets it again)
     try:
         items = read_share_code(code)
         opts = read_share_opts(code)
@@ -670,15 +749,168 @@ def merge_default_pack(cfg, code=None, version=None):
         if name.strip().lower() in taken:
             continue                                         # you already have a profile with that name: yours stays untouched
         taken.add(name.strip().lower())
-        cfg["profiles"][name] = moves
-        cfg["snaps"][name] = snaps
-        cfg["marks"][name] = marks
-        cfg["charged"][name] = charged
-        cfg["popts"][name] = dict(default_popts(), **(opts[i] if i < len(opts) else {}))
-        cfg["inv"][name] = invs[i] if i < len(invs) else clean_inv(None)
+        _put_pack_profile(cfg, name, moves, snaps, marks, charged, opts[i] if i < len(opts) else {}, invs[i] if i < len(invs) else None)
+        cfg.setdefault("pack_fp", {})[name] = profile_fp(cfg, name)
         added.append(name)
     cfg["pack"] = version
     return added
+
+
+def _put_pack_profile(cfg, name, moves, snaps, marks, charged, opt, inv):
+    cfg["profiles"][name] = moves
+    cfg["snaps"][name] = snaps
+    cfg["marks"][name] = marks
+    cfg["charged"][name] = charged
+    cfg["popts"][name] = dict(default_popts(), **(opt or {}))
+    cfg["inv"][name] = inv if inv is not None else clean_inv(None)
+
+
+def profile_fp(cfg, name):
+    """A fingerprint of a profile as it is now (moves, snap spells, marks, charged cooldowns, options, inventory): a default profile whose fingerprint
+    still matches the one saved when the tool added it was never changed by the player."""
+    try:
+        parts = [cfg[k].get(name) for k in ("profiles", "snaps", "marks", "charged", "popts", "inv")]
+        return hashlib.sha1(json.dumps(parts, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    except Exception:
+        return ""
+
+
+def merge_extra_packs(cfg, packs=None):
+    """The extra default packs (DEFAULT_EXTRA_PACKS): each pack id is applied ONCE per config, also to configs that got the first pack long ago.
+    A profile that is missing is added. A profile of the same name that the tool added earlier and the player never changed (its fingerprint still
+    matches) is replaced by the new version of it. One the player changed stays as it is, and the new one is added next to it as 'Name (pack id)'.
+    A profile of that name the player made himself is never touched. Returns what was done, for the log."""
+    packs = DEFAULT_EXTRA_PACKS if packs is None else packs
+    done = cfg.setdefault("packs_done", [])
+    fps = cfg.setdefault("pack_fp", {})
+    out = []
+    for pid, codes in packs:
+        if pid in done:
+            continue
+        for code in ([codes] if isinstance(codes, str) else codes):
+            try:
+                items, opts, invs = read_share_code(code), read_share_opts(code), read_share_inv(code)
+            except ValueError:
+                continue
+            for i, (name, moves, snaps, marks, charged) in enumerate(items):
+                opt, inv = (opts[i] if i < len(opts) else {}), (invs[i] if i < len(invs) else None)
+                have = next((n for n in cfg["profiles"] if n.strip().lower() == name.strip().lower()), None)
+                seen = cfg.setdefault("pack_seen", {})
+                if have is None:
+                    _put_pack_profile(cfg, name, moves, snaps, marks, charged, opt, inv)
+                    fps[name] = profile_fp(cfg, name)
+                    seen[name] = sorted(_pack_names(moves, snaps, inv))
+                    _record_pack_cds(cfg, name, moves, snaps, inv)
+                    out.append(name)
+                    continue
+                if have not in fps:
+                    continue                                 # (the player's own profile, or one from before the tool kept fingerprints: untouched)
+                if profile_fp(cfg, have) == fps[have]:
+                    _put_pack_profile(cfg, have, moves, snaps, marks, charged, opt, inv)      # never changed: updated in place
+                    fps[have] = profile_fp(cfg, have)
+                    seen[have] = sorted(_pack_names(moves, snaps, inv))
+                    _record_pack_cds(cfg, have, moves, snaps, inv)
+                    out.append(have + " (updated)")
+                else:
+                    nc = _update_pack_cds(cfg, have, moves, snaps, inv)          # changed by the player: the cooldowns he did not change himself follow the pack ...
+                    if nc:
+                        out.append(f"{have} ({nc} cooldown(s) updated)")
+                    n = _add_new_pack_moves(cfg, have, moves, snaps, inv, set(seen.get(have, [])))   # ... and only the NEW moves are added, into the inventory
+                    seen[have] = sorted(set(seen.get(have, [])) | _pack_names(moves, snaps, inv))
+                    if n:
+                        out.append(f"{have} (+{n} new)")
+        done.append(pid)
+    if out:
+        sync_inv_links(cfg)                                  # (the new inventory moves get their entries)
+    return out
+
+
+def _cd_vals(m):
+    """(cooldown, M2, split) of a move / snap spell / inventory entry, for comparing."""
+    return (round(float(m.get("cd") or 0.0), 4), round(float(m.get("cd2") or 0.0), 4), bool(m.get("split")))
+
+
+def _pack_cd_map(moves, snaps, inv):
+    out = {}
+    for m in list(moves) + list(snaps):
+        nm = _norm_name(m.get("name", ""))
+        if nm:
+            out[nm] = _cd_vals(m)
+    for e in (inv or []):
+        nm = _norm_name(e.get("name", ""))
+        if nm and not e.get("builtin") and not e.get("potion") and not e.get("link"):
+            out[nm] = _cd_vals(e)
+    return out
+
+
+def _record_pack_cds(cfg, name, moves, snaps, inv):
+    """Remembers the cooldowns the pack delivered for a profile, so a later pack can tell which ones the player changed himself."""
+    cfg.setdefault("pack_cds", {})[name] = {k: list(v) for k, v in _pack_cd_map(moves, snaps, inv).items()}
+
+
+def _update_pack_cds(cfg, name, moves, snaps, inv):
+    """A profile the player changed: the cooldowns (cooldown, M2, split) of the moves it holds are brought to the new pack's values - EXCEPT the
+    ones the player changed himself since the pack delivered them (those stay). Returns how many were changed."""
+    new = _pack_cd_map(moves, snaps, inv)
+    rec = cfg.setdefault("pack_cds", {}).get(name) or {}
+    items = [m for m in cfg["profiles"].get(name, []) + cfg["snaps"].get(name, [])]
+    items += [e for e in cfg["inv"].get(name, []) if not e.get("builtin") and not e.get("potion") and not e.get("link")]
+    n = 0
+    for m in items:
+        nm = _norm_name(m.get("name", ""))
+        if nm not in new:
+            continue
+        cur, want = _cd_vals(m), new[nm]
+        if cur == want:
+            continue
+        if nm in rec and tuple(rec[nm]) != cur:
+            continue                                         # (he changed this one himself: it stays)
+        m["cd"] = want[0]
+        if "cd2" in m or want[1]:
+            m["cd2"] = want[1]
+        if "split" in m or want[2]:
+            m["split"] = want[2]
+        n += 1
+    cfg["pack_cds"][name] = {k: list(v) for k, v in new.items()}
+    return n
+
+
+def _pack_names(moves, snaps, inv):
+    """The normalised names of everything a pack profile holds (hotbar moves, snap spells, inventory moves)."""
+    names = {_norm_name(m.get("name", "")) for m in list(moves) + list(snaps)}
+    names |= {_norm_name(e.get("name", "")) for e in (inv or []) if not e.get("builtin") and not e.get("potion")}
+    names.discard("")
+    return names
+
+
+def _add_new_pack_moves(cfg, name, moves, snaps, inv, delivered):
+    """A profile the player changed gets the moves of the new pack version it never had: put into the INVENTORY (white key box, like a move added
+    when all 12 slots are taken), under the hotbar moves, so no slot of the player's own layout is taken. What the pack delivered before and the
+    player removed is not brought back. Returns how many were added."""
+    have = _pack_names(cfg["profiles"].get(name, []), cfg["snaps"].get(name, []), cfg["inv"].get(name, []))
+    have |= {_norm_name(e.get("name", "")) for e in cfg["inv"].get(name, [])}
+    n = 0
+    for src, dst in ((moves, cfg["profiles"].setdefault(name, [])), (snaps, cfg["snaps"].setdefault(name, []))):
+        for m in src:
+            nm = _norm_name(m.get("name", ""))
+            if not nm or nm in have or nm in delivered or not can_be_in_inventory(m):
+                continue
+            d = dict(m)
+            d["ininv"] = True
+            d.pop("iid", None)
+            dst.append(d)
+            have.add(nm)
+            n += 1
+        dst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"]) if m.get("key") in HOTBAR_KEYS else 99))
+    inv_l = cfg["inv"].setdefault(name, clean_inv(None))
+    for e in (inv or []):
+        nm = _norm_name(e.get("name", ""))
+        if e.get("builtin") or e.get("potion") or e.get("link") or not nm or nm in have or nm in delivered:
+            continue
+        inv_l.append({k: v for k, v in e.items() if k != "link"})
+        have.add(nm)
+        n += 1
+    return n
 
 
 def read_share_opts(code):
@@ -866,7 +1098,10 @@ def clean_marks(marks):
             lo = max(0.0, hi - 0.5)
         if not (len(col) == 7 and col[0] == "#" and all(c in "0123456789abcdefABCDEF" for c in col[1:])):
             col = MARK_COLORS[kind]
-        out.append({"key": key, "kind": kind, "lo": round(lo, 2), "hi": round(hi, 2), "color": col.lower()})
+        mk = {"key": key, "kind": kind, "lo": round(lo, 2), "hi": round(hi, 2), "color": col.lower()}
+        if m.get("pin") is True:
+            mk["pin"] = True                                  # right-clicked in the Mana Overlay tab: the mark stays on the bar, spell in hand or not
+        out.append(mk)
     return out
 
 
@@ -2064,6 +2299,16 @@ def load_cfg():
                     cfg["settings"][k] = True if k in ALWAYS_ON else v      # (ALWAYS_ON: these used to be switches, a saved "off" is ignored)
     except Exception:
         pass
+    if cfg["settings"].get("gate_mode") not in GATE_MODES:
+        cfg["settings"]["gate_mode"] = "popup"
+    try:
+        sv = data.get("settings") if isinstance(data, dict) else None
+        if isinstance(sv, dict) and "gate_mode" not in sv and sv.get("gate_popup") is False:
+            cfg["settings"]["gate_mode"] = "off"                         # (an earlier version had a tick box for the boxes: its "off" carries over)
+    except Exception:
+        pass
+    if not cfg["settings"].get("kb_inj_v2"):
+        cfg["settings"]["kb_accept_injected"], cfg["settings"]["kb_inj_v2"] = True, True       # (one time: ON by default; the user can still turn it off)
     if not str(cfg["settings"].get("update_base") or "").strip():
         cfg["settings"]["update_base"] = UPDATE_BASE_URL      # (an old config saved it empty: use the built-in link)
     if cfg["active"] not in cfg["profiles"]:
@@ -2083,8 +2328,13 @@ def load_cfg():
     pin = data.get("pinned") if isinstance(data, dict) else None
     cfg["pinned"] = [n for n in dict.fromkeys(str(x) for x in pin) if n in cfg["profiles"]] if isinstance(pin, list) else []   # pinned profiles (top of the dropdown)
     cfg["pack"] = str(data.get("pack") or "") if isinstance(data, dict) else ""
-    first_run = cfg["pack"] != DEFAULT_PACK_VERSION        # the first start of this version
+    pd_ = data.get("packs_done") if isinstance(data, dict) else None
+    cfg["packs_done"] = [str(x) for x in pd_] if isinstance(pd_, list) else []
+    pf_ = data.get("pack_fp") if isinstance(data, dict) else None
+    cfg["pack_fp"] = {str(k): str(v) for k, v in pf_.items() if str(k) in cfg["profiles"]} if isinstance(pf_, dict) else {}
+    first_run = not cfg["pack"]                            # the first start that gets the pack (once: a config that has any pack version recorded never gets it again)
     added = merge_default_pack(cfg)                        # the default profiles of this version, once
+    added = list(added) + merge_extra_packs(cfg)           # the extra packs (each id once)
     if first_run:
         cfg["settings"]["opacity"] = 0.3                   # 1.2.0: everyone's Red Box Strength starts at 0.3 (changeable afterwards)
         cfg["pack"] = DEFAULT_PACK_VERSION                 # (saved with the next save: until then the same thing happens again, which changes nothing)
@@ -2458,6 +2708,8 @@ class Tracker:
                 return None
             d = {"key": key, "name": e["name"], "cd": float(e.get("cd") or 0.0), "cd2": float(e.get("cd2") or 0.0),
                  "split": bool(e.get("split")), "unequip": False, "inv": True}
+            if is_ink_blot(e["name"]):
+                d["cd"] = INK_BLOT_CD
             if is_soul_name(e["name"]):
                 d["soul"] = True
             if is_awk_name(e["name"]):
@@ -2571,6 +2823,10 @@ class Tracker:
         mv = self.move_for(key)
         return bool(mv) and is_withstand(mv.get("name"))
 
+    def is_withstand_key(self, key):
+        mv = self.move_for(key)
+        return bool(mv) and is_withstand(mv.get("name"))
+
     def is_spell(self, key):
         """A key is a SPELL when it has a snap spell or a cast mark on the mana bar (spells need no weapon).
         A spell stays armed after it is cast, like a weapon does."""
@@ -2613,6 +2869,12 @@ class Tracker:
                 self.dive = (b if self.dive[0] == a else a,) + self.dive[1:]
             if self.armed and self.armed[0] in (a, b):
                 self.armed = None                # "armed" meant the key that was pressed, not the move
+
+    def holding_spell(self, now):
+        """A SPELL is in hand (armed): some spells drain the mana slowly while they are held, which is no climbing."""
+        with self.lock:
+            a = self._live_armed(now)
+            return bool(a and self.is_spell(a[0]))
 
     def armed_key(self, now):
         """The key that is armed right now (or None)."""
@@ -3311,8 +3573,8 @@ class Tracker:
         akind = azure_kind(mv.get("name")) if mv else None
         cd = (self._azure_cd(akind) if variant else float(mv.get("cd") or 0.0)) if mv else 0.0
         ws = bool(mv) and is_withstand(mv.get("name"))
-        if ws and cd <= 0:
-            cd = WITHSTAND_CD
+        if ws:
+            cd = WITHSTAND_CD                               # (fixed: 6 s whatever is typed in the box)
         start = at + (0.0 if ws else DIVE_CD_DELAY)     # the cooldown starts a moment after you are back (Withstand: at once)
         if cd > 0:
             if variant:
@@ -3566,6 +3828,8 @@ class Tracker:
         ign = is_azure_ignition(mv.get("name"))
         akind = azure_kind(mv.get("name"))
         cd = float(mv.get("cd") or 0.0)
+        if is_ink_blot(mv.get("name")) and not mv.get("spell"):
+            cd = INK_BLOT_CD                 # Ink Blot: always 12 s, whatever the move's box says
         tsoul = is_the_soul(mv.get("name")) and not mv.get("spell")
         if tsoul and cd <= 0:
             cd = THE_SOUL_CD                 # The Soul: 30 s unless the move's box says otherwise
@@ -4458,7 +4722,7 @@ WH_KEYBOARD_LL, WH_MOUSE_LL = 13, 14
 WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_QUIT = 0x100, 0x101, 0x104, 0x105, 0x12
 WM_LBUTTONDOWN, WM_RBUTTONDOWN = 0x201, 0x204
 WM_LBUTTONUP, WM_RBUTTONUP, WM_MOUSEWHEEL = 0x202, 0x205, 0x20A
-WM_MBUTTONDOWN, WM_XBUTTONDOWN = 0x207, 0x20B
+WM_MBUTTONDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WM_MBUTTONUP = 0x207, 0x20B, 0x20C, 0x208
 
 
 def hwnd_of(tkwin):
@@ -4498,10 +4762,39 @@ def ctrl_down():
 
 
 def make_click_through(hwnd):
-    """Click-through + no taskbar button + never takes focus from the game."""
+    """Click-through + no taskbar button + never takes focus from the game. (Only written when something is missing: rewriting the style of a layered
+    window every second makes Windows redo it - and the mouse cursor can blink.)"""
     ex = u32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    u32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TRANSPARENT
-                       | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+    want = ex | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+    if want != ex:
+        u32.SetWindowLongW(hwnd, GWL_EXSTYLE, want)
+
+
+def needs_raise(hwnd):
+    """False while an overlay is still on top, so the once-a-second 'stay above the game' does nothing: a topmost window can only be covered by a
+    visible topmost window of another program that sits above it. (Raising every overlay every second shuffled them above each other all the time -
+    one of the things that can make the mouse cursor blink.)"""
+    if not IS_WIN:
+        return True
+    try:
+        if not (u32.GetWindowLongW(hwnd, GWL_EXSTYLE) & 0x00000008):                 # WS_EX_TOPMOST lost: raise
+            return True
+        pid = os.getpid()
+        cur = u32.GetWindow(hwnd, 3)                                                  # GW_HWNDPREV: the window above
+        for _ in range(60):
+            if not cur:
+                return False
+            if not (u32.GetWindowLongW(cur, GWL_EXSTYLE) & 0x00000008):               # (below the topmost ones nothing can cover us)
+                return False
+            if u32.IsWindowVisible(cur):
+                p = wintypes.DWORD(0)
+                u32.GetWindowThreadProcessId(cur, ctypes.byref(p))
+                if p.value != pid:
+                    return True                                                       # a visible topmost window of another program is above us
+            cur = u32.GetWindow(cur, 3)
+        return False
+    except Exception:
+        return True
 
 
 def is_roblox_window(h):
@@ -5162,6 +5455,29 @@ class AudioListener:
         self.stream = self.pa = None
 
 
+def set_thread_priority(level):
+    """Windows thread priority of the CALLING thread (2 = highest, 1 = above normal, -1 = below normal). The thread that catches the keys and
+    clicks gets the CPU before anything else; the threads that look at the screen give way to it."""
+    if not IS_WIN:
+        return
+    try:
+        k32.GetCurrentThread.restype = wintypes.HANDLE
+        k32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        k32.SetThreadPriority(k32.GetCurrentThread(), int(level))
+    except Exception:
+        pass
+
+
+HOOK_STALE_S = 1.5                       # input seen by Windows this long after the hooks' last call = the hooks were dropped (they are put back)
+
+
+def hooks_stale(hb, last_input, now, last_fix, backoff):
+    """True when Windows has seen keyboard / mouse input that the hooks never reported: the hooks were silently removed (Windows does that to a
+    hook that is too slow once). hb = when a hook last ran, last_input = when Windows last saw input (same clock), last_fix = the last re-install.
+    `backoff` keeps this from re-installing all the time when the game is an elevated window the hooks can't see into."""
+    return bool(last_input - hb > HOOK_STALE_S and now - last_fix >= backoff and now - last_input < 3.0)
+
+
 def precise_sleep(sec):
     """time.sleep is only accurate to ~15 ms on Windows: sleep most of it, spin the last 2 ms."""
     if sec <= 0:
@@ -5380,10 +5696,29 @@ def screenshot_png(rect=None):
 
 
 # ---------------- Gate: the shortcut boxes next to the game's gate prompt, pinned gates, gate keybinds ----------------
-GATE_BASE = ("Sigil", "Skycastle", "Snail")                                    # pinned by default
+GATE_MODES = ("popup", "off", "shortcut", "both")                                      # Extras > Gate: the boxes on a right click / nothing / letters + a number
+GATE_MODE_LABEL = {"popup": "POP-UP", "off": "OFF", "shortcut": "SHORTCUT", "both": "BOTH"}
+GATE_LETTERS = {"d": "Desert", "f": "Forest", "df": "Deepforest", "c": "Canyon", "t": "Tundra", "s": "Shore"}     # SHORTCUT: letters, then a number
+GATE_LETTER_VK = {0x44: "d", 0x46: "f", 0x43: "c", 0x54: "t", 0x53: "s"}
+GATE_LETTER_JOIN = 0.6                                                         # (letters this close together are one: d + f = df)
+GATE_LETTER_TTL = 1.5                                                          # (a number this soon after the last letter picks that area)
+
+
+def gate_shortcut_pick(buf, num):
+    """The gate for the letters typed (buf: 'd', 'f', 'df', also with other letters before) and the number: the longest ending that names an area,
+    and only a number that area has. None when not."""
+    for n in range(min(2, len(buf)), 0, -1):
+        area = GATE_LETTERS.get(buf[-n:])
+        if area:
+            return f"{area} {num}" if 1 <= num <= dict(GATE_AREAS).get(area, 0) else None
+    return None
+
+
+GATE_BASE = ("Sigil", "Skycastle", "Snail", "Counts")                            # pinned by default
+GATE_BASE_OLD = ("Sigil", "Skycastle", "Snail")                                 # (before Counts was added: a config still holding exactly these gets Counts once)
 GATE_AREAS = (("Forest", 5), ("Desert", 5), ("Deepforest", 5), ("Shore", 4), ("Tundra", 7), ("Canyon", 9))     # the boxes on the right, in this order
 GATE_PAGE_ORDER = ("Desert", "Forest", "Shore", "Tundra", "Deepforest", "Canyon")                          # the order of the "Unpinned Gates Location" list
-GATE_RANDOM = ("Sigil", "Skycastle", "Snail", "Deepforest", "Forest", "Tundra", "Shore", "Desert", "Canyon")     # the random gate picks one of these
+GATE_RANDOM = ("Sigil", "Skycastle", "Snail", "Counts", "Deepforest", "Forest", "Tundra", "Shore", "Desert", "Canyon")     # the random gate picks one of these
 GATE_ICON_PNG = "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"
 
 
@@ -5412,23 +5747,27 @@ GATE_ALL = tuple(gate_all())
 
 
 def clean_gates(data):
-    """{"pinned": [gate names], "keys": {gate name: {"id", "label"}}, "rand": {"id", "label"} | None}."""
-    out = {"pinned": list(GATE_BASE), "keys": {}, "rand": dict(GATE_RAND_KEY)}
+    """{"pinned": [gate names], "keys": {gate name: {"id", "label"}}, "rand": {"id", "label"} | None, "count_seen": True}."""
+    out = {"pinned": list(GATE_BASE), "keys": {}, "rand": dict(GATE_RAND_KEY), "count_seen": True}
     if not isinstance(data, dict):
         return out
     if isinstance(data.get("pinned"), list):
         seen = []
         for n in data["pinned"]:
+            n = "Counts" if n == "Count" else n                       # (the gate used to be called Count)
             if isinstance(n, str) and n in GATE_ALL and n not in seen:
                 seen.append(n)
+        if data.get("count_seen") is not True and tuple(seen) == GATE_BASE_OLD:
+            seen.append("Counts")                                     # (Counts is pinned by default now: once, for a config that still has the three old defaults)
         out["pinned"] = seen
     if isinstance(data.get("keys"), dict):
         for n, d in data["keys"].items():
-            k = _clean_key(d) if isinstance(d, dict) else None
+            n = "Counts" if n == "Count" else n
+            k = _clean_key(d, True) if isinstance(d, dict) else None
             if n in GATE_ALL and k:
                 out["keys"][n] = k
     if "rand" in data:
-        out["rand"] = _clean_key(data["rand"]) if isinstance(data.get("rand"), dict) else None
+        out["rand"] = _clean_key(data["rand"], True) if isinstance(data.get("rand"), dict) else None
     return out
 
 
@@ -5802,7 +6141,7 @@ class PotionDrinker(Brewer):
                 self._wait(self.step + 0.1)
             self._park()
             pot = None
-            if not self.in_hand(name):                            # (the potion is looked for FIRST: when it isn't there, the helmet is never touched)
+            if self.job.get("equip_only") or not self.in_hand(name):    # (the potion is looked for FIRST: when it isn't there, the helmet is never touched)
                 pot = self.scan_fn(name, 2.0)
                 self._ok()
                 if pot is None:
@@ -5834,10 +6173,14 @@ class PotionDrinker(Brewer):
                 self.equip_fn(name)
                 self._wait(self.step * 0.6)
                 self._park()
-            self._click_at(self.neutral_fn())                    # a click on the screen drinks the potion in hand
-            self.drink_fn()
-            self._wait(self.drink_time + 0.3)
-            self.count = 1
+            if self.job.get("equip_only"):                        # (an inventory item: equipped, nothing more - the inventory closes in the cleanup)
+                self._wait(self.step * 0.6)
+                self.count = 1
+            else:
+                self._click_at(self.neutral_fn())                # a click on the screen drinks the potion in hand
+                self.drink_fn()
+                self._wait(self.drink_time + 0.3)
+                self.count = 1
         except _BrewStop as e:
             why = str(e)
         except Exception as e:
@@ -6392,8 +6735,24 @@ class Overlay:
                 pass
 
     def raise_top(self):
+        if self.shown and IS_WIN:
+            try:
+                if not any(needs_raise(hwnd_of(w)) for w in self._top_windows()):
+                    return                                   # (still on top: nothing to do - see needs_raise)
+            except Exception:
+                pass
         if self.shown:
             self._visible()
+
+    def _top_windows(self):
+        """The Tk windows this overlay keeps above the game."""
+        if getattr(self, "red", None) and getattr(self, "num", None):
+            return [self.red[0], self.num[0]]
+        if getattr(self, "wins", None):
+            return [e["win"] for e in self.wins.values()]
+        if getattr(self, "win", None) is not None:
+            return [self.win]
+        return []
 
     def hide(self):
         if self.shown:
@@ -6509,6 +6868,8 @@ class DecorOverlay(Overlay):
         self.shown = bool(self.wins)
 
     def raise_top(self):
+        if IS_WIN and self.wins and not any(needs_raise(hwnd_of(e["win"])) for e in self.wins.values()):
+            return
         for ent in self.wins.values():
             self._show_win(ent["win"])
 
@@ -6918,6 +7279,8 @@ class PctOverlay(Overlay):
             pass
 
     def raise_top(self):
+        if self.shown and IS_WIN and self.win is not None and not needs_raise(hwnd_of(self.win)):
+            return
         if self.shown:
             self._visible()
 
@@ -7222,7 +7585,7 @@ def hp_bar_visible(rgb):
     need = min(0.30 * W, 120.0)                                      # (pixels: the bar is ~400 px long when full)
     light = (longest(_near(pr, pg, pb, HP_FRAME, 70)) >= need) | (longest(_near(pr, pg, pb, HP_FRAME_BRIGHT, 40)) >= need)
     if not light.any():
-        return False                                                  # (no light frame line at all: no bar - the dark outline needn't be looked for)
+        return hp_bar_visible_loose(pr, pg, pb)                       # (no light frame line of the usual colour: no bar - unless the colours are off, see hp_bar_visible_loose)
     # (the dark outline is only a pixel or two thick and gets blended with the red / the frame when the screen isn't 1080p: any DARK
     # row - every channel low - counts, not only the exact outline colour)
     dark = (longest(_near(pr, pg, pb, HP_DARK, 30)) >= need * 0.8) | (longest(np.maximum(np.maximum(pr, pg), pb) <= 125) >= need * 0.8) \
@@ -7237,6 +7600,37 @@ def hp_bar_visible(rgb):
                 lo, hi = int(ya), int(yb) + 1
                 if dark[lo:hi + 1].sum() >= 2:                        # the dark outline sits between / next to the two lines
                     return True
+    return hp_bar_visible_loose(pr, pg, pb)
+
+
+def hp_bar_visible_loose(pr, pg, pb):
+    """The same look when the picture's COLOURS are off (a bright / washed-out spot of the world: glare, bloom, fog and the like change the
+    bar's colours - and the scene behind it - so the exact frame colours of hp_bar_visible miss). It looks at the red FILL only, by how red it is
+    against its own green / blue (so a washed-out red still counts): a long straight band, 10-50 px tall, every row of it a long unbroken red run
+    of about the same length, with no red above or below it (a red wall / sunset fills the whole look, a bar doesn't).
+    pr/pg/pb = int16 channel planes of the HP bar area."""
+    H, W = pr.shape
+    need = min(0.30 * W, 120.0)
+    red = (pr >= 100) & (pr - pg >= 45) & (pr - pb >= 35)
+    lr = _longest_runs(red)
+    rows = lr >= need
+    if not rows.any():
+        return False
+    for g in range(len(rows) - 2):                                           # (a row or two of the band where the number / a glint cuts the red: the band stays one)
+        if not rows[g + 1] and rows[g] and g + 2 < len(rows) and rows[g + 2]:
+            rows[g + 1] = True
+    for y0, y1 in _runs(rows, 1):
+        h = y1 - y0 + 1
+        if not (10 <= h <= 50):
+            continue
+        seg = lr[y0:y1 + 1]
+        if (seg >= 0.8 * seg.max()).sum() < 0.7 * len(seg):
+            continue                                                         # (the band's rows are about the same length: a straight bar)
+        above = lr[max(0, y0 - 9):max(0, y0 - 2)]                            # (the band's own soft edge, 2 px, is left out)
+        below = lr[y1 + 3:y1 + 10]
+        if (len(above) and above.max() >= need) or (len(below) and below.max() >= need):
+            continue                                                         # (red goes on beyond the band: not a bar)
+        return True
     return False
 
 
@@ -7453,10 +7847,22 @@ def kb_key_id(scan, flags=0):
     return (int(scan) & 0xFF) | (0x100 if int(flags) & 1 else 0)
 
 
-def _clean_key(d):
+MOUSE4_ID, MOUSE5_ID, MOUSE3_ID = 0x300, 0x301, 0x302   # the ids of the middle button / the side buttons as a PRESSED key (keyboard keys are < 0x200)
+MOUSE_SIDE_ID = {1: MOUSE4_ID, 2: MOUSE5_ID}         # XBUTTON1 / XBUTTON2 -> id
+MOUSE_SIDE_LABEL = {MOUSE4_ID: "MOUSE 4", MOUSE5_ID: "MOUSE 5", MOUSE3_ID: "MOUSE 3"}
+MOUSE_PK_VK = {MOUSE3_ID: -4, MOUSE4_ID: -5, MOUSE5_ID: -6}     # (what the 'keys the user holds' set calls them)
+
+
+def valid_press_id(i):
+    """A key id a keybind may be pressed with: a keyboard key or Mouse 4 / Mouse 5."""
+    return 0 < i < 0x200 or i in MOUSE_SIDE_LABEL
+
+
+def _clean_key(d, mouse=False):
+    """{"id", "label"} of a key; mouse=True also accepts Mouse 4 / 5 (only as the key that is PRESSED, never as a key the tool sends)."""
     try:
         i = int(d.get("id"))
-        if 0 < i < 0x200:
+        if 0 < i < 0x200 or (mouse and i in MOUSE_SIDE_LABEL):
             return {"id": i, "label": str(d.get("label") or "KEY")[:16]}
     except Exception:
         pass
@@ -7471,14 +7877,14 @@ def clean_keybinds(data):
     mp = data.get("map")
     if isinstance(mp, dict):
         for slot, d in mp.items():
-            k = _clean_key(d) if isinstance(d, dict) else None
+            k = _clean_key(d, True) if isinstance(d, dict) else None
             if slot in KB_SLOT_SCAN and k:
                 out["map"][slot] = k
     cu = data.get("custom")
     if isinstance(cu, list):
         for e in cu:
             if isinstance(e, dict) and isinstance(e.get("send"), dict) and _clean_key(e["send"]):
-                out["custom"].append({"send": _clean_key(e["send"]), "key": _clean_key(e["key"]) if isinstance(e.get("key"), dict) else None})
+                out["custom"].append({"send": _clean_key(e["send"]), "key": _clean_key(e["key"], True) if isinstance(e.get("key"), dict) else None})
     return out
 
 
@@ -7627,7 +8033,9 @@ class InputWatcher(threading.Thread):
         self._next = lambda n, w, l: 0          # replaced by CallNextHookEx on Windows
         self._procs = ()
         self._imenu_held = False
-        self._phys = {0x57: False, 0x46: False, 0x47: False, 0x53: False}   # W / F / G / S as the USER holds them (the tool's own key presses are not counted)
+        self._phys = {0x57: False, 0x46: False, 0x47: False, 0x53: False, 0x41: False, 0x44: False}   # W / F / G / S / A / D as the USER holds them (the tool's own key presses are not counted)
+        self._br_thread = None
+        self._inj, self._inj_t = {}, 0.0                                 # keys the tool holds for the game (W / S / F / arrows) / since when you hold none of W / S / F
         self._rb_init()                                                  # (Block Run engine + the Cast Run that uses it)
         self._br_thread = None
         self._cr_thread = None
@@ -7645,20 +8053,32 @@ class InputWatcher(threading.Thread):
         self._cr_hold = False                      # the left button went down as a Cast Run (its button-up is handled too)
         self._cl_swallow = set()                 # mouse-up messages still to be swallowed (the click started on the checklist)
         self._pk = set()                         # keys / mouse buttons the USER holds right now (virtual keys; mouse: -1 left, -2 right, -4 middle, -5 / -6 side)
+        self._gate_buf = None                                   # SHORTCUT: (letters typed, time of the last one)
         self._gate_held, self._gate_thread, self._gate_pre = {}, None, set()     # Gate: keys taken for the shortcut boxes / a gate keybind (their release is taken too) / the typing run
+        self._xb_swallow = set()                 # mouse side buttons whose press picked a keybind: their release is taken too
         self._kb_held = {}                       # key id of a key whose press was taken (a keybind) -> what it did; its release does the matching thing
         self.kb_capture = None                   # set while a keybind is being picked: callback(key id or None, label)
+        self._hb, self._fix_t, self._fix_n, self._fix_wait = time.monotonic(), -1e9, 0, 5.0      # hook heartbeat / last re-install / how many / seconds before the next
         self._alt_sw, self._alt_inj = False, False   # LAlt was taken / was handed back to the system because Tab came after it (Alt+Tab)
 
     # ----- hook side (must be fast) -----
     def _kb(self, n_code, w_param, l_param):
         rb_swallow = False
+        self._hb = time.monotonic()                                       # (the hooks are alive: see _hook_watch)
         try:
             if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
                 info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                 is_down = w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
                 physical = info.dwExtraInfo != TRAIN_TAG                           # (not the tool's own key press)
+                if not physical and info.vkCode in self.INJ_WATCH:
+                    self._inj[info.vkCode] = is_down                               # (what the tool itself holds down for the game right now, whatever sent it)
                 real = physical and not (info.flags & 0x10)                        # (typed on the keyboard: not injected by another program, e.g. your own AutoHotkey script)
+                kreal = real or (physical and bool(self.app.cfg["settings"].get("kb_accept_injected")))     # (the keybinds can also take the keys a mouse driver sends)
+                if kreal and not real and is_down and self.kb_capture is not None:
+                    cb, self.kb_capture = self.kb_capture, None
+                    cb(None if info.vkCode == 0x1B else kb_key_id(info.scanCode, info.flags),
+                       "" if info.vkCode == 0x1B else key_label(info.scanCode, info.flags))
+                    return 1
                 if real:
                     (self._pk.add if is_down else self._pk.discard)(info.vkCode)
                     if is_down and self.kb_capture is not None:                    # picking a keybind: this key is it (Esc = cancel)
@@ -7670,7 +8090,10 @@ class InputWatcher(threading.Thread):
                     return 1                                           # Alt+F4: always closes the window, whatever keybind / script has F4
                 if info.dwExtraInfo != TRAIN_TAG:
                     if physical and info.vkCode in self._phys:
+                        was_k = self._phys[info.vkCode]
                         self._phys[info.vkCode] = is_down
+                        if info.vkCode == 0x46 and is_down and not was_k and self._phys[0x57] and not keys_off(self.app):
+                            self.block_run()                             # W held + F pressed (not a key repeat): the W + F Block Run
                     if physical and info.vkCode == 0x47 and getattr(self, "_g_cut", False):
                         if not is_down:
                             self._g_cut = False                          # they let go of G: back to normal (this release goes through)
@@ -7705,10 +8128,10 @@ class InputWatcher(threading.Thread):
                             self._imenu_held = False
                     if real and not (getattr(self.app, "gate_open", False) is True and info.vkCode in self.GATE_NAV and info.vkCode not in self._gate_pre):
                         rb_swallow = self.rb_event(info.vkCode, is_down)     # (Block Run: W / S / F / Q are taken and re-sent by the tool)
-                    if real and not self._chat_typing() and self._gate_filter(info, is_down):
+                    if kreal and not self._chat_typing() and self._gate_filter(info, is_down):
                         return 1                                       # (the gate shortcut boxes / a gate keybind took this key - also while the climb check
                                                                        # thinks the mana drains slowly: casting a Gate drains it too)
-                    if real and (not is_down or not self._chat_typing()) and self._kb_filter(info, is_down):
+                    if kreal and (not is_down or not self._chat_typing()) and self._kb_filter(info, is_down):
                         return 1                                       # (a keybind took this key - also while climbing: the climb check only pauses Block Run / AutoHotkey,
                                                                        # not the keybinds. A release always gets here, so a held keybind never sticks.)
                     if keys_off(self.app):
@@ -7778,6 +8201,8 @@ class InputWatcher(threading.Thread):
         """A right click while a Gate spell is armed: the shortcut boxes come up (the click itself goes through to the game as always)."""
         try:
             app = self.app
+            if getattr(app, "cfg", {"settings": {}})["settings"].get("gate_mode", "popup") not in ("popup", "both"):
+                return                                                        # (switched off in Extras > Gate: no shortcut boxes)
             if self._chat_typing() or not self.game_active() or not app.tracker.on or self.over_window(pt) or self.slot_at(pt):
                 return
             if app.tracker.gate_why(time.time()) != "ok":
@@ -7800,7 +8225,7 @@ class InputWatcher(threading.Thread):
         """True = this key is taken. While the boxes are up: the arrow keys move the selection, Ctrl picks, Backspace goes back. A gate keybind
         (or the random one) works while the boxes are up or a Gate spell is armed."""
         app = self.app
-        vk, kid, held = info.vkCode, kb_key_id(info.scanCode, info.flags), self._gate_held
+        vk, kid, held = info.vkCode, getattr(info, "kid", None) or kb_key_id(info.scanCode, info.flags), self._gate_held
         if not is_down:
             self._gate_pre.discard(vk)
             return held.pop(kid, None) is not None
@@ -7832,6 +8257,19 @@ class InputWatcher(threading.Thread):
             if hotbar_scan_name(info.scanCode, info.flags) in HOTBAR_KEYS:
                 self.gate_hide()                                           # (another spell: the boxes go away, the key goes through)
                 is_open = False
+        if getattr(app, "cfg", {"settings": {}})["settings"].get("gate_mode") in ("shortcut", "both") and not is_open and not (info.flags & 1):
+            ltr = GATE_LETTER_VK.get(vk)
+            if ltr:                                                        # (letters go through to the game as always: the tool only listens)
+                buf = self._gate_buf
+                self._gate_buf = ((buf[0] + ltr) if (buf and now - buf[1] <= GATE_LETTER_JOIN) else ltr, now)
+            elif 0x31 <= vk <= 0x39 and self._gate_buf and now - self._gate_buf[1] <= GATE_LETTER_TTL and self.gate_armed_now():
+                name = gate_shortcut_pick(self._gate_buf[0], vk - 0x30)
+                if name and self.gate_go(name):                            # (the number is taken: it must not switch the hotbar slot)
+                    self._gate_buf = None
+                    held[kid] = (vk, now)
+                    return True
+            elif vk not in (0x10, 0xA0, 0xA1):
+                self._gate_buf = None                                      # (any other key: the letters typed so far are dropped)
         gm = getattr(app, "gate_map", None)
         if not gm or kid not in gm:
             return False
@@ -7895,7 +8333,7 @@ class InputWatcher(threading.Thread):
         key press for the game, so anything that listens to that key, an AutoHotkey script of yours too, reacts to it as to a real one).
         Only while the game is in front and the chat is closed (the caller already left for the chat). LAlt + Tab is always left alone."""
         app = self.app
-        vk, kid, held = info.vkCode, kb_key_id(info.scanCode, info.flags), self._kb_held
+        vk, kid, held = info.vkCode, getattr(info, "kid", None) or kb_key_id(info.scanCode, info.flags), self._kb_held
         if not is_down:
             h = held.pop(kid, None)
             if vk == ALT_L:
@@ -7951,7 +8389,39 @@ class InputWatcher(threading.Thread):
     def _spin(ms):
         end = time.perf_counter() + ms / 1000.0
         while time.perf_counter() < end:
-            pass
+            time.sleep(0)                                          # (lets the keyboard hook thread run while the script waits)
+
+    INJ_WATCH = (0x57, 0x53, 0x46, 0x26, 0x28)
+
+    def _stuck_keys(self, now):
+        """Safety net for a key the tool holds for the game that nobody holds: W / S / F / the arrows the TOOL pressed (seen by the hook, whatever
+        code sent them) while you hold none of W / S / F, the run mode is off and no key sequence is running. After 0.4 s of that they are let go."""
+        down = [vk for vk, d in self._inj.items() if d]
+        if down and climb_paused(self.app):
+            names = {0x57: "w", 0x53: "s", 0x46: "f", 0x26: "up", 0x28: "down"}      # climbing: no virtual key may stay held, at once
+            for vk in down:
+                if vk in (0x57, 0x53, 0x46) and self._phys.get(vk):
+                    continue                                                           # (a key you really hold stays yours)
+                send_raw_key(vk, 1 if vk in (0x26, 0x28) else 0, True)
+                self._inj[vk] = False
+                self.rb.vdown.pop(names[vk], None)
+            if not (self._phys.get(0x57) or self._phys.get(0x53)):
+                self.rb.clear()                                                        # (run mode is over too: nothing virtual is left)
+            self._inj_t = 0.0
+            return
+        busy = (self.rb.trick or not self._rb_q.empty() or any(t is not None and t.is_alive() for t in (getattr(self, "_br_thread", None), getattr(self, "_cr_thread", None)))
+                or getattr(self, "_cr_hold", False))
+        if not down or busy or self._phys.get(0x57) or self._phys.get(0x53) or self._phys.get(0x46):
+            self._inj_t = 0.0
+            return
+        if not self._inj_t:
+            self._inj_t = now
+        elif now - self._inj_t > 0.4:
+            self._inj_t = 0.0
+            for vk in down:
+                send_raw_key(vk, 1 if vk in (0x26, 0x28) else 0, True)
+                self._inj[vk] = False
+                self.rb.vdown.pop({0x57: "w", 0x53: "s", 0x46: "f", 0x26: "up", 0x28: "down"}[vk], None)
 
     # ----- Block Run (the all-directional AutoHotkey script) -----
     def _rb_init(self):
@@ -7960,6 +8430,7 @@ class InputWatcher(threading.Thread):
                                gate=self.rb_enabled)
             self._rb_q = queue.Queue()
             self._rb_held, self._rb_was = set(), False
+            self._fw_held = set()
             self._climb, self._sp_last, self._sp_down = False, -1e9, False
             self._rb_thread, self._drain_paused = None, False
             self._climb_pending, self._climb_seen = 0.0, 0.0
@@ -7973,8 +8444,8 @@ class InputWatcher(threading.Thread):
 
     def rb_enabled(self):
         S = self.app.cfg["settings"]
-        if not S.get("block_run") or keys_off(self.app) or getattr(self, "_climb", False):
-            return False                                   # (chat / Esc menu / a slow mana drain = climbing / Space climb: the script stays off)
+        if not S.get("all_dir_run") or not (S.get("block_run") or S.get("cast_run")) or keys_off(self.app) or getattr(self, "_climb", False):
+            return False                                   # (All directional run + Block Run and / or Cast Run is the script; chat / Esc menu / a slow mana drain = climbing: it stays off)
         return bool(self.game_active())
 
     def _rb_put(self, *item):
@@ -7992,7 +8463,17 @@ class InputWatcher(threading.Thread):
                 continue
             try:
                 if item[0] == "reset":
+                    self.rb.climb_tap = bool(len(item) > 2 and item[2])        # (the W tap is for a climb only: the chat opening, the Esc menu ... must not press W)
                     self.rb.reset(hand_back=True)
+                elif item[0] == "idle":
+                    self.rb.release_idle()
+                elif item[0] == "fresh":
+                    self.rb.send("w", True)
+                    self._spin(8)
+                    if self._phys.get(0x57):
+                        self.rb.send("w", False)
+                        if not self._phys.get(0x57):               # (let go meanwhile: the game must not keep it)
+                            self.rb.send("w", True)
                 elif item[0] == "cast":
                     try:
                         self.rb.cast_clicked = False
@@ -8020,7 +8501,7 @@ class InputWatcher(threading.Thread):
             if d is not None and d.empty(now):
                 self._climb, self._climb_pending = False, 0.0       # the mana ran out: always back to Block Run
             elif self._climb:
-                if seen or (d is not None and d.falling(now)):
+                if seen or (d is not None and d.climbing(now, 0.6)):             # (the mana still falls at a climbing speed; a normal slower drain is NOT a climb)
                     self._climb_seen = now
                 elif now - self._climb_seen > CLIMB_END:
                     self._climb = False                      # (the mana no longer drains like a climb: it is over)
@@ -8029,6 +8510,16 @@ class InputWatcher(threading.Thread):
                     self._climb, self._climb_pending, self._climb_seen = True, 0.0, now
             self._rb_transition(self.rb_enabled())
             self._pause_sync(now)
+            self._stuck_keys(now)
+            held_v = [k for k in self.rb.vdown if k in ("w", "s", "f", "up", "down")]
+            if held_v and not self.rb.trick and not (self._phys.get(0x57) or self._phys.get(0x53) or self._phys.get(0x46)):
+                if not getattr(self, "_idle_t", 0.0):
+                    self._idle_t = now
+                elif now - self._idle_t > 0.35:                    # (0.35 s of the tool holding keys for the game while you hold none: let go)
+                    self._idle_t = 0.0
+                    self._rb_put("idle", True)
+            else:
+                self._idle_t = 0.0
         except Exception:
             pass
 
@@ -8053,7 +8544,7 @@ class InputWatcher(threading.Thread):
                     self._rb_q.get_nowait()                # (what was still waiting to be sent is dropped: it would only add leftover keys)
             except queue.Empty:
                 pass
-            self._rb_put("reset", True)                    # (virtual keys are let go, the keys you really hold go back to the game)
+            self._rb_put("reset", True, climb_paused(self.app))                    # (virtual keys are let go, the keys you really hold go back to the game)
         self._rb_was = en
 
     def _rb_space(self, is_down):
@@ -8088,6 +8579,27 @@ class InputWatcher(threading.Thread):
         else:
             self._sp_last = now
 
+    def _fresh_w(self, is_down):
+        """While climbing (the script is off): the W you press goes to the game as W up, W down - a clean new press whatever the game thinks the key is
+        doing (after a sideways run its W may still count as held, and the first press was then lost). True = the tool took this key event."""
+        try:
+            S = self.app.cfg["settings"]
+            if not S.get("all_dir_run") or not (S.get("block_run") or S.get("cast_run")):
+                return False
+            if is_down:
+                if 0x57 in self._fw_held:
+                    return True                              # (key repeat: taken, the game already has the press)
+                if not self.game_active() or not climb_paused(self.app) or (getattr(self.app, "chat_open", False) is True and not getattr(self, "_drain_paused", False)):
+                    return False
+                self._fw_held.add(0x57)
+                self._rb_put("fresh", True)
+                return True
+            if 0x57 in self._fw_held:
+                self._fw_held.discard(0x57)                  # (the release itself goes to the game as it is)
+            return False
+        except Exception:
+            return False
+
     def rb_event(self, vk, is_down):
         """A real key event: True when the tool takes it (W / S / F / Q while Block Run is on - the tool sends what the game should see)."""
         try:
@@ -8100,10 +8612,16 @@ class InputWatcher(threading.Thread):
                 return False
             en = self.rb_enabled()
             self._rb_transition(en)
-            if not en:
-                self._rb_held.discard(vk)
+            if name == "w" and (en or not is_down):
+                self._fw_held.discard(vk)                   # (a W release, or the script being on again, always ends the "climbing press" - a stale one swallowed every later W press)
+            if name == "w" and not en and self._fresh_w(is_down):
+                return True                                  # (climbing: your W press is sent to the game as a clean new press, see _fresh_w)
+            if not en or (name == "f" and not self.app.cfg["settings"].get("block_run")):
+                self._rb_held.discard(vk)                   # (F blocks only with Block Run on: with just Cast Run + All directional run it is a plain key)
                 return False
             swallow = name in RB_SWALLOW
+            if swallow and name in ("w", "s", "f"):
+                self.rb.taken.add(name)
             if is_down:
                 if vk in self._rb_held:
                     return swallow                           # (key repeat)
@@ -8115,26 +8633,51 @@ class InputWatcher(threading.Thread):
         except Exception:
             return False
 
-    def cast_run_wanted(self, pt, t=None):
-        """Cast Run applies to a left click that CASTS a held spell while W is held (the run does not have to be detected)."""
+    def cast_run_why(self, pt):
+        """None when a Cast Run happens for a left click at `pt` (the conditions below all hold), else the plain reason it doesn't."""
         S = self.app.cfg["settings"]
-        if not S.get("cast_run") or keys_off(self.app):
-            return False
-        if not (self._phys[0x57] or self._cr_engine(True)):         # (W held, or Block Run is in run mode in any direction)
-            return False
+        if not S.get("cast_run"):
+            return "Cast Run is switched off in the settings"
+        if keys_off(self.app):
+            return "the keybinds are paused (the chat / Esc menu is open, or the tool thinks you are climbing)"
+        if not (self._cast_dirs() or self._cr_engine(True)):         # (a run key held, or Block Run is in run mode in any direction)
+            return "W isn't held (and Block Run isn't in run mode)" if not S.get("all_dir_run") else "none of W / A / S / D is held (and Block Run isn't in run mode)"
         T = self.app.tracker
         a = T.armed
-        if not a or not T.is_cast_spell(a[0]) or not T.on or not self.game_active():
-            return False
-        if self.over_window(pt) or self.slot_at(pt):
-            return False
-        return True
+        if not a:
+            return "the tool doesn't see a spell in your hand (press the spell's hotbar key first: it didn't register it, or the hotbar isn't recognised)"
+        if not T.is_cast_spell(a[0]):
+            return f"the move in your hand ('{a[0]}') isn't a Normal Spell / normal cast mark"
+        if not T.on:
+            return "the tracker is switched off"
+        if not self.game_active():
+            return "the game window isn't the one in front"
+        if self.over_window(pt):
+            return "the click was on the tool's own window"
+        k = self.slot_at(pt)
+        if k:
+            bar = self.app.cfg["bar"]
+            return (f"the click at {int(pt[0])},{int(pt[1])} counts as on hotbar slot {k}: the tool's hotbar position (x {int(bar['x'])}, y {int(bar['y'])}, "
+                    f"slot {int(bar['w'])}x{int(bar['h'])}, pitch {bar['pitch']:g}) doesn't match this screen - re-detect the hotbar")
+        return None
+
+    CR_VK = {"w": 0x57, "a": 0x41, "s": 0x53, "d": 0x44}
+
+    def _cast_dirs(self):
+        """The run keys you hold now: W only; with All directional run on, also A / S / D."""
+        keys = ("w", "a", "s", "d") if self.app.cfg["settings"].get("all_dir_run") else ("w",)
+        ph = getattr(self, "_phys", {})
+        return [k for k in keys if ph.get(self.CR_VK[k])]
+
+    def cast_run_wanted(self, pt, t=None):
+        """Cast Run applies to a left click that CASTS a held spell while W is held (the run does not have to be detected)."""
+        return self.cast_run_why(pt) is None
 
     def _cr_engine(self, running=False):
         """True when the Block Run engine does the Cast Run (all directions). With running=True: only while it is in run mode."""
         try:
             rb = getattr(self, "rb", None)
-            if rb is None or not self.app.cfg["settings"].get("block_run") or not self.rb_enabled():
+            if rb is None or not self.app.cfg["settings"].get("cast_run") or not self.rb_enabled():
                 return False
             return bool(rb.trick) if running else True
         except Exception:
@@ -8333,27 +8876,39 @@ class InputWatcher(threading.Thread):
                 self._cr_done = threading.Event()
                 self._rb_put("cast", self._cr_done)                # (the Block Run engine casts it: W / S / A / D, whichever way you run)
             else:
-                self._cr_thread = threading.Thread(target=self._cast_run_seq, daemon=True)
+                self._cr_thread = threading.Thread(target=self._cast_run_seq, args=(self._cast_dirs() or ["w"],), daemon=True)
                 self._cr_thread.start()
             return True
         except Exception:
             self._cr_hold = False
             return False
 
-    def _cast_run_seq(self):
+    def _cr_key(self, k, up=False):
+        if k == "w":
+            send_key("w", up)
+        else:
+            send_raw_key(self.CR_VK[k], 0, up)
+
+    def _cast_run_seq(self, dirs=("w",)):
+        """Run keys up, down, up, the click, then down again (the ones you still hold; the others stay up): the run is not lost by the cast."""
         clicked = False
+        dirs = list(dirs) or ["w"]
         try:
-            send_key("w", True)
-            send_key("w")
+            for k in dirs:
+                self._cr_key(k, True)
+                self._cr_key(k)
             self._spin(1)
-            send_key("w", True)
+            for k in dirs:
+                self._cr_key(k, True)
             self._spin(1)
             send_click(False)
             clicked = True
             self._spin(10)
-            send_key("w")
-            if not self._phys[0x57]:
-                send_key("w", True)
+            for k in dirs:
+                self._cr_key(k)
+            for k in dirs:
+                if not self._phys.get(self.CR_VK[k]):
+                    self._cr_key(k, True)
         except Exception:
             pass
         finally:
@@ -8362,6 +8917,44 @@ class InputWatcher(threading.Thread):
                     send_click(False)                  # (the click must never get lost)
                 except Exception:
                     pass
+
+    def block_run(self):
+        """Block Run (W + F, the AutoHotkey script ~W & F): W up, W down, 1 ms, W up, 1 ms, F down, 10 ms, W down; then wait until F is let go,
+        F up, 10 ms, and W up unless W is still held. Runs in its own thread; a held F doesn't repeat it. Only with All directional run off
+        (with it on, the all-directional Block Run does this)."""
+        try:
+            S = self.app.cfg["settings"]
+            if not S.get("block_run") or S.get("all_dir_run"):
+                return
+            t = getattr(self, "_br_thread", None)
+            if t is not None and t.is_alive():
+                return
+            self._br_thread = threading.Thread(target=self._block_run_seq, daemon=True)
+            self._br_thread.start()
+        except Exception:
+            pass
+
+    def _block_run_seq(self):
+        try:
+            if not self.game_active():
+                return
+            send_key("w", True)
+            send_key("w")
+            self._spin(1)
+            send_key("w", True)
+            self._spin(1)
+            send_key("f")
+            self._spin(10)
+            send_key("w")
+            t0 = time.perf_counter()
+            while self._phys[0x46] and not self.quit.is_set() and time.perf_counter() - t0 < 30:
+                time.sleep(0)
+            send_key("f", True)
+            self._spin(10)
+            if not self._phys[0x57]:
+                send_key("w", True)
+        except Exception:
+            pass
 
     def _cast_run_up(self):
         t = self._cr_thread
@@ -8416,8 +9009,8 @@ class InputWatcher(threading.Thread):
             return False                              # no health bar (inventory / menu): the autoclicker waits
         T = self.app.tracker
         a = T.armed
-        if a and T.no_autoclick(a[0]):
-            return False                              # holding a spell (or Withstand): the autoclicker is off
+        if a and T.is_spell(a[0]):
+            return False                              # holding a spell: the autoclicker is off (Withstand: it clicks once, see _autoclick_loop)
         if self.over_window(pt) or self.slot_at(pt):
             return False
         return bool(self.game_active())
@@ -8427,12 +9020,14 @@ class InputWatcher(threading.Thread):
             if self._ac_thread is not None and self._ac_thread.is_alive():
                 return
             if self.autoclick_wanted(pt):
-                self._ac_thread = threading.Thread(target=self._autoclick_loop, daemon=True)
+                a = self.app.tracker.armed
+                ws0 = bool(a and self.app.tracker.is_withstand_key(a[0]))       # (the button went down with Withstand in hand: that click was the one)
+                self._ac_thread = threading.Thread(target=self._autoclick_loop, args=(ws0,), daemon=True)
                 self._ac_thread.start()
         except Exception:
             pass
 
-    def _autoclick_loop(self):
+    def _autoclick_loop(self, ws_done=False):
         """AutoClick.ahk: the real click already went through; while the button stays held, click every 30 ms."""
         try:
             T = self.app.tracker
@@ -8445,8 +9040,20 @@ class InputWatcher(threading.Thread):
                     continue                          # a hotbar key was just pressed: no click until the tool has seen what is in hand now
                                                       # (a click with a spell in hand while running = the run stops: that is what Cast Run is for)
                 a = T.armed
-                if (a and T.no_autoclick(a[0])) or T.dive_is_withstand():
-                    break                             # a spell / Withstand is held now: stop, and stay off until the button is pressed again
+                if a and T.is_spell(a[0]):
+                    break                             # a spell is held now: stop, and stay off until the button is pressed again
+                if (a and T.is_withstand_key(a[0])) or T.dive_is_withstand():
+                    if not ws_done and not T.dive_is_withstand():
+                        ws_done = True                # switched to Withstand while the button is held: ONE click (it starts the stance) ...
+                        try:
+                            if self.autoclick_hits():
+                                self.events.put(("click", "left", time.time(), cursor_pos()))
+                        except Exception:
+                            pass
+                        send_click(False)
+                        send_click(True)
+                    continue                          # ... then no clicks while it is in hand / the stance lasts; switching away brings the autoclicker back
+                ws_done = False
                 try:
                     if self.autoclick_hits():
                         self.events.put(("click", "left", time.time(), cursor_pos()))     # (the click that casts the move you just armed: its cooldown starts)
@@ -8457,8 +9064,33 @@ class InputWatcher(threading.Thread):
         except Exception:
             pass
 
+    def _mouse_side(self, kid, is_down):
+        """Mouse 4 / Mouse 5 as a keybind: picks a keybind (while one is being picked) or acts like the same press of a keyboard key
+        (the potion keys, the hotbar / custom keybinds and the gate keys all take it). True = the button is taken: the game never sees it."""
+        vk = MOUSE_PK_VK[kid]
+        (self._pk.add if is_down else self._pk.discard)(vk)
+        if is_down and self.kb_capture is not None:
+            cb, self.kb_capture = self.kb_capture, None
+            self._xb_swallow.add(kid)
+            cb(kid, MOUSE_SIDE_LABEL[kid])
+            return True
+        if not is_down and kid in self._xb_swallow:
+            self._xb_swallow.discard(kid)
+            return True
+        info = types.SimpleNamespace(vkCode=vk, scanCode=0, flags=0, kid=kid, dwExtraInfo=0)
+        if not self._chat_typing() and self._gate_filter(info, is_down):
+            return True
+        return bool((not is_down or not self._chat_typing()) and self._kb_filter(info, is_down))
+
     def _ms(self, n_code, w_param, l_param):
+        self._hb = time.monotonic()
         try:
+            if n_code >= 0 and w_param in (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP):
+                _xi = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
+                _xid = MOUSE3_ID if w_param in (WM_MBUTTONDOWN, WM_MBUTTONUP) else MOUSE_SIDE_ID.get((_xi.mouseData >> 16) & 0xFFFF)
+                if (_xid and _xi.dwExtraInfo != TRAIN_TAG and not (_xi.flags & 0x1)
+                        and self._mouse_side(_xid, w_param in (WM_XBUTTONDOWN, WM_MBUTTONDOWN))):
+                    return 1
             if n_code >= 0 and w_param in (WM_LBUTTONDOWN, WM_LBUTTONUP):
                 _inf = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                 if _inf.dwExtraInfo != TRAIN_TAG and not (_inf.flags & 0x1):      # (a click another program sent, e.g. an AutoHotkey script: not the user's button)
@@ -8550,13 +9182,54 @@ class InputWatcher(threading.Thread):
             pass
         return self._next(n_code, w_param, l_param)
 
+    def _install_hooks(self, kb, ms):
+        hmod = k32.GetModuleHandleW(None)
+        return u32.SetWindowsHookExW(WH_KEYBOARD_LL, kb, hmod, 0), u32.SetWindowsHookExW(WH_MOUSE_LL, ms, hmod, 0)
+
+    def _last_input_time(self):
+        """When Windows last saw keyboard / mouse input, on the time.monotonic() clock (None = can't tell)."""
+        class LII(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+        li = LII(ctypes.sizeof(LII), 0)
+        if not u32.GetLastInputInfo(ctypes.byref(li)):
+            return None
+        idle = ((k32.GetTickCount() - li.dwTime) & 0xFFFFFFFF) / 1000.0
+        return time.monotonic() - idle
+
+    def _hook_watch(self, h_kb, h_ms, kb, ms):
+        """Once a second (in the hook thread): were the hooks dropped? Windows removes a low-level hook that once took too long to answer. When it
+        saw input that the hooks never reported, they are installed again - so the keys and clicks are never lost for the rest of the session."""
+        now = time.monotonic()
+        refresh_hotbar_layout()                                          # (the keyboard layout can be switched while the tool runs)
+        li = self._last_input_time()
+        if li is None or not hooks_stale(self._hb, li, now, self._fix_t, self._fix_wait):
+            return h_kb, h_ms
+        for h in (h_kb, h_ms):
+            try:
+                u32.UnhookWindowsHookEx(h)
+            except Exception:
+                pass
+        n_kb, n_ms = self._install_hooks(kb, ms)
+        if not n_kb or not n_ms:                                          # (couldn't: keep trying, slowly)
+            for h in (n_kb, n_ms):
+                if h:
+                    u32.UnhookWindowsHookEx(h)
+            self._fix_t, self._fix_wait = now, min(60.0, self._fix_wait * 2)
+            return h_kb, h_ms
+        self._hb, self._fix_t, self._fix_n = now, now, self._fix_n + 1
+        self._fix_wait = min(60.0, 5.0 * (2 ** self._fix_n))             # (an elevated game can't be seen into: the more it happens, the rarer it tries)
+        self.app.q.put(("msg", "The input hooks were dropped by Windows (the tool was too busy for a moment): they are back on."
+                        if self._fix_n < 2 else
+                        "Windows keeps not passing your clicks / keys to the tool. If Roblox (or its launcher) runs as administrator, run the tool as administrator too."))
+        return n_kb, n_ms
+
     def _hook_thread(self):
         self._next = lambda n, w, l: u32.CallNextHookEx(None, n, w, l)
+        set_thread_priority(2)                                  # (the hooks answer before any other thread of the tool gets the CPU)
+        refresh_hotbar_layout()
         kb, ms = HOOKPROC(self._kb), HOOKPROC(self._ms)
         self._procs = (kb, ms)                                  # keep them alive
-        hmod = k32.GetModuleHandleW(None)
-        h_kb = u32.SetWindowsHookExW(WH_KEYBOARD_LL, kb, hmod, 0)
-        h_ms = u32.SetWindowsHookExW(WH_MOUSE_LL, ms, hmod, 0)
+        h_kb, h_ms = self._install_hooks(kb, ms)
         if not h_kb or not h_ms:
             for h in (h_kb, h_ms):
                 if h:
@@ -8569,9 +9242,18 @@ class InputWatcher(threading.Thread):
         self.hook_tid = k32.GetCurrentThreadId()
         self.mode = "hook"
         self.app.q.put(("msg", "Input hooks active: every key press and click is caught, even very fast ones."))
+        self._hb = time.monotonic()
+        try:
+            u32.SetTimer(None, 0, 1000, None)                    # (a WM_TIMER a second: the hooks' health check)
+        except Exception:
+            pass
         msg = wintypes.MSG()
         while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:      # the hooks run inside this call
-            pass
+            if msg.message == 0x0113:                                 # WM_TIMER
+                try:
+                    h_kb, h_ms = self._hook_watch(h_kb, h_ms, kb, ms)
+                except Exception:
+                    pass
         u32.UnhookWindowsHookEx(h_kb)
         u32.UnhookWindowsHookEx(h_ms)
 
@@ -8745,6 +9427,7 @@ class InputWatcher(threading.Thread):
             self.app.q.put(("msg", "Key / click watching needs Windows."))
             return
         threading.Thread(target=self._hook_thread, daemon=True).start()
+        set_thread_priority(1)                                          # (the thread that handles the caught keys / clicks goes before the screen readers)
         while not self.quit.is_set():
             try:
                 ev = self.events.get(timeout=0.2)
@@ -8783,7 +9466,7 @@ def keys_off(app):
 CLIMB_CONFIRM = 1.0                         # seconds after Space twice in which a climbing-speed mana drain has to be seen
 EMPTY_MANA = 1.0                            # % - at or below this the mana is empty
 CLIMB_CHECK = 0.3                           # ... and how long a steady fall has to be seen for (after Space twice, so the look is short and a bit looser)
-CLIMB_END = 5.0                             # seconds without the mana falling at all after which a climb is over (Space ends it earlier)
+CLIMB_END = 2.0                             # seconds without the mana falling at a climbing speed after which a climb is over (the top: the game stops climbing, the drain is normal) (Space ends it earlier)
 RB_VK = {"w": 0x57, "s": 0x53, "f": 0x46, "q": 0x51, "g": 0x47, "up": 0x26, "down": 0x28}
 RB_KEYS = {0x57: "w", 0x53: "s", 0x41: "a", 0x44: "d", 0x51: "q", 0x46: "f", 0x47: "g"}      # the keys Block Run looks at
 RB_SWALLOW = ("w", "s", "q", "f")                                                              # ... and takes (the others pass through)
@@ -8792,13 +9475,17 @@ RB_SWALLOW = ("w", "s", "q", "f")                                               
 class RunBlock:
     """The all-directional Block Run AutoHotkey script. handle(key, down) is one of its hotkeys; send(name, up) presses a key for the game,
     sleep(ms) waits. W / S / F / Q are taken by the tool (the caller swallows them); A / D / G only pass through and are tracked."""
+    CLIMB_WAIT_MS = 50                                         # ms of waiting before the W tap
+    CLIMB_TAPS, CLIMB_TAP_MS = 1, 50                           # W taps (50 ms each) after the tool lets go of its virtual keys for a climb
     TAP, FIRST, DBL, RUNTAP, GAP = 180, 400, 500, 200, 10     # tapThreshold, firstHoldThreshold, doubleTapWindow, runTapWindow, runGap (ms)
 
     def __init__(self, send, sleep, phys=None, clock=None, gate=None):
         self._send, self.sleep = send, sleep
         self.gate = gate                                           # () -> True while Block Run may act; else a key is only sent as it is
         self.vdown = {}                                            # the keys the tool is holding down for the game right now (insertion order)
+        self.taken = set()                                         # W / S / F: keys whose events the tool took (the game may hold one with no release coming)
         self.phys = phys or (lambda: (False, False, False))
+        self.climb_tap = True                                      # reset() ends with a 10 ms tap of W (when you do not hold it)
         self.clock = clock or (lambda: time.perf_counter() * 1000.0)
         self.clear()
 
@@ -8822,6 +9509,7 @@ class RunBlock:
         """Block Run goes off (slow mana drain / climbing): EVERY key the tool is still holding down for the game is let go (no leftover
         arrow / W / S / F / Q); the W / S / F you really hold go back to the game."""
         w, s, f = (tuple(self.phys()) + (False, False, False))[:3]
+        active = bool(self.trick or self.vdown or self.taken)       # (the tool was doing something with the keys)
         self.clear()
         held = list(self.vdown)
         for k in ("w", "up", "down", "s", "f", "q"):               # (the usual ones first, then anything else)
@@ -8831,6 +9519,11 @@ class RunBlock:
             if k in self.vdown:
                 self.send(k, True)
         self.vdown.clear()
+        if active:                                                 # (whatever the tool's own record says: the game gets a release of every key you do NOT hold, so it
+            for k, down in (("w", w), ("s", s), ("f", f), ("up", False), ("down", False)):     # never thinks W / the arrows are still down - a W press that
+                if not down and k not in held:                     # would then be ignored as "already held")
+                    self.send(k, True)
+                    self.vdown.pop(k, None)
         if hand_back and held:
             self.sleep(30)
             w, s, f = (tuple(self.phys()) + (False, False, False))[:3]      # (look again: you may have let go meanwhile)
@@ -8839,16 +9532,60 @@ class RunBlock:
                     self.send(k, True)                                       # a key you let go must not stay held for the game
                     self.vdown.pop(k, None)
         if hand_back:
-            if w and "w" in held:                                  # (only a key the tool had let go: the game still needs it held)
-                self.send("w", False)
-            if s and "s" in held:
-                self.send("s", False)
-            if f and "f" in held:
-                self.send("f", False)
+            w, s, f = (tuple(self.phys()) + (False, False, False))[:3]
+            for k, down in (("w", w), ("s", s), ("f", f)):
+                if not down and k in self.taken:
+                    self.send(k, True)                             # (a key whose press the tool took while on and you do NOT hold now: the game gets its release for sure -
+                                                                   #  a release the tool swallowed and then dropped with its queue, as Block Run went off, must never leave W held)
+            for k, down in (("w", w), ("s", s), ("f", f)):
+                if down and k in self.taken and k not in held:
+                    self.send(k, False)                            # (you hold it, the tool took its press but never sent it - the queue was dropped: the game gets it now)
+            self.taken.clear()
+            for k, down in (("w", w), ("s", s), ("f", f)):         # (a key you hold now ALWAYS gets to the game: it may have been let go by this reset, taken and
+                if active and down and k not in self.vdown:      #  dropped, or pressed while the reset was running - an extra press of a held key does no harm)
+                    self.send(k, False)
+            w, s, f = (tuple(self.phys()) + (False, False, False))[:3]          # (and once more: a key you let go of while this ran must not stay held for the game)
+            for k, down in (("w", w), ("s", s), ("f", f)):
+                if not down and k in self.vdown:
+                    self.send(k, True)
+                    self.vdown.pop(k, None)
+            if not w and self.climb_tap:
+                if self.CLIMB_WAIT_MS:
+                    self.sleep(self.CLIMB_WAIT_MS)                 # (a moment of nothing first)
+                for i in range(self.CLIMB_TAPS):                   # (a 50 ms tap of W: the game gets clean W presses / releases after the tool let go of its
+                    if tuple(self.phys())[:1] == (True,):          #  virtual W - not when you hold W yourself: that press just goes on as it is)
+                        break
+                    self.send("w", False)
+                    self.sleep(self.CLIMB_TAP_MS)
+                    self.send("w", True)
+                    self.vdown.pop("w", None)
+                    if i < self.CLIMB_TAPS - 1:
+                        self.sleep(10)
+                if tuple(self.phys())[:1] == (True,):
+                    self.send("w", False)                          # (pressed W during the taps: it stays down for you)
+
+    def release_idle(self):
+        """The tool holds W / S / F / the arrows for the game but you hold none of W / S / F and no sprint is on: they are let go (never a key left held
+        for you after the climb / a drain / a hook that lost a release)."""
+        if self.trick:
+            return
+        w, s, f = (tuple(self.phys()) + (False, False, False))[:3]
+        for k in list(self.vdown):
+            if (k == "w" and not w) or (k == "s" and not s) or (k == "f" and not f) or k in ("up", "down"):
+                self.send(k, True)
+        for k, down in (("w", w), ("s", s), ("f", f)):
+            if not down and k in self.vdown:
+                self.vdown.pop(k, None)
 
     def handle(self, key, down):
         if self.gate is not None and not self.gate():
             if key in ("w", "s", "f", "q"):                        # (switched off - climbing: W sends W, S sends S ... nothing else)
+                if down:
+                    # a press the tool took BEFORE it went off, handled only now: the real release has long gone to the game, so sending the
+                    # press now would leave the key held for good. Only a key you still hold goes through.
+                    held = dict(zip(("w", "s", "f"), (tuple(self.phys()) + (False, False, False))[:3]))
+                    if not held.get(key, False):
+                        return
                 self.send(key, not down)
             return
         getattr(self, ("on_" if down else "off_") + key)()
@@ -9585,6 +10322,8 @@ class AutoclickBadge(Overlay):
         self.shown = True
 
     def raise_top(self):
+        if self.shown and IS_WIN and self.win is not None and not needs_raise(hwnd_of(self.win)):
+            return                                   # (still on top: nothing to do - see needs_raise)
         if self.shown:
             try:
                 self.win.attributes("-topmost", True)
@@ -9800,6 +10539,7 @@ class App:
 
     def __init__(self):
         self.cfg = load_cfg()
+        apply_grab_mode(bool(self.cfg["settings"].get("grab_layered")))
         self.q = queue.Queue()
         self.selecting = False
         self.tracker = Tracker(self.cfg)
@@ -9936,7 +10676,7 @@ class App:
                 pass
         added_ = self.cfg.pop("_pack_added", None)
         if added_:
-            self.append_log(f"Version {DEFAULT_PACK_VERSION}: added {len(added_)} new default profile(s): " + ", ".join(added_) + " (yours are untouched).")
+            self.append_log(f"Default profiles: {len(added_)} added / updated: " + ", ".join(added_) + " (the ones you changed are untouched).")
         new_ = self.cfg.pop("_dash_new", None)
         if new_:                                                       # coins that came with an update: on the game's own spots
             dflt_ = default_dashpos(*screen_size(r))
@@ -9949,6 +10689,10 @@ class App:
                 if valid_anchor(self.cfg.get("dash_anchor")):          # (the other coins already follow the hotbar: so does the new one)
                     move_item(self.cfg["dashpos"][k_], A_, self.cfg["dash_anchor"], left=(k_ == "rune"))
             save_cfg(self.cfg)
+        try:
+            sys.setswitchinterval(0.001)                                # (threads swap every 1 ms instead of 5: a hook never waits long for the thread that is drawing)
+        except Exception:
+            pass
         self._perf = None
         if self.cfg["settings"].get("perf_log"):                       # hidden: "perf_log": true in the settings file -> the log shows where the time goes every 5 s
             self.perf_start()
@@ -10705,10 +11449,10 @@ class App:
         """Rebuild the rows of BOTH lists (normal moves + snap spells) for the active profile."""
         self.move_key_btns = {}
         for frame, title, text, lst in ((self.moves_frame, self.moves_title, "3.Moves in '{}' (left click)",
-                                         [m for m in self.moves() if not m.get("spell")]),
+                                         sorted([m for m in self.moves() if not m.get("spell")], key=lambda m: bool(m.get("ininv")))),
                                         (self.spells_frame, self.spells_title, "4.Normal Spells in '{}' (left click)",
-                                         [m for m in self.moves() if m.get("spell")]),
-                                        (self.snaps_frame, self.snaps_title, "5.Snap spells in '{}' (right click)", self.snaps())):
+                                         sorted([m for m in self.moves() if m.get("spell")], key=lambda m: bool(m.get("ininv")))),
+                                        (self.snaps_frame, self.snaps_title, "5.Snap spells in '{}' (right click)", sorted(self.snaps(), key=lambda m: bool(m.get("ininv"))))):
             for w in frame.winfo_children():
                 w.destroy()
             title.config(text=text.format(self.cfg["active"]))
@@ -10784,7 +11528,7 @@ class App:
     def build_move_row(self, parent, mv):
         row = tk.Frame(parent, bg=PARCH)
         row.pack(fill="x", padx=8, pady=1)
-        kb = PixBtn(row, mv["key"], lambda m=mv: self.capture_move_key(m), self.f, self.KEY_W, 24, bd=2)
+        kb = PixBtn(row, "" if mv.get("ininv") else mv["key"], lambda m=mv: self.capture_move_key(m), self.f, self.KEY_W, 24, bd=2)       # (an inventory move: blank key box)
         kb.pack(side="left")
         kb.lbl.bind("<ButtonRelease-3>", lambda e, m=mv: self.toggle_in_inventory(m))     # right-click: white = not on the hotbar, it is in the inventory
         kb.set_on(bool(mv.get("ininv")))
@@ -10801,6 +11545,9 @@ class App:
                     self.soul_rebuild_later(False)
                 if is_decompose(v) and "cd2" in m and not m.get("spell") and m.get("cd2") != DECOMPOSE_M2:
                     m["cd2"], m["split"] = DECOMPOSE_M2, True      # Decompose: M2 is 31 s
+                    self.soul_rebuild_later(False)
+                if is_ink_blot(v) and not m.get("spell") and float(m.get("cd") or 0.0) != INK_BLOT_CD:
+                    m["cd"] = INK_BLOT_CD                  # Ink Blot: 12 s
                     self.soul_rebuild_later(False)
                 if is_the_soul(v) and float(m.get("cd") or 0.0) <= 0:
                     m["cd"] = THE_SOUL_CD                  # The Soul: 30 s to start with (change the box if you like)
@@ -11100,7 +11847,7 @@ class App:
                 d["name"] = f"{base} {n}"
             d["ininv"] = True
         lst.append(d)
-        lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+        lst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"])))
         if d.get("ininv"):
             sync_inv_links(self.cfg)
         save_cfg(self.cfg)
@@ -11284,11 +12031,13 @@ class App:
         marks = self.marks()
         if now < self.demo_until:                                   # F7: show every mark so you can check them
             shown = marks
-        elif getattr(self, "train", None) and self.train.running:
-            shown = self.train_shown_marks()                        # Snap Training: the spell's mark, the whole time
         else:
-            k = self.tracker.armed_key(now)                         # only the marks of the key that is armed
-            shown = [mk for mk in marks if mk["key"] == k] if k else []
+            if getattr(self, "train", None) and self.train.running:
+                shown = list(self.train_shown_marks())              # Snap Training: the spell's mark, the whole time
+            else:
+                k = self.tracker.armed_key(now)                     # only the marks of the key that is armed
+                shown = [mk for mk in marks if mk["key"] == k] if k else []
+            shown += [mk for mk in marks if mk.get("pin") is True and not any(mk is x for x in shown)]      # (pinned marks are always on)
         boxes = mana_boxes(m, inner, self.marks_front(shown))
         self._boxes_now = list(boxes)
         sig = (round(m["x"]), round(m["y"]), round(m["w"]), round(m["h"]), tuple(m["zone"]), self._mana_img[0],
@@ -11906,10 +12655,13 @@ class App:
             box, var = self.bound_entry(row, f"{mk[fld]:g}", lambda t, m=mk, f=fld: self.mark_value(m, f, t), 38, 22)
             box.pack(side="left", padx=(2, 0))
             box.entry.bind("<FocusIn>", lambda e, m=mk: self._select_mark(m), add="+")
+            for w_ in (box, box.entry):
+                w_.bind("<Button-3>", lambda e, m=mk: self.mark_toggle_pin(m))        # right-click a % : the mark stays on the bar
             vars_.append(var)
         self.mark_vars[id(mk)] = vars_
-        sw = PixBtn(row, "", lambda m=mk: (self._select_mark(m), self.mark_pick_color(m)), self.fs, 24, 22, bd=2)
+        sw = PixBtn(row, "P" if mk.get("pin") else "", lambda m=mk: (self._select_mark(m), self.mark_pick_color(m)), self.fs, 24, 22, bd=2)
         sw.lbl.config(bg=mk["color"])
+        sw.lbl.bind("<Button-3>", lambda e, m=mk: self.mark_toggle_pin(m))
         sw.lbl.bind("<Enter>", lambda e: None)
         sw.lbl.bind("<Leave>", lambda e: None)
         sw.pack(side="left", padx=(2, 0))
@@ -11936,6 +12688,19 @@ class App:
         self.mana_ov.sig = None
         self._select_mark(mk)
         self.draw_preview()
+
+    def mark_toggle_pin(self, mk):
+        """Right-click a mark's % box (or its colour square): the mark always stays on the mana bar (P on the colour square), even with no spell
+        in hand. Right-click again to go back to showing it only while its spell is in hand."""
+        if mk.get("pin"):
+            mk.pop("pin", None)
+            self.say("Mark unpinned: shows only while its spell is in your hand.", "Mark unpinned")
+        else:
+            mk["pin"] = True
+            self.say("Mark pinned: always on the mana bar (P). Right-click it again to unpin.", "Mark pinned")
+        save_cfg(self.cfg)
+        self.mana_ov.sig = None
+        self.rebuild_marks()
 
     def mark_toggle_kind(self, mk):
         mk["kind"] = "move" if mk["kind"] == "snap" else "snap"
@@ -12531,6 +13296,9 @@ class App:
                 self._inv_row(p, e)
         PixBtn(p, "+ Add move", self.add_inv, self.f, 110, 26).pack(anchor="w", padx=8, pady=(4, 2))
         self.label(p, "You can change the Box Color if you want", **small).pack(fill="x", padx=8, pady=(2, 3))
+        box, p = self.panel(self.inv_body, f"Equip keys in '{self.cfg['active']}'")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self._inv_keys_ui(p, lst, small)
         self.inv_refresh_status()
 
     def _inv_row(self, parent, e):
@@ -12737,6 +13505,9 @@ class App:
             box, p = self.panel(host, nm)
             box.pack(fill="x", padx=6, pady=(0, 6))
             self.label(p, txt, **small).pack(fill="x", padx=8, pady=(0, 3))
+        box, p = self.panel(host, "Desendra")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.label(p, "lol add ink blot and paint all over the place lol", **small).pack(fill="x", padx=8, pady=(0, 3))
         box, p = self.panel(host, "Where the coins go")
         box.pack(fill="x", padx=6, pady=(0, 6))
         self.coin_pos_rows(p, ("awk_pb", "awk_dash", "fisch_dash"))
@@ -12932,6 +13703,7 @@ class App:
 
     def awk_loop(self):
         """Looks at the 'DODGES: x' text ~15 times a second while Awakened runs (or the Fischeran dodges are on)."""
+        set_thread_priority(-1)                                    # (a screen reader gives way to the thread that catches the keys / clicks)
         while True:
             try:
                 now = time.time()
@@ -13200,8 +13972,8 @@ class App:
         self._mana_seen_now = True
         v = self.read_mana_pct()
         try:
-            if self.gate_open or getattr(self.tracker, "gate", None) is not None:
-                self.slow_drain.reset()                      # (the gate shortcut is up / a Gate waits for its name: casting it drains the mana too - no drain is looked for)
+            if self.gate_open or getattr(self.tracker, "gate", None) is not None or self.tracker.holding_spell(now):
+                self.slow_drain.reset()                      # (the gate shortcut is up / a Gate waits for its name: casting it drains the mana too; a spell in hand can drain it slowly: no drain is looked for)
             else:
                 self.slow_drain.feed(now, v)
         except Exception:
@@ -13241,6 +14013,7 @@ class App:
                 self.say("Slow mana drain: Block Run and the keybinds are paused" if drain else "Mana drain over: Block Run is back", "Mana drain" if drain else "Drain over")
 
     def _pct_loop(self):
+        set_thread_priority(-1)
         while True:
             try:
                 self._pct_once(time.time())
@@ -13314,6 +14087,7 @@ class App:
     def _probe_loop(self):
         """Looks at the mana bar ~30 times a second while the mana dashes are on, so a dash is judged by the mana you had
         just BEFORE the key press (the dash itself may use the mana up)."""
+        set_thread_priority(-1)                                    # (a screen reader gives way to the thread that catches the keys / clicks)
         while True:
             try:
                 self._probe_once(time.time())
@@ -13446,6 +14220,7 @@ class App:
 
     def _inv_loop(self):
         """Twice a second while the game is in front: see inv_step."""
+        set_thread_priority(-1)                                    # (a screen reader gives way to the thread that catches the keys / clicks)
         while not getattr(self, "_closing", False):
             time.sleep(0.4)
             try:
@@ -13469,6 +14244,7 @@ class App:
 
     def _hp_loop(self):
         """About 7 times a second while the game is in front: look at the HP bar (see hp_failsafe)."""
+        set_thread_priority(-1)                                    # (a screen reader gives way to the thread that catches the keys / clicks)
         while not getattr(self, "_closing", False):
             time.sleep(0.07)
             try:
@@ -13766,38 +14542,57 @@ class App:
 
     # ---------- potion keys (Extras > Inventory > Potions) ----------
     def apply_potion_keys(self):
-        """(Re)loads the potion keys into the input hook: {pressed key id: potion name}."""
-        pk = self.cfg["settings"].get("potion_keys")
+        """(Re)loads the potion keys (drink) and the inventory item keys (equip) into the input hook: {pressed key id: item name}."""
         m = {}
-        for nm, spec in (pk.items() if isinstance(pk, dict) else ()):
-            try:
-                if isinstance(spec, dict) and 0 < int(spec.get("id")) < 0x200:
-                    m[int(spec["id"])] = str(nm)
-            except (TypeError, ValueError):
-                pass
+        for store in ("inv_keys", "potion_keys"):
+            pk = self.cfg["settings"].get(store)
+            for nm, spec in (pk.items() if isinstance(pk, dict) else ()):
+                try:
+                    if isinstance(spec, dict) and valid_press_id(int(spec.get("id"))):
+                        m[int(spec["id"])] = str(nm)
+                except (TypeError, ValueError):
+                    pass
         self.potion_map = m
 
+    def _key_row(self, p, store, nm, text=None):
+        """One row: the item's name and the box its key is bound in (click + press a key; right-click twice = removed)."""
+        pk = self.cfg["settings"].setdefault(store, {})
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=2)
+        self.label(row, text or nm, font=self.fs, width=14).pack(side="left", padx=(4, 0))
+        spec = pk.get(nm)
+        ref = (store, nm)
+        waiting = self.pk_cap == ref
+        armed = self.pk_del[0] == ref and time.time() < self.pk_del[1]
+        b = PixBtn(row, "press a key..." if waiting else (spec["label"] if isinstance(spec, dict) else ""),
+                   lambda r=ref: self.pk_pick(r), self.f, 100, 24, bd=2)
+        b.pack(side="right", padx=(0, 18))
+        b.lbl.bind("<ButtonRelease-3>", lambda ev, r=ref: self.pk_rclick(r))
+        if armed:
+            b.lbl.config(bg=RED, fg="#ffffff")
+            b.lbl.bind("<Enter>", lambda ev: None)
+            b.lbl.bind("<Leave>", lambda ev: None)
+
+    def _inv_keys_ui(self, p, lst, small):
+        self.label(p, "Equip keybind: bind an inventory item to a key, press it and the tool opens your inventory, equips the item (it doesn't use it) "
+                      "and closes the inventory again. Nothing is bound until you bind it (click a box, press a key or Mouse 3 / 4 / 5).",
+                   **small).pack(fill="x", padx=8, pady=(4, 2))
+        n = 0
+        for e in lst:
+            if e.get("potion") or e.get("builtin") or not e.get("name"):
+                continue
+            self._key_row(p, "inv_keys", e["name"])
+            n += 1
+        if not n:
+            self.label(p, "(no moves in the inventory yet: add one above)", **small).pack(fill="x", padx=8, pady=(0, 3))
+
     def _potion_keys_ui(self, p, lst, small):
-        pk = self.cfg["settings"].setdefault("potion_keys", {})
         self.label(p, "Potion Keybind, yeah you bind your potion to a key then u press that key to drink it lol.", **small).pack(fill="x", padx=8, pady=(4, 2))
         for e in lst:
             if not e.get("potion"):
                 continue
             nm = e["name"]
-            row = tk.Frame(p, bg=PARCH)
-            row.pack(fill="x", padx=8, pady=2)
-            self.label(row, nm, font=self.fs, width=14).pack(side="left", padx=(4, 0))
-            spec = pk.get(nm)
-            waiting = self.pk_cap == nm
-            armed = self.pk_del[0] == nm and time.time() < self.pk_del[1]
-            b = PixBtn(row, "press a key..." if waiting else (spec["label"] if isinstance(spec, dict) else ""),
-                       lambda n=nm: self.pk_pick(n), self.f, 100, 24, bd=2)
-            b.pack(side="right", padx=(0, 18))
-            b.lbl.bind("<ButtonRelease-3>", lambda ev, n=nm: self.pk_rclick(n))
-            if armed:
-                b.lbl.config(bg=RED, fg="#ffffff")
-                b.lbl.bind("<Enter>", lambda ev: None)
-                b.lbl.bind("<Leave>", lambda ev: None)
+            self._key_row(p, "potion_keys", nm)
             if is_health_potion_name(nm):
                 hrow = tk.Frame(p, bg=PARCH)
                 hrow.pack(fill="x", padx=8, pady=(0, 2))
@@ -13831,36 +14626,39 @@ class App:
                    ).pack(fill="x", padx=8, pady=(0, 2))
         self.entry_row(p, "Potion key: wait between steps (ms)", "potion_wait_ms", float, w=56, h=22)
 
-    def pk_pick(self, name):
-        if self.pk_cap == name:                                 # click again = cancel
+    def pk_pick(self, ref):
+        """ref = (settings store, item name): ('potion_keys', 'Health Potion') drinks it, ('inv_keys', 'Some Move') equips it."""
+        if self.pk_cap == ref:                                  # click again = cancel
             self.pk_cap, self.inputs.kb_capture = None, None
             self.rebuild_inv()
             return
-        self.pk_cap, self.kb_cap, self.gk_cap = name, None, None
+        self.pk_cap, self.kb_cap, self.gk_cap = ref, None, None
         self.inputs.kb_capture = lambda kid, label: self.q.put(("potcap", kid, label))      # (runs in the input thread: only queues)
         self.rebuild_inv()
-        self.say("Press the key you want to use for this potion (Esc = cancel).", "Press a key...")
+        self.say("Press the key (or Mouse 3 / 4 / 5) you want to use for this item (Esc = cancel).", "Press a key...")
 
     def finish_pk_cap(self, kid, label):
-        name, self.pk_cap, self.inputs.kb_capture = self.pk_cap, None, None
-        if name is not None and kid is not None:
-            pk = self.cfg["settings"].setdefault("potion_keys", {})
-            for n_ in [n_ for n_, v in pk.items() if isinstance(v, dict) and v.get("id") == int(kid)]:
-                pk.pop(n_, None)                                # (one key = one potion)
-            pk[name] = {"id": int(kid), "label": str(label or "KEY")[:16]}
+        ref, self.pk_cap, self.inputs.kb_capture = self.pk_cap, None, None
+        if ref is not None and kid is not None:
+            store, name = ref
+            for st in ("potion_keys", "inv_keys"):
+                pk = self.cfg["settings"].setdefault(st, {})
+                for n_ in [n_ for n_, v in pk.items() if isinstance(v, dict) and v.get("id") == int(kid)]:
+                    pk.pop(n_, None)                            # (one key = one item)
+            self.cfg["settings"].setdefault(store, {})[name] = {"id": int(kid), "label": str(label or "KEY")[:16]}
             save_cfg(self.cfg)
             self.apply_potion_keys()
         self.rebuild_inv()
 
-    def pk_rclick(self, name):
+    def pk_rclick(self, ref):
         now = time.time()
-        if self.pk_del[0] == name and now < self.pk_del[1]:
+        if self.pk_del[0] == ref and now < self.pk_del[1]:
             self.pk_del = (None, 0.0)
-            self.cfg["settings"].setdefault("potion_keys", {}).pop(name, None)
+            self.cfg["settings"].setdefault(ref[0], {}).pop(ref[1], None)
             save_cfg(self.cfg)
             self.apply_potion_keys()
         else:
-            self.pk_del = (name, now + 3.0)
+            self.pk_del = (ref, now + 3.0)
             self.root.after(3100, self.rebuild_inv)
         self.rebuild_inv()
 
@@ -13908,19 +14706,20 @@ class App:
                 return
             if not IS_WIN:
                 return
-            ent = next((e for e in inv_of(self.cfg) if e.get("potion") and _norm_name(e["name"]) == _norm_name(name)), None)
+            ent = next((e for e in inv_of(self.cfg) if _norm_name(e["name"]) == _norm_name(name)), None)
             if ent is None:
-                self.q.put(("msg", f"Potion key: '{name}' isn't one of this profile's potions."))
+                self.q.put(("msg", f"Item key: '{name}' isn't in this profile's inventory."))
                 return
             name = ent["name"]
+            equip_only = not ent.get("potion")                    # (a potion key drinks it; the key of any other inventory item only equips it)
             if not self.inv_have(name):
-                self.q.put(("msg", f"Potion key: teach the tool the {name} card first (Extras > Inventory > Learn)."))
+                self.q.put(("msg", f"Item key: teach the tool the {name} card first (Extras > Inventory > Learn)."))
                 return
-            left = self.tracker.potion_wait(time.time())
+            left = 0.0 if equip_only else self.tracker.potion_wait(time.time())
             if left > 0.05:
                 self.q.put(("msg", f"Potions are on cooldown ({left:.0f}s left)"))
                 return
-            helmet = bool(S.get("helm_swap", True) and is_health_potion_name(name))
+            helmet = bool(S.get("helm_swap", True) and is_health_potion_name(name)) and not equip_only
             note = ""
             if helmet and not self.inv_have(HELMET_CARD):
                 helmet, note = False, " (teach it your helmet to have it taken off: Extras > Inventory)"
@@ -13935,7 +14734,7 @@ class App:
 
             def done(why):
                 hs = box[0].helm_state if box else "-"
-                self.q.put(("msg", (f"Drank {name}." if why == "done" else f"Potion key: {why}")
+                self.q.put(("msg", ((f"Equipped {name}." if equip_only else f"Drank {name}.") if why == "done" else f"Potion key: {why}")
                             + (f" Helmet: {hs}." if helmet and hs != "-" else "")))
             pd = PotionDrinker(
                 allowed=self.train_allowed, inv_open=lambda: self.inv_is_open(), step=step, drink_time=self.tracker.DRINK_TIME,
@@ -13948,7 +14747,7 @@ class App:
                 on_stop=lambda n, why: done(why))
             box.append(pd)
             self.potion_job = pd
-            pd.start({"name": name, "helmet": helmet, "need_bright": bool(S.get("helm_need_bright", False))})
+            pd.start({"name": name, "helmet": helmet, "equip_only": equip_only, "need_bright": bool(S.get("helm_need_bright", False))})
             if note:
                 self.q.put(("msg", f"Potion key: {name}{note}"))
         except Exception as ex:
@@ -14784,13 +15583,28 @@ class App:
         self.back_button(f, "other")
         big = (self.family, -(UI_FONT_PX + 6))
         self.label(f, "Gate", font=big).pack(fill="x", padx=12, pady=(8, 0))
-        self.label(f, "Right click with a Gate spell and boxes with the gates come up: click one, or use W A S D to move and Ctrl to pick. "
-                      "Needs the tracker on and the Gate in the Snap Spells list.", font=self.fs, fg=DIM, justify="left",
-                   wraplength=PAGE_W - 40).pack(fill="x", padx=12, pady=(4, 0))
         for i, (key, text) in enumerate((("gatepin", "Pinned Gates"), ("gatekeys", "Gates Keybinds"))):
             row = tk.Frame(f, bg=PARCH)
             row.pack(fill="x", padx=12, pady=(14 if i == 0 else 8, 0))
             PixBtn(row, text, lambda k=key: self.show_extra(k), big, 260, 44).pack(side="left", padx=(8, 0))
+        row = tk.Frame(f, bg=PARCH)
+        row.pack(fill="x", padx=12, pady=(14, 0))
+        box = tk.Frame(row, bg=PARCH)
+        box.pack(side="top")
+
+        def step(d):
+            cur = self.cfg["settings"].get("gate_mode")
+            i = (GATE_MODES.index(cur) if cur in GATE_MODES else 0) + d
+            self.cfg["settings"]["gate_mode"] = GATE_MODES[i % len(GATE_MODES)]
+            save_cfg(self.cfg)
+            self.inputs._gate_buf = None
+            self.gate_close()
+            mid.lbl.config(text=GATE_MODE_LABEL[self.cfg["settings"]["gate_mode"]])
+
+        PixBtn(box, "<", lambda: step(-1), big, 30, 28).pack(side="left")
+        mid = PixBtn(box, GATE_MODE_LABEL.get(self.cfg["settings"].get("gate_mode"), "POP-UP"), lambda: step(1), self.fs, 120, 28)
+        mid.pack(side="left", padx=4)
+        PixBtn(box, ">", lambda: step(1), big, 30, 28).pack(side="left")
 
     # ----- Pinned Gates page -----
     def build_gatepin(self, f):
@@ -14925,7 +15739,7 @@ class App:
         self.kb_cap = None
         self.inputs.kb_capture = lambda kid, label: self.q.put(("gatecap", kid, label))
         self._gk_rebuild()
-        self.say("Press the key you want to use (Esc = cancel).", "Press a key...")
+        self.say("Press the key (or Mouse 3 / 4 / 5) you want to use (Esc = cancel).", "Press a key...")
 
     def finish_gk_cap(self, kid, label):
         ref, self.gk_cap, self.inputs.kb_capture = self.gk_cap, None, None
@@ -14984,6 +15798,7 @@ class App:
         for w in self.kb_body.winfo_children():
             w.destroy()
         kb = _get_or_make(self.cfg, "keybinds", clean_keybinds)
+        self.check_row(self.kb_body, "Also take keys sent by mouse software (12-button mice: Razer / Logitech)", "kb_accept_injected", wrap=250)
         for slot, lab in KB_SLOTS:
             self._kb_row(lab, kb["map"].get(slot), ("slot", slot))
         for i, e in enumerate(kb["custom"]):
@@ -15012,7 +15827,7 @@ class App:
         self.kb_cap = ref
         self.inputs.kb_capture = lambda kid, label: self.q.put(("kbcap", kid, label))      # (runs in the input thread: only queues)
         self._rebuild_kb()
-        self.say("Press the key you want to use (Esc = cancel).", "Press a key...")
+        self.say("Press the key (or Mouse 3 / 4 / 5) you want to use (Esc = cancel).", "Press a key...")
 
     def kb_add(self):
         self.kb_pick(("new",))
@@ -15028,6 +15843,10 @@ class App:
             elif ref[0] == "custom" and ref[1] < len(kb["custom"]):
                 kb["custom"][ref[1]]["key"] = spec
             elif ref[0] == "new":
+                if int(kid) in MOUSE_SIDE_LABEL:                  # (the FIRST key of a custom pair is the key the game gets: a keyboard key)
+                    self.say("The key that gets sent has to be a keyboard key. Mouse 4 / 5 can be the key you PRESS.", "Keyboard key")
+                    self._rebuild_kb()
+                    return
                 kb["custom"].append({"send": spec, "key": None})
             save_cfg(self.cfg)
             self.apply_keybinds()
@@ -16393,9 +17212,10 @@ class App:
         self.check_row(inner, "Show Cooldown Numbers On Non Hotkey/Inventory (Potions/Buffs etc)", "buff_numbers", wrap=250)
         self.check_row(inner, "Keep this window on top", "topmost",
                        extra=lambda v: self.root.attributes("-topmost", v))
-        self.check_row(inner, "Block Run (all directions): double-tap / hold W, A, S, D to run, F blocks while running, Q dashes. Off while the mana drains at a climbing speed, and after Space twice + that drain", "block_run", wrap=230)
+        self.check_row(inner, "Block Run: hold W and press F to block-run (W, F, W, super fast; holding F doesn't repeat it)", "block_run", wrap=230)
         self.check_row(inner, "Only show the cooldown boxes, Mana Overlay, Decorations and Dash / PB coins while the game window is in front", "mana_only_focused", wrap=230)
         self.check_row(inner, "Cast Run: casting a held spell (left click) while holding W keeps you running (W, click, W, super fast)", "cast_run", wrap=230)
+        self.check_row(inner, "All directional run: with Block Run and / or Cast Run, the all-directional script replaces their W-only versions: W / A / S / D run (double-tap / hold), Q dashes, F blocks while running (Block Run), a click casts while running (Cast Run). Off while the mana drains at a climbing speed, and after Space twice + that drain", "all_dir_run", wrap=230)
         self.hp_status_lbl = self.label(inner, "Health bar: -", font=self.fs, justify="left", wraplength=PAGE_W - 40)
         self.hp_status_lbl.pack(fill="x", padx=8, pady=(4, 0))
         PixBtn(inner, "Save health bar picture", self.hp_debug_save, self.f, 190, 24, bd=2).pack(anchor="w", padx=8, pady=(2, 2))
@@ -16595,7 +17415,7 @@ class App:
             btn = self.move_key_btns.get(id(mv))
             if btn is not None:
                 waiting = self.capturing and self.capturing[0] == "move" and self.capturing[1] is mv
-                btn.lbl.config(text="..." if waiting else mv["key"])
+                btn.lbl.config(text="..." if waiting else ("" if mv.get("ininv") else mv["key"]))
         for mk in self.marks():
             btn = self.mark_key_btns.get(id(mk))
             if btn is not None:
@@ -16778,7 +17598,7 @@ class App:
                 old = mv["key"]
                 self.tracker.swap_keys(old, name, snap=(kind == "snap"))
                 mv["key"], other["key"] = name, old
-                lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+                lst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"])))
                 save_cfg(self.cfg)
                 self.rebuild_moves()
                 self.say(f"'{mv['name']}' is now on key {name} and '{other['name']}' moved to key {old}.",
@@ -16786,7 +17606,7 @@ class App:
             else:
                 self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
                 mv["key"] = name
-                lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+                lst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"])))
                 save_cfg(self.cfg)
                 self.rebuild_moves()
                 self.say(f"'{mv['name']}' is now on key {name}.", f"Key: {name}")
@@ -17242,6 +18062,7 @@ class App:
                     states[i] = bm_now[k] + ("soul",)
                 if k in awk_now:
                     states[i] = awk_now[k] + ("soul",)                                      # Awakened: black while it lasts, like Soul Berserk
+        cd_over = not any(states)                               # (every cooldown has run out: nothing is cooling down any more - not a hidden / blinking look)
         if S.get("mana_only_focused", True) and now >= self.demo_until and not self.game_focused():
             states = [None] * len(HOTBAR_KEYS)                  # game not in front: boxes hidden (the cooldowns keep running)
         elif self.menu_hidden(now):
@@ -17250,7 +18071,7 @@ class App:
             if self._sig is not None:
                 if getattr(self, "_empty_t0", None) is None:
                     self._empty_t0 = now
-                if now - self._empty_t0 >= 0.35:                # (a blink of "nothing to show" - a focus flick, a bad look - leaves the boxes alone)
+                if cd_over or now - self._empty_t0 >= 0.35:     # (the last cooldown ran out: the boxes go at once, no "0.0" left on screen; a blink of "nothing to show" - a focus flick, a bad look - leaves the boxes alone)
                     self.ov.hide()
                     self._sig = None
                     self._empty_t0 = None
