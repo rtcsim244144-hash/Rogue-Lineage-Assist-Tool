@@ -96,7 +96,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -110,6 +110,14 @@ VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
 # on a Turkish (and other non-US) layout the key at that place is not "-" / "=" (a Turkish keyboard has "?" there), so its virtual key differs.
 SCAN_HOTBAR = {0x0C: "-", 0x0D: "="}
 SCAN_HOTBAR_US = dict(SCAN_HOTBAR)
+
+
+def is_ahk_extra(extra):
+    """True for the marker AutoHotkey puts on the keys / clicks its own scripts send (its 'ignore' values)."""
+    try:
+        return 0xFFC3D44D <= (int(extra) & 0xFFFFFFFF) <= 0xFFC3D452
+    except (TypeError, ValueError):
+        return False
 
 
 def hotbar_layout_for(vk_of_scan):
@@ -214,6 +222,11 @@ DEFAULT_SETTINGS = {
     "update_check": True,    # look for a new version when the program starts (only if an update link is set)
     "update_base": UPDATE_BASE_URL,   # the web folder the updates come from
     "inv_hide": True,        # hide the coins while the inventory is open
+    "house_notice_seen": False,   # the House Setup notice (public MQTT brokers, your IP) was shown
+    "whatsnew_cache": {},     # the last "What's New?" text read from GitHub: {"v": version, "lines": [...]} (used when GitHub can not be reached)
+    "basecd_done": False,    # the one-time fill of the known moves' base cooldowns was done
+    "seen_update": "",       # the newest version whose "Update Available" window was shown
+    "seen_log": "",          # the version whose "What's New?" window was already shown
     "cast_run": True,        # Cast Run: casting a held spell (left click) while running does W up, W down, W up, click, W down so the run is not lost
     "cast_run_lock": 1.0,    # seconds after a Cast Run in which clicks on the same spell are dismissed (0 = no lock)
     "ahk_chat_suspend": True,   # while the Roblox chat is typed in, your own AutoHotkey scripts are paused (File > Suspend Hotkeys)
@@ -253,6 +266,13 @@ DEFAULT_SETTINGS = {
     "inv_box_width": 3,
     "inv_box_opacity": 0.6,
     "buff_numbers": True,         # the seconds left as a number on the potion effect icons
+    "house_on": False,            # Housemate HP: show the HP bars + buffs of the people in my house
+    "house_share": True,          # ... and send my own HP + buffs to them
+    "house_name": "",             # the name my housemates see
+    "house_server": "",           # the https address of the house server
+    "house_hid": "", "house_mid": "", "house_secret": "", "house_title": "",      # my place in a house (made by Join / Create: never shared)
+    "house_x": 22, "house_y": 450, "house_dx": 7, "house_dy": -25, "house_scale": 1.0,
+    "house_numbers": False,       # the seconds left on the housemates' buff icons
     "dblood_sound": True,         # Dragon Blood: listen for its low-health turning-off sound while it is on
     "inv_items": {},         # the item pictures learned by the user: name -> base64 (see inv_card_sig)
     "click_equip": True,     # clicking a hotbar slot with the mouse equips that move (same as pressing its key)
@@ -285,7 +305,7 @@ DEFAULT_SETTINGS = {
     "snap_webhook": "",        # Snap Training: a Discord webhook, posts every SNAP_HOOK_EVERY casts trained (it does not stop the trainer)
     "dayfarm_webhook": "",     # Day Farm: a Discord webhook, posts a screenshot of the game every 30 minutes (only while the HP bar is on screen)
     "key_imenu": "[",          # Instant Menu: presses \\, Enter, \\ (Extras > Other Stuff > Instant Menu)
-    "key_gank": "]",           # sends a screenshot of the game to the Gank Ping webhook (Extras > Other Stuff)
+    "key_gank": "]",           # sends a screenshot of the game to the Gank Ping webhook (Extras > House Stuff)
     "gank_webhook": "",       # ... the Discord webhook link for it
     "gank_name": "",          # ... the name shown in the message
     "brew_nudge": False,      # ... a tiny 1 px mouse wiggle after moving (helps the game notice the cursor)
@@ -513,6 +533,239 @@ def ensure_snarv_pair(cfg, snap):
     return True
 
 
+# The casting window of every spell people can get in Rogue Lineage (wiki "Spells" page, Nov 2026): name -> (normal %, snap %). A range is
+# (lowest, highest) mana % the spell can be cast at; None = no such version (or the wiki gives none). Seasonal spells (Gourdus, Dulciferus,
+# Vir Nivis ...) and spells nobody can get any more (Mori) are not listed. (Snap Trickstus 15-40, Snap Nocere 70-85 and Snap Fimbulvetr 75-90 were confirmed by the developer.)
+SPELL_MARKS = {
+    "celeritas": ((75, 95), (75, 95)),
+    "trickstus": ((30, 70), (15, 40)),
+    "sagitta sol": ((50, 60), (40, 70)),
+    "hystericus": ((75, 85), (10, 50)),
+    "tenebris": ((90, 100), (40, 60)),
+    "viribus": ((15, 30), (60, 75)),
+    "velo": ((50, 100), (50, 60)),                 # (50-100 % to cast, 0-100 % to uncast)
+    "telorum": ((80, 90), (75, 85)),
+    "armis": ((30, 60), (70, 85)),
+    "gate": ((75, 85), (75, 85)),
+    "snarvindur": ((55, 75), (15, 30)),
+    "ignis": ((85, 95), (50, 60)),
+    "gelidus": ((80, 90), (90, 100)),
+    "nocere": ((70, 80), (70, 85)),
+    "trahere": ((70, 90), None),
+    "manus dei": ((95, 97), (50, 60)),
+    "fimbulvetr": ((90, 98), (75, 90)),
+    "contrarium": ((60, 100), (70, 85)),
+    "percutiens": ((60, 70), (70, 80)),
+    "hoppa": ((30, 60), (50, 60)),
+    "inferi": ((1, 30), None),
+}
+SPELL_ALIAS = {}                               # (exact names only: a partly typed name must not match something else)
+
+
+def auto_mark_for(name, snap):
+    """A spell name ('Viribus', 'Snap Ignis', 'geli') -> (spell, (low %, high %)) for the normal / snap version; None when it is no known spell."""
+    n = re.sub(r"^snap\s+", "", _norm_name(name))
+    n = SPELL_ALIAS.get(n, n)
+    rng = SPELL_MARKS.get(n)
+    rng = rng[1 if snap else 0] if rng else None
+    return (n, rng) if rng else None
+
+
+def sync_auto_marks(cfg):
+    """Every Normal Spell / Snap spell with a known name has its mana mark made for it (cast % from SPELL_MARKS) on its hotbar key. The mark
+    follows the spell: its key changes with the spell's key, it goes when the spell is renamed to something else / deleted. A spell kept in the
+    inventory gets its mark on its card ("inv:<name>", the Spells in Inventory list): it shows when the card is clicked to equip it. A mark you made yourself on that key is left alone; a mark you deleted does not come back (move["nomark"]). Returns True when
+    something changed."""
+    changed = False
+    for prof, moves in cfg.get("profiles", {}).items():
+        snaps = cfg.get("snaps", {}).get(prof, [])
+        marks = cfg.setdefault("marks", {}).setdefault(prof, [])
+        keep, new = [], []
+        for kind, lst in (("move", [m for m in moves if m.get("spell")]), ("snap", list(snaps))):
+            for mv in lst:
+                key = mv.get("key")
+                if mv.get("ininv"):
+                    key = inv_vkey(mv.get("name") or "") if _norm_name(mv.get("name") or "") else None       # (in the inventory: the mark is for its card, "inv:<name>")
+                a = None if (key is None or (not is_inv_key(key) and key not in HOTBAR_KEYS)) else auto_mark_for(mv.get("name"), kind == "snap")
+                if a is None:
+                    continue
+                n, (lo, hi) = a
+                if mv.get("nomark") == n:
+                    continue                                                 # (deleted by the user: stays deleted until the spell is another one)
+                mk = next((m for m in marks if m.get("auto") == n and m.get("kind") == kind and not any(m is k for k in keep)), None)
+                if mk is not None:
+                    if mk["key"] != key:
+                        mk["key"] = key
+                        changed = True
+                    keep.append(mk)
+                else:
+                    new.append((kind, key, n, lo, hi))
+        for mk in list(marks):
+            if mk.get("auto") and not any(mk is k for k in keep):
+                marks.remove(mk)                                             # (its spell is gone or renamed)
+                changed = True
+        for kind, key, n, lo, hi in new:
+            if any(m["key"] == key and m.get("kind") == kind for m in marks):
+                continue                                                     # (a mark of your own is there already)
+            marks.append({"key": key, "kind": kind, "lo": float(lo), "hi": float(hi), "color": MARK_COLORS[kind], "auto": n})
+            changed = True
+    return changed
+
+
+# BASE COOLDOWNS of the moves every class has (the default profiles' numbers): typing one of these names into a Move fills its blank cooldown boxes
+# (cooldown, M2, "M1 and M2 don't share"). Only BLANK boxes are filled, so numbers you typed stay; the boxes stay editable. A weapon's M2 is 3 s.
+# Moves with no number here (buffs / class moves the tool already knows by name: Agility, Soul Rip, Awakened ...) have no cooldown to fill.
+BASE_CDS = {
+    'abyssal scream': (15.5, 0, False),
+    'action surge': (20, 0, False),
+    'angel ray': (20.6, 0, False),
+    'axe': (0, 3, False),
+    'axe kick': (9, 0, False),
+    'azure ignition': (0.5, 0, False),
+    'blade crash': (20, 0, False),
+    'blade flash': (10, 21, True),
+    'bloodletter': (15, 0, False),
+    'brandish': (11, 0, False),
+    'calm mind': (45, 0, False),
+    'chain pull': (15.6, 0, False),
+    'counterthrow': (18.5, 0, False),
+    'dagger': (0, 3, False),
+    'hammer': (0, 3, False),
+    'darkflame burst': (5, 0, False),
+    'deep sacrifice': (15.5, 0, False),
+    'demon flip': (8, 8, False),
+    'demon step': (0.5, 0, False),
+    'dragon roar': (15, 0, False),
+    'elegant slash': (10.5, 0, False),
+    'ethereal strike': (15.5, 0, False),
+    'fallen lightning': (5, 0, False),
+    'flame charge': (5, 0, False),
+    'flowing counter': (10, 0, False),
+    'grapple': (7.5, 0, False),
+    'greatsword': (0, 3, False),
+    'grudge': (16, 0, False),
+    'harpoon': (10, 0, False),
+    "hunter's focus": (30, 0, False),
+    'ice charge': (5, 0, False),
+    'impale': (15.5, 0, False),
+    'impure crystals': (5, 0, False),
+    'interrogation': (25.5, 0, False),
+    'joyous dance': (10, 0, False),
+    'katana': (0, 3, False),
+    'leg breaker': (11, 0, False),
+    'lethality': (30.5, 0, False),
+    'light piercer': (9, 0, False),
+    'lightning drop': (12, 0, False),
+    'lightning elbow': (10.5, 0, False),
+    'monastic stance': (42, 0, False),
+    "needle's eye": (10.5, 0, False),
+    "ocean's protection": (60, 0, False),
+    'owl slash': (10.8, 0, False),
+    'pavise': (60, 0, False),
+    'pommel strike': (15.5, 0, False),
+    'puncture': (19, 0, False),
+    'rapier': (0, 3, False),
+    'rift dive': (26, 0, False),
+    'rising dragon': (11.5, 0, False),
+    'scathing strike': (12.5, 0, False),
+    'serpent strike': (15.5, 0, False),
+    'shadow fan': (10.5, 0, False),
+    'shadowrush': (8.7, 0, False),
+    'shoulder bash': (16, 0, False),
+    'skewer': (12, 0, False),
+    'smite': (15.5, 0, False),
+    'song of lethargy': (10, 0, False),
+    'spear': (0, 3, False),
+    'spear crusher': (8.5, 0, False),
+    'spin kick': (10.5, 0, False),
+    'subzero strike': (15.5, 0, False),
+    'swallow reversal': (15, 15, False),
+    'sweet soothing': (10, 0, False),
+    'sword': (0, 3, False),
+    'symphony of horses': (10, 0, False),
+    'the waaith': (1, 0, False),
+    'thunder charge': (5, 0, False),
+    'thunder spear crash': (15, 0, False),
+    'tidal trident': (14, 0, False),
+    'triple dagger throw': (10.5, 0, False),
+    'triple slash': (10, 0, False),
+    'triple strike': (16, 0, False),
+    "vinifera's song": (10, 0, False),
+    'white fire charge': (5, 0, False),
+    'wing soar': (17, 0, False),
+    'withstand': (6, 0, False),
+    'wrathful leap': (11.6, 0, False),
+    'zealous lunge': (15.5, 0, False),
+}
+
+
+def snap_fixed_cd(name, gate_cd=None):
+    """The cooldown a SNAP spell of this name always has (it shows in the box when you add it): Gelidus 3 s, Gate 6.5 s. None for any other spell."""
+    n = str(name or "").lower()
+    if any(w and w in n for w in RUNNING_SNAPS):
+        return 3.0
+    if any(w and w in n for w in GATE_SNAPS):
+        return float(gate_cd) if gate_cd and gate_cd > 0 else GATE_CD
+    return None
+
+
+def base_cd_for(name):
+    """(cooldown, M2, split) a move of this name starts with; None for an unknown name."""
+    n = _norm_name(name)
+    v = BASE_CDS.get(n)
+    if v is None and n and is_axe_name(n):
+        v = (0, 3, False)                                       # (Axe / Battle Axe / Greataxe ... : a weapon)
+    return v
+
+
+def apply_base_cd(m):
+    """Fills the BLANK cooldown boxes of a Move row (not a Normal Spell / snap spell) from BASE_CDS. What an earlier fill put there for a name typed so
+    far (\"Axe\" on the way to \"Axe Kick\") is taken back first, if nobody changed it since. Returns True when the row changed."""
+    if m.get("spell") or "cd2" not in m:
+        return False
+    def vals():
+        return (round(float(m.get("cd") or 0.0), 4), round(float(m.get("cd2") or 0.0), 4), bool(m.get("split")))
+    changed = False
+    rec = m.pop("basecd", None)
+    if rec and vals() == tuple(rec["now"]):
+        m["cd"], m["cd2"], m["split"] = rec["prev"][0], rec["prev"][1], bool(rec["prev"][2])
+        changed = True
+    want = base_cd_for(m.get("name"))
+    if not want or m.get("soul") or m.get("awk") or m.get("bmove") or m.get("pick"):
+        return changed
+    cur = vals()
+    new = list(cur)
+    if cur[0] == 0 and not m.get("zero") and want[0] > 0:
+        new[0] = float(want[0])
+    if cur[1] == 0 and want[1] > 0:
+        new[1] = float(want[1])
+        if want[2]:
+            new[2] = True
+    if tuple(new) == cur:
+        return changed
+    m["basecd"] = {"prev": list(cur), "now": list(new)}
+    m["cd"], m["cd2"], m["split"] = new[0], new[1], bool(new[2])
+    return True
+
+
+def sweep_base_cds(cfg):
+    """Once per config: every Move with a known name and blank boxes gets its base cooldowns (also the default profiles: the lapidarist's Hammer M2 is 3 s).
+    A profile the tool delivered and nobody changed stays "unchanged" for the pack updates. Returns how many rows changed."""
+    n = 0
+    fps = cfg.get("pack_fp", {})
+    for prof, moves in cfg.get("profiles", {}).items():
+        same = prof in fps and profile_fp(cfg, prof) == fps[prof]
+        k = 0
+        for m in moves:
+            if apply_base_cd(m):
+                m.pop("basecd", None)
+                k += 1
+        if k and same:
+            fps[prof] = profile_fp(cfg, prof)
+        n += k
+    return n
+
+
 def is_azure_ignition(name):
     return _norm_name(name) == AZURE_IGNITION_NAME
 
@@ -591,8 +844,12 @@ def clean_moves(moves, m2=False):
             ue = bool(m.get("unequip", False))                # right-click the name box: unequips after use
             d = ({"key": key, "name": nm, "cd": cd, "cd2": cd2, "split": bool(m.get("split", False)), "unequip": ue}
                  if m2 else {"key": key, "name": nm, "cd": cd, "unequip": ue})
+            if not m2 and snap_fixed_cd(nm) is not None:
+                d["cd"] = snap_fixed_cd(nm)                    # Snap Gelidus 3 s / Snap Gate 6.5 s: fixed, shown in the box
             if not m2 and m.get("gf"):
                 d["gf"] = "hold" if m.get("gf") == "hold" else True      # snap Ignis: green = after the cast G is pressed, F held; white ("hold") = the same, and it also works while the user holds G
+            if m.get("nomark"):
+                d["nomark"] = str(m["nomark"])[:40]           # the mana mark made for this spell was deleted by the user: it is not made again
             if m2 and m.get("spell"):
                 d["spell"] = True                          # listed under "Normal Spells" (hovering one removes Charge / Azure)
                 if m.get("vir") and "viribus" in nm.lower():
@@ -1101,6 +1358,8 @@ def clean_marks(marks):
         mk = {"key": key, "kind": kind, "lo": round(lo, 2), "hi": round(hi, 2), "color": col.lower()}
         if m.get("pin") is True:
             mk["pin"] = True                                  # right-clicked in the Mana Overlay tab: the mark stays on the bar, spell in hand or not
+        if m.get("auto"):
+            mk["auto"] = str(m["auto"])[:40]                  # made by itself for a known spell (see sync_auto_marks): it follows that spell's key
         out.append(mk)
     return out
 
@@ -1237,6 +1496,23 @@ def _manufaktur_files():
     return out
 
 
+def _name_font(px):
+    """The housemates' names: Cinzel (the game's name font) when a Cinzel .ttf / .otf is next to the program, else the number font."""
+    for base in (APP_DIR, RES_DIR):
+        for pat in ("*inzel*.ttf", "*inzel*.otf", "*INZEL*.TTF", "*INZEL*.OTF"):
+            for fp in sorted(glob.glob(os.path.join(base, pat))):
+                try:
+                    f = ImageFont.truetype(fp, px)
+                    try:
+                        f.set_variation_by_axes([600])                 # (the variable file: semi-bold, like the game's name)
+                    except Exception:
+                        pass
+                    return f
+                except Exception:
+                    pass
+    return _num_font(px)
+
+
 def _num_font(px):
     """The font of the numbers drawn into pictures (potion seconds): Manufaktur when its file is next to the program."""
     for fp in _manufaktur_files():
@@ -1292,6 +1568,7 @@ def buff_art(kind, frac, size, text=""):
 
 
 BMOVE_PNG = {
+    "soulberserk": "iVBORw0KGgoAAAANSUhEUgAAAEIAAABCCAYAAADjVADoAAAACXBIWXMAAAsTAAALEwEAmpwYAAAF7UlEQVR4nO2cz28WRRjHP9uWsC8BfAuS6IsXgiHQ9KBvTTwI1cSLp1b/ADm1kZuGU0+QcOLoDUw5GP4BbRMTTyaingj1UsCQmF5oxSDtKoR3eYtZDzPPdnfed2Zn3vqj4H6SZt8fszvzPvOd53lmd6ZRlmVUEUVRlmVZVFlwB+Lb9ijLMqIo6muNLMui4nfbNUYURbuA3UAM7AF2AcPAE0Dqeaz/APbqcvuBP7MsuxlYX6ntzt/pMsT/hSzLoqH/uhE7hdoQmpGQwvMLt7zL/r5xn43ffmV4ZIT9zYMA7I73ALDZfUJjz16GhoeJoojNbpduNyV9/Iinm12ePt2k8/gRAA+TB2xudnntzXfZHTdCmsvs9Jh3WW8fEWKEnYSPMXJnCViNMb9wi5mpE/n7pUX9+ZxR4UV1bE/5N9J2rX7XNQmp5/3z11i48Hbf7yQSDoHbCM8L0+e+7fu5/PaIrfjdQzHZMnvv+5VrpbInj0wCfsowr3X5tj09OXPCPWpDlBhF9nqsPqI4JJYWew2wnJalNh4ri4tBfBAD2H5s0UByfcGsx8cgtiGS5xFmxvg8DQkTc4jIbw8Kn4NQHELSi6YSzGEmFFVgKpCVsgJFsZcCnGiROqHSeCmiPQWz8mZOj80V95jt60v0OdLTNn9TRMrKUcrm5xjKEEccEl6hVkSOt48QC/cow6BfL5se31TAgfgwAOvpak95KeurDGnXLGGqqBWhCY4apjLM9Dj3FSu9mZz03uGXjpc+7yQP+9Z18shkfh2bMmzMz4VFkFoRmmBF2CZK4htEEcUoYssThEZzHwAHEuUresa9A1d+ERJBakVovBVRpQRbXA/BqgyqfUI/6qgxAN6KsClBcM0+zUiyfE/1tOQPNorf22a7tlmp7YaODS9DyLCA6mm4Wa6IeY4kUIJpmEZzXx5aze/McGp2QJ1iD4iXIubn/G/IuCZS40c+BGCjc71vPdL74jRtiZaL0CEh1IrQOBVR9A0mVUqYfP1yXnY9+QGAlJ+cjXEpwfQnZv2D3EUvUitCE5xi+yrBVwXbrd/G0mKdUA2EUxGlKfec+1acKOHnXz4FoNHQ473zEFKZdk9UNOeGPqqo0km3fEWD/aX6fFL5etI1AN43b3E8n+xHp6N7Mz2OKKGT3HGe02iKYkQJ/fONf4JaEZrgqFHlG3IKfkGUcPXcDADtifKj+qUb6sna6QtXAGg038m/66RlVdh8hfgwuT3XnnLnQSa1IjTBs08brXufALARq/yhEx9Tx+ROjxJa04dK564t3Ae2FFNURiNV0afFe6osXwOwypfOtranwvKI4EnX0VRJ8KheTbD242elsqPpWwCsp8ogV8/N5AZ4eerFUllzjWebsfwcUAY5qg0giEHe4Av1QaoO+bTfGCK+1END46WI2Yvkljad5auxmlqLEtaaSuYk6tCeGOtRgiALN0QZUk6UUbxeK1HDaQPlWK+jzrVNvkKpFaHZdkK1zjf6lUqCWol2ak316fj0WR5kV4MaNT59FoBG81iPElb5vLqtA1ArQuOdUOVjz1gfIb7iFHfLJyQqmqw14WB0GtiKBhIuha/OK7+zFTZV6G0lh2jxkXqdl94AII7VtUzfUK+P2CbB6yNsvuK7+JXS+1Z6Rh2TQ7m/kB63UVQCKL+wzAulMh3+AGCcGee16hszAxI86aryFfIgZi1Wk7FT6d2Sv3AhShC/UFRDroSKvEGeyIXmE7UiNMGTLutaKosybvIBo3p+MJqooqIWQfyJcJOP89dVSujxA1oR9YqZARl45a2vMtZZ5UDsvuUmCpGbtaICGPxBzkBPw81F6bPTY6X12MVKzYSlyiDgXlDaj+KTdV8DSLsuVSwjNxely3bIIdtejZBtQM8Kts0rURRlI679kFcWbwOUdvDYesS5INVjUViR4rMKXyVUbU9wYd2mkDfiOVJF1VYm781ttq1AOx2bAYoEbYD1ueBOI6TN9ZZo6i3RJWpDaJyZ5d/9bxP+bXz/bQJoH+FzwWfNCIJv2/8CNYji06ooG9wAAAAASUVORK5CYII=",
     "tempest": "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",
     "powersurge": "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",
     "flock": "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",
@@ -1795,7 +2072,7 @@ def _near_any(a, colors):
     return best
 
 
-def mana_fill_boundary(arr, boxes=(), alpha=0.6, tol=24, tints=()):
+def mana_fill_boundary(arr, boxes=(), alpha=0.6, tol=24, tints=(), prev_row=None):
     """arr = the screen strip of the mana bar from the 100 % line (row 0) down to the 0 % line. Returns the row where the
     fill's top edge is (0 = full, len(arr) = empty). Rows are empty / filled by colour; thin tick lines of the overlay
     picture are outvoted. boxes = [(row0, row1, (r, g, b))]: cast-mark boxes drawn over the bar, where the empty colour is
@@ -1812,6 +2089,7 @@ def mana_fill_boundary(arr, boxes=(), alpha=0.6, tol=24, tints=()):
     if tc:                                                         # (an overlay on the bar - wherever it is - is empty mana, not fill)
         best = np.minimum(best, _near_any(a, tc) * 2)              # (tighter than the plain colours: blends are exact, the world isn't)
     is_empty = (best <= tol).mean(axis=1) >= 0.5
+    unknown = np.zeros(n, dtype=bool)
     for r0, r1, col in boxes:
         r0, r1 = max(0, int(r0)), min(n, int(r1))
         if r1 <= r0:
@@ -1820,10 +2098,22 @@ def mana_fill_boundary(arr, boxes=(), alpha=0.6, tol=24, tints=()):
         for c in emp:
             exp = alpha * np.array(col, dtype=float) + (1 - alpha) * c
             bl = np.minimum(bl, np.abs(a[r0:r1] - exp).sum(axis=2))
-        is_empty[r0:r1] = (bl <= tol).mean(axis=1) >= 0.5
-    cum_f = np.concatenate([[0], np.cumsum(~is_empty)])             # filled rows above row b are wrong
-    cum_e = np.concatenate([[0], np.cumsum(is_empty)])              # empty rows from row b down are wrong
+        blend_row = (bl <= tol).mean(axis=1) >= 0.5
+        is_empty[r0:r1] = blend_row
+        # A screen where the box is NOT see-through (Linux without a compositor, a window manager that ignores the strength): the box shows its own plain
+        # colour and nothing of the bar behind it. Those rows say nothing about the fill: they count for neither side.
+        op = (np.abs(a[r0:r1] - np.array(col, dtype=np.int16)).sum(axis=2) <= max(6, tol // 2)).mean(axis=1) >= 0.7
+        unknown[r0:r1] = op & ~(blend_row & (alpha < 0.95))
+        is_empty[r0:r1] &= ~unknown[r0:r1]
+    know = ~unknown
+    cum_f = np.concatenate([[0], np.cumsum(~is_empty & know)])      # filled rows above row b are wrong
+    cum_e = np.concatenate([[0], np.cumsum(is_empty & know)])       # empty rows from row b down are wrong
     cost = cum_f + (cum_e[-1] - cum_e)
+    if unknown.any():                                               # (the rows nobody can read: any edge among them fits - the one nearest the last reading wins)
+        best = np.flatnonzero(cost == cost.min())
+        if prev_row is not None:
+            return int(best[np.argmin(np.abs(best - prev_row))])
+        return int(best[len(best) // 2])
     return int(np.argmin(cost))
 
 
@@ -2335,6 +2625,9 @@ def load_cfg():
     first_run = not cfg["pack"]                            # the first start that gets the pack (once: a config that has any pack version recorded never gets it again)
     added = merge_default_pack(cfg)                        # the default profiles of this version, once
     added = list(added) + merge_extra_packs(cfg)           # the extra packs (each id once)
+    if not cfg["settings"].get("basecd_done"):
+        cfg["settings"]["basecd_done"] = True              # (once: blank cooldown boxes of known moves are filled; typing a name does it from then on)
+        sweep_base_cds(cfg)                                # (saved with the next save, like the pack marker)
     if first_run:
         cfg["settings"]["opacity"] = 0.3                   # 1.2.0: everyone's Red Box Strength starts at 0.3 (changeable afterwards)
         cfg["pack"] = DEFAULT_PACK_VERSION                 # (saved with the next save: until then the same thing happens again, which changes nothing)
@@ -2386,11 +2679,38 @@ def newer_version(a, b):
     return pa + (0,) * (n - len(pa)) > pb + (0,) * (n - len(pb))
 
 
+def clean_notes(body):
+    """A GitHub release description (Markdown / Discord style) -> a list of plain lines, one per change. "-# ^small text" lines join the line above."""
+    out = []
+    for raw in str(body or "").replace("\r", "").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        sub = s.startswith("-#")
+        if sub:
+            s = s[2:]
+        elif s.startswith("#"):
+            continue                                        # (a heading: "## What's new")
+        s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)       # [text](link) -> text
+        s = re.sub(r"[*_`~]+", "", s).strip()
+        s = re.sub(r"^(?:[-+*\u2022]\s+)+", "", s).lstrip("^ ").strip()
+        if not s:
+            continue
+        if sub and out:
+            out[-1] = out[-1] + ("" if out[-1].endswith((".", "!", "?", ":")) else ":") + " " + s
+        else:
+            out.append(s)
+    return [ln[:300] for ln in out[:40]]
+
+
 def parse_update_info(text):
     info = {}
     for line in str(text or "")[:20000].splitlines():
         if "=" in line and not line.lstrip().startswith("#"):
             k, v = line.split("=", 1)
+            if k.strip().lower() == "note":                 # (version.txt: one  note=...  line per change)
+                info.setdefault("notes_list", []).append(v.strip()[:300])
+                continue
             info[k.strip().lower()] = v.strip()
     if parse_version(info.get("version")) is None:
         raise UpdateError("version.txt has no valid 'version=' line.")
@@ -2482,6 +2802,9 @@ def parse_release_info(text):
     notes = next((ln.strip() for ln in str(rel.get("body") or "").splitlines() if ln.strip()), "")
     if notes:
         info["notes"] = notes[:200]
+    nl = clean_notes(rel.get("body"))
+    if nl:
+        info["notes_list"] = nl
     for asset in rel.get("assets") or []:
         name, url = str(asset.get("name") or ""), str(asset.get("browser_download_url") or "")
         digest = str(asset.get("digest") or "")
@@ -3040,6 +3363,21 @@ class Tracker:
             self.buffs = [b for b in self.buffs if now < b[1] + b[2]]
             return [(k, max(0.0, min(1.0, 1.0 - (now - t0) / ln))) for k, t0, ln in reversed(self.buffs)]
 
+    def house_buffs(self, now):
+        """The buffs for the housemates: [{k: icon, b: 1 = a buff move, l: seconds left (-1 = lasting), t: seconds in all}], potions + buff moves."""
+        out = []
+        self.buff_snapshot(now)                                           # (drops the ones that ran out)
+        with self.lock:
+            for k, t0, ln in reversed(self.buffs):
+                if now < t0 + ln and ln > 0:
+                    out.append({"k": k, "b": 0, "l": round(t0 + ln - now, 1), "t": round(ln, 1)})
+        for k, frac, left in self.bm_icons(now):
+            if left is None:
+                out.append({"k": k, "b": 1, "l": -1, "t": 0})
+            elif left > 0:
+                out.append({"k": k, "b": 1, "l": round(left, 1), "t": round(left / frac, 1) if frac > 0.001 else round(left, 1)})
+        return out[:12]
+
     def buff_times(self, now):
         """{icon kind: seconds left} of the potion effects that are on."""
         with self.lock:
@@ -3266,6 +3604,15 @@ class Tracker:
         if dk:
             self.bm[kind]["deb"], self.bm[kind]["debk"] = deb, dk
         back = ""
+        if kind == "powersurge":                              # Power Surge also takes the cooldown off an axe's M2
+            cleared = False
+            for m_ in self.cfg["profiles"].get(self.cfg["active"], []):
+                if is_axe_name(m_.get("name")) and not m_.get("spell") and self.m2_ready.get(m_["key"], 0.0) > now:
+                    self.m2_ready.pop(m_["key"], None)
+                    self.m2_total.pop(m_["key"], None)
+                    cleared = True
+            if cleared:
+                back = " - the axe's M2 cooldown is gone"
         if kind == "bane" and self.disarmed:                  # Bane gives the weapon back: the macro knows at once (no waiting for the screen)
             self.disarmed, self.absent, self._flip = False, frozenset(), 0
             if self.cfg["popts"].get(self.cfg["active"], {}).get("whisper_dj"):
@@ -3316,6 +3663,9 @@ class Tracker:
                 if deb and v["t1"] <= now < v["t1"] + deb:
                     left = v["t1"] + deb - now
                     live.append((v["t1"], v["debk"], max(0.0, min(1.0, left / deb)), left))
+            s_ = getattr(self, "soul", None)
+            if s_ and s_[1] <= now < s_[2]:                      # Wraith Knight: Soul Berserk lasting (same place as the other buffs)
+                live.append((s_[1], "soulberserk", max(0.0, min(1.0, (s_[2] - now) / s_[4])) if s_[4] > 0 else 1.0, s_[2] - now))
             p = self.bl_passive
             if p and p["t0"] <= now < p["t1"] and not any(k == "bloodline" for _t, k, _f, _l in live):
                 live.append((p["t0"], "bloodline", max(0.0, min(1.0, (p["t1"] - now) / (p["t1"] - p["t0"]))), p["t1"] - now))
@@ -3588,6 +3938,22 @@ class Tracker:
                     self.m2_total.pop(key, None)
         what = "stance over" if ws else ("back down" if is_blade_crash(mv.get("name") if mv else "") else "back up")
         return f"{(mv['name'] if mv else '') or 'Dive'} ({key}): {what}" + (f" - cooldown {cd:g}s started" if cd > 0 else "")
+
+    def blade_waiting(self):
+        """Blade Crash (either variant) is up in the air, waiting for the click."""
+        with self.lock:
+            d = self.dive
+            mv = self.move_for(d[0]) if d else None
+            return bool(d and mv and is_blade_crash(mv.get("name")))
+
+    def blade_cancel(self, now):
+        """X while Blade Crash waits for the click: you come back down, so the move goes on cooldown (as it does when you click)."""
+        with self.lock:
+            d = self.dive
+            mv = self.move_for(d[0]) if d else None
+            if not (d and mv and is_blade_crash(mv.get("name"))):
+                return None
+            return "X: " + self._surface(now)
 
     def dive_is_withstand(self):
         """The Withstand stance is on right now."""
@@ -4317,8 +4683,11 @@ def detect_hotbar(rgb, n=12):
             ws = np.array([e - s + 1 for s, e in seq])
             st = np.array([s for s, _ in seq])
             gaps = np.diff(st)
-            if ws.max() - ws.min() <= 3 and gaps.max() - gaps.min() <= 3 and gaps.min() > ws.max():
-                return {"x": int(st[0]), "y": int(y_lo + y0), "w": int(round(np.median(ws))), "h": int(h),
+            wfull = ws[:-1]                                     # (the LAST slot may be partly covered - by the tool's own window at the right: only its start counts)
+            cut = ws[-1] < wfull.min() and ws[-1] >= 0.4 * wfull.min()
+            wchk = wfull if cut else ws
+            if wchk.max() - wchk.min() <= 3 and gaps.max() - gaps.min() <= 3 and gaps.min() > wchk.max():
+                return {"x": int(st[0]), "y": int(y_lo + y0), "w": int(round(np.median(wchk))), "h": int(h),
                         "pitch": float(st[-1] - st[0]) / (n - 1)}
     return None
 
@@ -6880,6 +7249,1175 @@ class DecorOverlay(Overlay):
         self.shown = False
 
 
+# ----------------------------------------------------------------------------
+# Housemate HP (Extras > Other Stuff > Housemate HP): the HP bar + the buffs of the people in your house, on your screen. Every tool of the
+# house sends its own player's name, HP % and buff icons (the ones the tool already follows: potion effects + buff moves) to a small relay
+# server (housemate_server.py) about twice a second and gets the others back. The house is a code the house agrees on: the server only ever
+# sees its hash. Buffs are sent as "seconds left" and drain on every screen by themselves, like they do in the game.
+# ----------------------------------------------------------------------------
+HOUSE_DEFAULT_SERVER = ""                  # (set this to your house server's https address to ship it built in)
+HOUSE_EVERY = 0.5                          # seconds between two messages
+HOUSE_SHOWN = 8                            # most housemates drawn at once
+HOUSE_ROW = 38                             # px per row at size 1 (name line + bar)
+
+
+def house_server_url(url):
+    """The server's base address when it is acceptable (https, or a server on this very computer for testing), else None."""
+    u = str(url or "").strip().rstrip("/")
+    if not u or u.lower() in ("relay", "none", "default"):
+        return "relay"                                                    # no server: the free public relay (see RelayEngine)
+    if u.startswith("https://") and len(u) > 10:
+        return u
+    if re.match(r"^http://(127\.0\.0\.1|localhost)(:\d+)?$", u):
+        return u
+    return None
+
+
+def house_clean_buffs(items, recv, age=0.0):
+    """Buffs from the server -> [(kind, is_move_buff, end time on this computer's clock or None = lasting, total seconds)]."""
+    out = []
+    for b in (items if isinstance(items, list) else [])[:12]:
+        try:
+            k, mv = str(b["k"]), bool(b.get("b"))
+            if k not in (BMOVE_PNG if mv else BUFF_PNG):
+                continue
+            left, tot = float(b["l"]), float(b["t"])
+            if left < 0:
+                out.append((k, mv, None, 0.0))
+            elif tot > 0:
+                out.append((k, mv, recv - age + left, tot))
+        except Exception:
+            continue
+    return out
+
+
+def house_call(base, path, payload, timeout=5.0):
+    """One request to the house server -> (HTTP status, answer as a dict). Network problems raise; a refusal (403 ...) comes back as a status."""
+    if base == "relay":
+        if RELAY.path is None:
+            RELAY.path = os.path.join(os.path.dirname(os.path.abspath(CONFIG_FILE)), "house_relay.json")
+        return RELAY.call(path, payload, timeout)
+    req = urllib.request.Request(base + path, data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", "User-Agent": "RLAT/" + APP_VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read(65536).decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read(4096).decode("utf-8", "replace"))
+        except Exception:
+            return e.code, {}
+
+
+import hmac, secrets, socket
+
+# ----------------------------------------------------------------------------
+# RELAY MODE: a house without any server. Every member's tool talks through a free public MQTT broker; EVERYTHING that is sent is encrypted
+# with the house's own key (the broker only ever sees random-looking bytes), so nobody has to host anything.
+#   house key  : 32 random bytes shared by the members (rotated when somebody is removed: sent to each remaining member under a
+#                Diffie-Hellman key only the two of them can make)
+#   invite code: one use, 24 hours; the Leader / Officer who made it has to be online (their tool answers the join request)
+#   roles      : kept in a roster that every member holds; the tools of the members obey it (a modified tool of a member could cheat: a
+#                house is for friends)
+# ----------------------------------------------------------------------------
+RELAY_NAME = "relay"
+RELAY_BROKERS = [("broker.emqx.io", 8883, True), ("broker.hivemq.com", 8883, True), ("mqtt.eclipseprojects.io", 8883, True)]
+RELAY_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+RELAY_TTL = 6.0                                  # seconds without a presence message = offline
+RELAY_INVITE_HOURS = 24
+RELAY_BAD_AFTER = 10.0                           # seconds a roster that can not be read is waited for before "you were removed"
+_DH_P = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16)
+
+
+def _b64(b):
+    return base64.urlsafe_b64encode(b).decode("ascii").rstrip("=")
+
+
+def _unb64(s):
+    s = str(s)
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def relay_keys(key):
+    return hmac.new(key, b"enc", hashlib.sha256).digest(), hmac.new(key, b"mac", hashlib.sha256).digest()
+
+
+def relay_seal(key, obj):
+    """obj -> a short text only the holders of key can read or forge (HMAC-SHA256 stream + HMAC tag)."""
+    ke, km = relay_keys(key)
+    raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    nonce = secrets.token_bytes(12)
+    ks = b"".join(hmac.new(ke, nonce + i.to_bytes(4, "big"), hashlib.sha256).digest() for i in range((len(raw) + 31) // 32))
+    ct = bytes(a ^ b for a, b in zip(raw, ks))
+    tag = hmac.new(km, nonce + ct, hashlib.sha256).digest()[:16]
+    return _b64(nonce + ct + tag)
+
+
+def relay_open(key, text):
+    try:
+        data = _unb64(text)
+        if len(data) < 29:
+            return None
+        nonce, ct, tag = data[:12], data[12:-16], data[-16:]
+        ke, km = relay_keys(key)
+        if not hmac.compare_digest(hmac.new(km, nonce + ct, hashlib.sha256).digest()[:16], tag):
+            return None
+        ks = b"".join(hmac.new(ke, nonce + i.to_bytes(4, "big"), hashlib.sha256).digest() for i in range((len(ct) + 31) // 32))
+        return json.loads(bytes(a ^ b for a, b in zip(ct, ks)).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def relay_code_key(code):
+    return hashlib.pbkdf2_hmac("sha256", re.sub(r"[^A-Z0-9]", "", str(code).upper())[:10].encode("ascii"), b"rlat-invite-1", 60000)
+
+
+def relay_code_id(code):
+    return hashlib.sha256(b"id:" + re.sub(r"[^A-Z0-9]", "", str(code).upper())[:10].encode("ascii")).hexdigest()[:24]
+
+
+def relay_dh_new():
+    priv = secrets.randbits(256) | (1 << 255)
+    return priv, _b64(pow(2, priv, _DH_P).to_bytes(256, "big"))
+
+
+def relay_dh_shared(priv, pub_b64):
+    pub = int.from_bytes(_unb64(pub_b64), "big")
+    if not 2 <= pub <= _DH_P - 2:
+        raise ValueError("bad key")
+    return hashlib.sha256(pow(pub, priv, _DH_P).to_bytes(256, "big")).digest()
+
+
+def _clean(s, default, n=24):
+    s = "".join(ch for ch in str(s or "") if ch.isprintable()).strip()[:n]
+    return s or default
+
+
+class Mqtt:
+    """The little part of MQTT 3.1.1 that is needed: connect, subscribe, publish (QoS 0, also retained), keep-alive."""
+
+    def __init__(self, host, port, tls, on_message):
+        self.host, self.port, self.tls, self.on_message = host, port, tls, on_message
+        self.sock = None
+        self.alive = False
+        self.wl = threading.Lock()
+        self.pid = 0
+        self.last_tx = 0.0
+        self.connecting = False
+
+    @staticmethod
+    def _s(b):
+        return len(b).to_bytes(2, "big") + b
+
+    @staticmethod
+    def _len(n):
+        out = bytearray()
+        while True:
+            d, n = n % 128, n // 128
+            out.append(d | (0x80 if n else 0))
+            if not n:
+                return bytes(out)
+
+    def _send(self, first, body):
+        with self.wl:
+            self.sock.sendall(bytes([first]) + self._len(len(body)) + body)
+            self.last_tx = time.time()
+
+    def _read(self, n):
+        buf = b""
+        while len(buf) < n:
+            try:
+                c = self.sock.recv(n - len(buf))
+            except socket.timeout:
+                if not self.alive or self.connecting:
+                    raise OSError("closed" if not self.alive else "no answer from the relay")
+                if time.time() - self.last_tx > 20:
+                    self._send(0xC0, b"")
+                continue
+            if not c:
+                raise OSError("closed")
+            buf += c
+        return buf
+
+    def _packet(self):
+        first = self._read(1)[0]
+        n, mul = 0, 1
+        for _ in range(4):
+            b = self._read(1)[0]
+            n += (b & 0x7F) * mul
+            mul *= 128
+            if not b & 0x80:
+                break
+        if n > 262144:
+            raise OSError("packet too big")
+        return first, self._read(n) if n else b""
+
+    def connect(self, timeout=10.0):
+        raw = socket.create_connection((self.host, self.port), timeout=timeout)
+        if self.tls:
+            import ssl
+            raw = ssl.create_default_context().wrap_socket(raw, server_hostname=self.host)
+        raw.settimeout(timeout)
+        self.sock = raw
+        self.alive = True
+        self.connecting = True
+        cid = ("rlat" + secrets.token_hex(6)).encode()
+        self._send(0x10, self._s(b"MQTT") + bytes([4, 2]) + (30).to_bytes(2, "big") + self._s(cid))
+        end = time.time() + timeout
+        while True:
+            if time.time() > end:
+                raise OSError("no answer from the relay")
+            first, body = self._packet()
+            if first >> 4 == 2:
+                if len(body) < 2 or body[1] != 0:
+                    raise OSError("the relay refused the connection")
+                break
+        self.connecting = False
+        raw.settimeout(1.0)
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        try:
+            while self.alive:
+                first, body = self._packet()
+                t = first >> 4
+                if t == 3:
+                    qos = (first >> 1) & 3
+                    tl = int.from_bytes(body[:2], "big")
+                    topic = body[2:2 + tl].decode("utf-8", "replace")
+                    off = 2 + tl
+                    if qos:
+                        pid = body[off:off + 2]
+                        off += 2
+                        if qos == 1:
+                            self._send(0x40, pid)
+                    try:
+                        self.on_message(topic, body[off:], bool(first & 1))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self.alive = False
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+    def subscribe(self, topics):
+        if not topics:
+            return
+        self.pid = self.pid % 65000 + 1
+        body = self.pid.to_bytes(2, "big") + b"".join(self._s(t.encode()) + b"\x00" for t in topics)
+        self._send(0x82, body)
+
+    def publish(self, topic, payload, retain=False):
+        if isinstance(payload, str):
+            payload = payload.encode("utf-8")
+        self._send(0x30 | (1 if retain else 0), self._s(topic.encode()) + payload)
+
+    def close(self):
+        self.alive = False
+        try:
+            self._send(0xE0, b"")
+        except Exception:
+            pass
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+class RelayEngine:
+    """Answers the same requests as the house server (/v1/create ...), but through the relay. call() -> (status, answer)."""
+
+    def __init__(self, path=None):
+        self.path = path
+        self.brokers = list(RELAY_BROKERS)
+        self.lk = threading.RLock()
+        self.st = None                    # the house I am in (see _new_state)
+        self.m = None                     # the connection of that house
+        self.pres = {}                    # mid -> (received at, presence dict)
+        self.raw_roster = None            # the last roster text received (tried again when the key changes)
+        self.raw_k = None
+        self.disbanded = False            # the Leader disbanded this house
+        self.inv_view = {}                # officer id -> the invite codes they have out (the Leader sees these)
+        self.cancels = {}                 # officer id -> the codes the Leader cancelled
+        self.bad_since = None
+        self.connected_at = 0.0
+        self.next_try = 0.0
+        self.fails = 0
+        self.joins = {}                   # request id -> answer (while joining)
+        self.loaded = False
+
+    # ---- storage ----
+    def load(self):
+        if self.loaded:
+            return
+        self.loaded = True
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict) and d.get("hid"):
+                self.st = d
+        except Exception:
+            pass
+
+    def save(self):
+        if not self.path:
+            return
+        try:
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.st or {}, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def key(self):
+        return _unb64(self.st["key"])
+
+    # ---- connection ----
+    def _broker(self, idx):
+        return self.brokers[int(idx) % len(self.brokers)]
+
+    def _topics(self):
+        base = "rlat1/" + self.st["hid"]
+        t = [base + "/p/+", base + "/r", base + "/k/" + self.st["mid"], base + "/i/+", base + "/x/" + self.st["mid"], base + "/d"]
+        t += ["rlat1/inv/" + cid + "/q" for cid in (self.st.get("invites") or {})]
+        return t
+
+    def _ensure(self):
+        """Connected to the house's relay (True) or not yet (False)."""
+        with self.lk:
+            if self.st is None:
+                return False
+            if self.m is not None and self.m.alive:
+                return True
+            if time.time() < self.next_try:
+                return False
+            host, port, tls = self._broker(self.st.get("broker", 0))
+            m = Mqtt(host, port, tls, self._on_message)
+        try:
+            m.connect(6.0)
+            with self.lk:
+                self.m = m
+                self.pres = {}
+                self.connected_at = time.time()
+                self.fails = 0
+            m.subscribe(self._topics())
+            with self.lk:
+                self._share_invites()
+            return True
+        except Exception:
+            with self.lk:
+                self.fails += 1
+                self.next_try = time.time() + min(20.0, 1.0 + self.fails * 2.0)
+            try:
+                m.close()
+            except Exception:
+                pass
+            return False
+
+    def _pub(self, sub, obj, retain=False, key=None):
+        base = "rlat1/" + self.st["hid"] + "/"
+        if self.m is None or not self.m.alive:
+            raise OSError("not connected")
+        self.m.publish(base + sub, relay_seal(key or self.key(), obj), retain)
+
+    def close(self):
+        with self.lk:
+            m, self.m = self.m, None
+        if m is not None:
+            m.close()
+
+    # ---- incoming ----
+    def _on_message(self, topic, payload, retain):
+        with self.lk:
+            if self.st is None:
+                return
+            text = payload.decode("utf-8", "replace")
+            base = "rlat1/" + self.st["hid"] + "/"
+            if topic.startswith("rlat1/inv/") and topic.endswith("/q"):
+                self._on_join_request(topic.split("/")[2], text)
+            elif topic.startswith(base + "p/"):
+                o = relay_open(self.key(), text)
+                if isinstance(o, dict):
+                    self.pres[topic.rsplit("/", 1)[1]] = (time.time(), o)
+            elif topic == base + "r":
+                self.raw_roster = text
+                self._take_roster(text)
+            elif topic == base + "k/" + self.st["mid"]:
+                self.raw_k = text
+                self._take_key(text)
+            elif topic == base + "d":
+                o = relay_open(self.key(), text)
+                lead = ((self.st.get("roster") or {"m": {}})["m"].get(str((o or {}).get("by"))) or {}).get("r") if isinstance(o, dict) else None
+                if isinstance(o, dict) and o.get("d") and lead == "leader":
+                    self.disbanded = True
+            elif topic.startswith(base + "i/"):
+                self._take_invites(topic.rsplit("/", 1)[1], text)
+            elif topic == base + "x/" + self.st["mid"]:
+                self._take_cancel(text)
+
+    def _take_roster(self, text):
+        o = relay_open(self.key(), text)
+        if not isinstance(o, dict) or not isinstance(o.get("m"), dict):
+            self._maybe_bad()
+            return
+        self.bad_since = None
+        if int(o.get("e", 0)) != int(self.st.get("epoch", 0)):
+            return
+        old = self.st.get("roster")
+        if old and int(o.get("v", 0)) <= int(old["v"]):
+            return
+        if old and not self._roster_ok(old, o):
+            return
+        self.st["roster"] = {"v": int(o["v"]), "by": str(o.get("by")), "name": _clean(o.get("hn"), "House", 30), "m": o["m"]}
+        self.st["house_name"] = self.st["roster"]["name"]
+        self.save()
+
+    def _maybe_bad(self):
+        if self.bad_since is None:
+            self.bad_since = time.time()
+
+    def _take_key(self, text):
+        try:
+            hdr = json.loads(_unb64(text).decode("utf-8"))
+            sender = str(hdr["f"])
+            old = self.st.get("roster") or {"m": {}}
+            if not any(m.get("p") == sender and m.get("r") in ("leader", "officer") for m in old["m"].values()):
+                return
+            shared = relay_dh_shared(int(self.st["priv"], 16), sender)
+            o = relay_open(shared, hdr["s"])
+            if not isinstance(o, dict) or int(o.get("e", 0)) <= int(self.st.get("epoch", 0)):
+                return
+            self.st["key"], self.st["epoch"] = str(o["k"]), int(o["e"])
+            self.pres = {}
+            self.bad_since = None
+            self.save()
+            if self.raw_roster:
+                self._take_roster(self.raw_roster)
+        except Exception:
+            return
+
+    @staticmethod
+    def _roster_ok(old, new):
+        """May this roster replace the one I hold? (the tools obey the roles)"""
+        om, nm, by = old["m"], new["m"], str(new.get("by"))
+        if by not in om:
+            return False
+        role = om[by].get("r")
+        removed = set(om) - set(nm)
+        added = set(nm) - set(om)
+        if removed == {by} and not added:                                   # I leave
+            return all(nm[k] == om[k] for k in nm)
+        if not removed and not added and all(nm[k].get("r") == om[k].get("r") for k in nm):   # somebody renamed themselves
+            changed = [k for k in nm if nm[k] != om[k]]
+            if changed == [by]:
+                return True
+        if role == "leader":
+            return sum(1 for m in nm.values() if m.get("r") == "leader") == 1
+        if role == "officer":
+            return (all(om[k].get("r") == "member" for k in removed) and all(nm[k].get("r") == "member" for k in added)
+                    and all(nm[k] == om[k] for k in nm if k in om))
+        return False
+
+    def _on_join_request(self, cid, text):
+        inv = (self.st.get("invites") or {}).get(cid)
+        if not inv or inv["exp"] < time.time():
+            return
+        ck = _unb64(inv["ck"])
+        o = relay_open(ck, text)
+        if not isinstance(o, dict) or not o.get("rid") or not o.get("pub"):
+            return
+        r = self.st["roster"]
+        if len(r["m"]) >= 40:
+            return
+        try:
+            relay_dh_shared(int(self.st["priv"], 16), str(o["pub"]))
+        except Exception:
+            return
+        mid = secrets.token_hex(6)
+        newm = dict(r["m"])
+        newm[mid] = {"n": _clean(o.get("name"), "Player"), "r": "member", "p": str(o["pub"])}
+        self.st["invites"].pop(cid, None)
+        self.st["roster"] = {"v": r["v"] + 1, "by": self.st["mid"], "name": r["name"], "m": newm}
+        self.save()
+        answer = {"rid": o["rid"], "hid": self.st["hid"], "mid": mid, "key": self.st["key"], "e": self.st["epoch"], "broker": self.st.get("broker", 0),
+                  "hn": r["name"], "roster": self.st["roster"]}
+        try:
+            self.m.publish("rlat1/inv/" + cid + "/a", relay_seal(ck, answer))
+            self._pub("r", self._roster_obj(), True)
+            self._share_invites()
+        except Exception:
+            pass
+
+    def _roster_obj(self):
+        r = self.st["roster"]
+        return {"v": r["v"], "e": self.st["epoch"], "by": r["by"], "hn": r["name"], "m": r["m"]}
+
+    # ---- helpers for the answers ----
+    def _me(self):
+        r = self.st.get("roster") or {"m": {}}
+        return r["m"].get(self.st["mid"])
+
+    def _auth(self, body):
+        if self.st is not None and self.disbanded:
+            return (403, {"error": "The Leader disbanded this house."})
+        if self.st is None or str(body.get("house")) != self.st["hid"] or str(body.get("id")) != self.st["mid"]:
+            return (403, {"error": "You are not in this house any more."})
+        return None
+
+    # ---- invite codes the Leader can see and cancel ----
+    def _fmt_code(self, raw):
+        return f"{raw[:5]}-{raw[5:]}-{int(self.st.get('broker', 0)) % 10}"
+
+    def _leader(self):
+        for k, v in ((self.st.get("roster") or {"m": {}})["m"]).items():
+            if v.get("r") == "leader" and v.get("p"):
+                return k, v
+        return None, None
+
+    def _share_invites(self):
+        """An Officer tells the Leader (sealed with their pair key) which codes they have out, so the Leader can show and cancel them."""
+        try:
+            me = self._me()
+            lk, lv = self._leader()
+            if not me or me["r"] != "officer" or lv is None or self.m is None or not self.m.alive:
+                return
+            now = time.time()
+            lst = [{"c": c, "code": self._fmt_code(v["raw"]), "exp": v["exp"]} for c, v in (self.st.get("invites") or {}).items() if v["exp"] > now and v.get("raw")]
+            sealed = relay_seal(relay_dh_shared(int(self.st["priv"], 16), lv["p"]), {"l": lst})
+            hdr = _b64(json.dumps({"f": self.st["pub"], "s": sealed}, separators=(",", ":")).encode())
+            self.m.publish("rlat1/" + self.st["hid"] + "/i/" + self.st["mid"], hdr, True)
+        except Exception:
+            pass
+
+    def _take_invites(self, mid, text):
+        me = self._me()
+        rec = (self.st.get("roster") or {"m": {}})["m"].get(mid)
+        if not me or me["r"] != "leader" or not rec or rec.get("r") != "officer" or not rec.get("p"):
+            return
+        try:
+            hdr = json.loads(_unb64(text).decode("utf-8"))
+            if str(hdr["f"]) != rec["p"]:
+                return
+            o = relay_open(relay_dh_shared(int(self.st["priv"], 16), rec["p"]), hdr["s"])
+            if isinstance(o, dict) and isinstance(o.get("l"), list):
+                self.inv_view[mid] = [{"c": str(i["c"])[:40], "code": str(i["code"])[:24], "exp": float(i["exp"])} for i in o["l"][:20] if isinstance(i, dict)]
+        except Exception:
+            return
+
+    def _take_cancel(self, text):
+        try:
+            hdr = json.loads(_unb64(text).decode("utf-8"))
+            lk, lv = self._leader()
+            if lv is None or str(hdr["f"]) != lv["p"]:
+                return
+            o = relay_open(relay_dh_shared(int(self.st["priv"], 16), lv["p"]), hdr["s"])
+            if not isinstance(o, dict) or not isinstance(o.get("c"), list):
+                return
+            gone = [c for c in o["c"] if c in (self.st.get("invites") or {})]
+            for c in gone:
+                self.st["invites"].pop(c, None)
+            if gone:
+                self.save()
+                self._share_invites()
+        except Exception:
+            return
+
+    def do_invite_cancel(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        cid = str(body.get("invite") or "")
+        with self.lk:
+            me = self._me()
+            if not me or me["r"] not in ("leader", "officer"):
+                return 403, {"error": "Only the Leader and Officers can cancel invite codes."}
+            if cid in (self.st.get("invites") or {}):
+                self.st["invites"].pop(cid, None)
+                self.save()
+                self._share_invites()
+                return 200, {"ok": True}
+            if me["r"] == "leader":
+                for mid, lst in self.inv_view.items():
+                    if any(i["c"] == cid for i in lst):
+                        self.inv_view[mid] = [i for i in lst if i["c"] != cid]
+                        rec = self.st["roster"]["m"].get(mid)
+                        self.cancels.setdefault(mid, []).append(cid)
+                        try:
+                            if rec and rec.get("p") and self.m is not None and self.m.alive:
+                                sealed = relay_seal(relay_dh_shared(int(self.st["priv"], 16), rec["p"]), {"c": self.cancels[mid][-40:]})
+                                hdr = _b64(json.dumps({"f": self.st["pub"], "s": sealed}, separators=(",", ":")).encode())
+                                self.m.publish("rlat1/" + self.st["hid"] + "/x/" + mid, hdr, True)
+                        except Exception:
+                            pass
+                        return 200, {"ok": True}
+            return 404, {"error": "That invite code is gone already."}
+
+    def _publish_roster(self, newm):
+        r = self.st["roster"]
+        self.st["roster"] = {"v": r["v"] + 1, "by": self.st["mid"], "name": r["name"], "m": newm}
+        self.save()
+        self._pub("r", self._roster_obj(), True)
+
+    # ---- the requests ----
+    def call(self, path, body, timeout=8.0):
+        self.load()
+        fn = {"/v1/create": self.do_create, "/v1/join": self.do_join, "/v1/invite": self.do_invite, "/v1/invite_cancel": self.do_invite_cancel, "/v1/roster": self.do_roster, "/v1/role": self.do_role,
+              "/v1/kick": self.do_kick, "/v1/leave": self.do_leave, "/v1/disband": self.do_disband, "/v1/transfer": self.do_transfer, "/v1/rename": self.do_rename,
+              "/v1/sync": self.do_sync}.get(path)
+        if fn is None:
+            return 404, {"error": "unknown request"}
+        try:
+            return fn(body if isinstance(body, dict) else {}, timeout)
+        except OSError:
+            return 503, {"error": "Can't reach the relay right now. Trying again..."}
+        except Exception as ex:
+            return 500, {"error": "Relay problem (" + type(ex).__name__ + ")."}
+
+    def _new_state(self, hid, mid, key, epoch, priv, pub, broker, roster):
+        return {"hid": hid, "mid": mid, "key": _b64(key) if isinstance(key, bytes) else key, "epoch": epoch, "priv": "%x" % priv, "pub": pub,
+                "broker": broker, "roster": roster, "house_name": roster["name"], "invites": {}}
+
+    def do_create(self, body, timeout):
+        with self.lk:
+            if self.st is not None:
+                self.close()
+            priv, pub = relay_dh_new()
+            hid, mid = secrets.token_hex(8), secrets.token_hex(6)
+            roster = {"v": 1, "by": mid, "name": _clean(body.get("house_name"), "House", 30),
+                      "m": {mid: {"n": _clean(body.get("name"), "Player"), "r": "leader", "p": pub}}}
+            self.st = self._new_state(hid, mid, secrets.token_bytes(32), 1, priv, pub, 0, roster)
+            self.pres, self.raw_roster, self.next_try, self.fails = {}, None, 0.0, 0
+            self.save()
+        ok = False
+        for idx in range(len(self.brokers)):                              # the first relay that answers is the house's relay
+            with self.lk:
+                self.st["broker"], self.next_try = idx, 0.0
+            if self._ensure():
+                ok = True
+                break
+        if not ok:
+            self.st = None
+            self.save()
+            return 503, {"error": "Can't reach the relay (check your internet)."}
+        with self.lk:
+            self._pub("r", self._roster_obj(), True)
+            return 200, {"house": hid, "id": mid, "secret": RELAY_NAME, "role": "leader", "house_name": roster["name"]}
+
+    def do_invite(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            me = self._me()
+            if not me or me["r"] not in ("leader", "officer"):
+                return 403, {"error": "Only the Leader and Officers can make invite codes."}
+            if len(self.st["invites"]) >= 20:
+                return 409, {"error": "Too many unused codes. Wait for some to run out."}
+            if len(self.st["roster"]["m"]) >= 40:
+                return 409, {"error": "The house is full (40)."}
+            raw = "".join(secrets.choice(RELAY_ALPHABET) for _ in range(10))
+            cid = relay_code_id(raw)
+            self.st["invites"][cid] = {"exp": time.time() + RELAY_INVITE_HOURS * 3600.0, "ck": _b64(relay_code_key(raw)), "by": self.st["mid"], "raw": raw}
+            self.save()
+        if not self._ensure():
+            return 503, {"error": "Can't reach the relay right now."}
+        with self.lk:
+            self.m.subscribe(["rlat1/inv/" + cid + "/q"])
+            self._share_invites()
+            code = f"{raw[:5]}-{raw[5:]}-{int(self.st.get('broker', 0)) % 10}"
+            return 200, {"code": code, "hours": RELAY_INVITE_HOURS, "expires": self.st["invites"][cid]["exp"]}
+
+    def do_join(self, body, timeout):
+        code = str(body.get("code") or "").strip().upper()
+        m = re.match(r"^([A-Z0-9]{5})-?([A-Z0-9]{5})(?:-?(\d))?$", code)
+        if not m or any(c not in RELAY_ALPHABET for c in m.group(1) + m.group(2)):
+            return 400, {"error": "That code doesn't look right."}
+        raw, bidx = m.group(1) + m.group(2), int(m.group(3) or 0)
+        with self.lk:
+            if self.st is not None:
+                return 409, {"error": "You are in a house already. Leave it first."}
+        host, port, tls = self._broker(bidx)
+        rid = secrets.token_hex(8)
+        priv, pub = relay_dh_new()
+        ck, cid = relay_code_key(raw), relay_code_id(raw)
+        got = {}
+        ev = threading.Event()
+
+        def on(topic, payload, retain):
+            o = relay_open(ck, payload.decode("utf-8", "replace"))
+            if isinstance(o, dict) and o.get("rid") == rid:
+                got["a"] = o
+                ev.set()
+        c = Mqtt(host, port, tls, on)
+        try:
+            c.connect(min(8.0, timeout))
+            c.subscribe(["rlat1/inv/" + cid + "/a"])
+            time.sleep(0.4)
+            c.publish("rlat1/inv/" + cid + "/q", relay_seal(ck, {"rid": rid, "pub": pub, "name": _clean(body.get("name"), "Player")}))
+            if not ev.wait(max(2.0, timeout - 1.0)):
+                return 408, {"error": "Nobody answered. The person who made the code has to be online with the tool open. Try again when they are."}
+        finally:
+            c.close()
+        a = got["a"]
+        try:
+            ro = a["roster"]
+            with self.lk:
+                self.st = self._new_state(str(a["hid"]), str(a["mid"]), str(a["key"]), int(a["e"]), priv, pub, int(a.get("broker", 0)),
+                                          {"v": int(ro["v"]), "by": str(ro["by"]), "name": _clean(ro["name"], "House", 30), "m": ro["m"]})
+                self.pres, self.raw_roster, self.next_try, self.fails = {}, None, 0.0, 0
+                self.save()
+                return 200, {"house": self.st["hid"], "id": self.st["mid"], "secret": RELAY_NAME, "role": "member", "house_name": self.st["house_name"]}
+        except Exception:
+            return 500, {"error": "The answer could not be read."}
+
+    def do_roster(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            r, me = self.st["roster"], self._me()
+            if not me:
+                return 403, {"error": "You are not in this house any more."}
+            now = time.time()
+            order = {"leader": 0, "officer": 1, "member": 2}
+            mem = [{"id": k, "name": v["n"], "role": v["r"], "online": k == self.st["mid"] or (k in self.pres and now - self.pres[k][0] <= RELAY_TTL)}
+                   for k, v in r["m"].items()]
+            mem.sort(key=lambda x: (order.get(x["role"], 3), x["name"].lower()))
+            out = {"house_name": r["name"], "role": me["r"], "members": mem}
+            if me["r"] in ("leader", "officer"):
+                inv = [{"id": c, "by": r["m"].get(v["by"], {}).get("n", "?"), "expires": v["exp"], "code": self._fmt_code(v["raw"]) if v.get("raw") else ""}
+                       for c, v in self.st["invites"].items() if v["exp"] > now]
+                if me["r"] == "leader":
+                    have = {i["id"] for i in inv}
+                    for omid, lst in self.inv_view.items():
+                        if omid not in r["m"]:
+                            continue
+                        for i in lst:
+                            if i["exp"] > now and i["c"] not in have:
+                                inv.append({"id": i["c"], "by": r["m"][omid].get("n", "?"), "expires": i["exp"], "code": i["code"]})
+                out["invites"] = sorted(inv, key=lambda i: i["expires"])
+            return 200, out
+
+    def do_role(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            me, t, role = self._me(), str(body.get("target", "")), str(body.get("role", ""))
+            if not me or me["r"] != "leader":
+                return 403, {"error": "Only the Leader can promote or demote."}
+            m = self.st["roster"]["m"]
+            if t not in m or t == self.st["mid"] or role not in ("officer", "member"):
+                return 400, {"error": "That member can't be changed."}
+            newm = {k: dict(v) for k, v in m.items()}
+            newm[t]["r"] = role
+            self._publish_roster(newm)
+            return 200, {"ok": True}
+
+    def do_kick(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            me, t = self._me(), str(body.get("target", ""))
+            m = self.st["roster"]["m"]
+            if not me or t not in m or t == self.st["mid"]:
+                return 400, {"error": "That member can't be removed."}
+            if not (me["r"] == "leader" or (me["r"] == "officer" and m[t]["r"] == "member")):
+                return 403, {"error": "You can't remove that member."}
+            newm = {k: dict(v) for k, v in m.items() if k != t}
+            newkey, epoch = secrets.token_bytes(32), int(self.st["epoch"]) + 1
+            priv = int(self.st["priv"], 16)
+            base = "rlat1/" + self.st["hid"] + "/"
+            for mid, v in newm.items():                                    # the new house key to everybody who stays (before the roster that needs it)
+                if mid == self.st["mid"]:
+                    continue
+                try:
+                    sealed = relay_seal(relay_dh_shared(priv, v["p"]), {"k": _b64(newkey), "e": epoch})
+                    hdr = _b64(json.dumps({"f": self.st["pub"], "s": sealed}, separators=(",", ":")).encode())
+                    self.m.publish(base + "k/" + mid, hdr, True)
+                except Exception:
+                    continue
+            self.m.publish(base + "k/" + t, b"", True)                     # (nothing stays for the one who left)
+            r = self.st["roster"]
+            self.st["roster"] = {"v": r["v"] + 1, "by": self.st["mid"], "name": r["name"], "m": newm}
+            self.st["key"], self.st["epoch"] = _b64(newkey), epoch
+            self.pres = {}
+            self.save()
+            self.m.publish(base + "r", relay_seal(newkey, self._roster_obj()), True)
+            return 200, {"ok": True}
+
+    def do_leave(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            me, m = self._me(), self.st["roster"]["m"]
+            if me and me["r"] == "leader" and len(m) > 1:
+                return 409, {"error": "Hand the house to someone else first (Make Leader), then leave."}
+            try:
+                if len(m) > 1:
+                    self._publish_roster({k: dict(v) for k, v in m.items() if k != self.st["mid"]})
+                else:
+                    base = "rlat1/" + self.st["hid"] + "/"
+                    self.m.publish(base + "r", b"", True)                   # the last one: the house is gone
+            except Exception:
+                pass
+        self.forget()
+        return 200, {"ok": True}
+
+    def do_disband(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            me = self._me()
+            if not me or me["r"] != "leader":
+                return 403, {"error": "Only the Leader can disband the house."}
+        if not self._ensure():
+            return 503, {"error": "Can't reach the relay right now."}
+        with self.lk:
+            try:
+                self._pub("d", {"d": 1, "by": self.st["mid"]}, True)           # (stays on the relay: the ones who are offline now read it later)
+            except OSError:
+                return 503, {"error": "Can't reach the relay right now."}
+        time.sleep(0.3)
+        self.forget()
+        return 200, {"ok": True}
+
+    def forget(self):
+        self.close()
+        with self.lk:
+            self.disbanded = False
+            self.st, self.pres, self.raw_roster = None, {}, None
+            self.save()
+
+    def do_transfer(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            me, t = self._me(), str(body.get("target", ""))
+            m = self.st["roster"]["m"]
+            if not me or me["r"] != "leader":
+                return 403, {"error": "Only the Leader can hand the house over."}
+            if t not in m or t == self.st["mid"]:
+                return 400, {"error": "Pick another member."}
+            newm = {k: dict(v) for k, v in m.items()}
+            newm[t]["r"], newm[self.st["mid"]]["r"] = "leader", "officer"
+            self._publish_roster(newm)
+            return 200, {"ok": True}
+
+    def do_rename(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        with self.lk:
+            me = self._me()
+            if me:
+                newm = {k: dict(v) for k, v in self.st["roster"]["m"].items()}
+                newm[self.st["mid"]]["n"] = _clean(body.get("name"), me["n"])
+                self._publish_roster(newm)
+            return 200, {"ok": True}
+
+    def do_sync(self, body, timeout):
+        bad = self._auth(body)
+        if bad:
+            return bad
+        if not self._ensure():
+            return 503, {"error": "Connecting to the relay..."}
+        with self.lk:
+            now = time.time()
+            if self.m is not None and now - self.connected_at > 3.0:
+                r = self.st.get("roster")
+                if r is not None and self.st["mid"] not in r["m"]:
+                    return 403, {"error": "You are not in this house any more."}
+                if self.bad_since is not None and now - self.bad_since > RELAY_BAD_AFTER:
+                    return 403, {"error": "You were removed from this house."}
+            me = self._me()
+            if body.get("share", True):
+                try:
+                    hp = body.get("hp")
+                    hp = None if hp is None else max(0, min(100, int(round(float(hp)))))
+                except (TypeError, ValueError):
+                    hp = None
+                bl = []
+                for b in (body.get("buffs") if isinstance(body.get("buffs"), list) else [])[:12]:
+                    if isinstance(b, dict):
+                        bl.append({"k": str(b.get("k"))[:20], "b": 1 if b.get("b") else 0, "l": b.get("l", -1), "t": b.get("t", 0)})
+                try:
+                    self._pub("p/" + self.st["mid"], {"n": me["n"] if me else "Player", "h": hp, "b": bl})
+                except OSError:
+                    return 503, {"error": "Connecting to the relay..."}
+            r = self.st.get("roster") or {"m": {}, "name": "House"}
+            others = []
+            for k, (t, o) in list(self.pres.items()):
+                v = r["m"].get(k)
+                if k == self.st["mid"] or v is None or now - t > RELAY_TTL:
+                    continue
+                others.append({"id": k, "name": v["n"], "role": v["r"], "hp": o.get("h"), "buffs": o.get("b") if isinstance(o.get("b"), list) else [],
+                               "age": round(now - t, 2)})
+            return 200, {"members": others, "me": {"role": me["r"] if me else "member", "name": me["n"] if me else ""}, "house_name": r["name"], "ttl": RELAY_TTL}
+
+
+RELAY = RelayEngine()
+
+
+HOUSE_ROLE_NAME = {"leader": "Leader", "officer": "Officer", "member": "Member"}
+
+
+class HouseLink(threading.Thread):
+    """Sends my HP / buffs and fetches the housemates' (a background thread; it does nothing until I am in a house and a server is set)."""
+
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.stop_ev = threading.Event()
+        self.members = []                  # [(id, name, hp or None, [buffs], received at)]
+        self.status = "Off"
+        self.fails = 0
+        self.role = ""                     # my place in the house, as the server says
+        self._hp_keep = {}                 # member id -> (last HP, when): bridges short gaps in their readings
+        self.removed = ""                  # set when the server says I am not in the house any more (the tool clears it on its own thread)
+
+    def stop(self):
+        self.stop_ev.set()
+
+    def mine(self, now):
+        hp = None
+        try:
+            f = getattr(self.app.tracker, "hp_frac", None)
+            if f and f[0] is not None and now - f[1] < 3.0:
+                hp = int(round(max(0.0, min(1.0, f[0])) * 100))
+                self._last_hp = (hp, now)
+            elif getattr(self, "_last_hp", None) and now - self._last_hp[1] < 6.0:
+                hp = self._last_hp[0]                                   # (one look that failed does not turn the bar into a "?" for the others)
+        except Exception:
+            pass
+        return hp, self.app.tracker.house_buffs(now)
+
+    def run(self):
+        while not self.stop_ev.is_set():
+            wait = HOUSE_EVERY
+            try:
+                S = self.app.cfg["settings"]
+                show, share = bool(S.get("house_on")), bool(S.get("house_share"))
+                hid, mid, sec = str(S.get("house_hid") or ""), str(S.get("house_mid") or ""), str(S.get("house_secret") or "")
+                base = house_server_url(S.get("house_server") or HOUSE_DEFAULT_SERVER)
+                if not hid or not sec:
+                    self.status, self.members, self.role = "Not in a house yet", [], ""
+                    wait = 1.0
+                elif not (show or share):
+                    self.status, self.members = "Off", []
+                    wait = 1.0
+                    if base == "relay" and RELAY.st is not None and RELAY.st.get("invites"):
+                        RELAY._ensure()                                 # (stays on the relay so the invite codes I made can be answered)
+                elif base is None:
+                    self.status, self.members = "Type the server address (https://...)", []
+                    wait = 1.0
+                else:
+                    now = time.time()
+                    hp, buffs = self.mine(now) if share else (None, [])
+                    code, resp = house_call(base, "/v1/sync", {"house": hid, "id": mid, "secret": sec, "hp": hp, "buffs": buffs, "share": share})
+                    if code == 200:
+                        recv = time.time()
+                        out = []
+                        for m in (resp.get("members") or [])[:40]:
+                            try:
+                                age = max(0.0, min(30.0, float(m.get("age", 0.0))))
+                                hpm = m.get("hp")
+                                keep = self._hp_keep
+                                if hpm is None and str(m["id"]) in keep and recv - keep[str(m["id"])][1] < 5.0:
+                                    hpm = keep[str(m["id"])][0]            # (a gap in their readings: the last value stays a few seconds)
+                                elif hpm is not None:
+                                    keep[str(m["id"])] = (hpm, recv)
+                                out.append((str(m["id"]), str("".join(ch for ch in str(m.get("name") or "Player") if ch.isprintable())[:24]) or "Player",
+                                            None if hpm is None else max(0, min(100, int(hpm))), house_clean_buffs(m.get("buffs"), recv, age), recv))
+                            except Exception:
+                                continue
+                        self.members, self.fails = out, 0
+                        self.role = str((resp.get("me") or {}).get("role") or "")
+                        self.status = f"Connected - {len(out)} housemate{'s' if len(out) != 1 else ''} online"
+                    elif code == 403:
+                        self.members, self.role = [], ""
+                        self.removed = str(resp.get("error") or "You are not in this house any more.")
+                        self.status = self.removed
+                        wait = 2.0
+                    else:
+                        self.fails += 1
+                        self.members = []
+                        self.status = str(resp.get("error") or f"The server answered {code}")
+                        wait = min(8.0, 1.0 + self.fails)
+            except Exception as ex:
+                self.fails += 1
+                self.members = []
+                self.status = "Can't reach the server (" + type(ex).__name__ + ")"
+                wait = min(8.0, 1.0 + self.fails)
+            self.stop_ev.wait(wait)
+
+    def view(self, now):
+        """[(name, hp, [(kind, is_move, fraction left, seconds left or None)])] - the buffs drain between two messages by themselves."""
+        out = []
+        for _mid, name, hp, buffs, _recv in list(self.members)[:HOUSE_SHOWN * 2]:
+            if hp is None:
+                continue                                        # (no health bar seen on their screen: not in the game, so no empty "?" bar)
+            bl = []
+            for k, mv, end, tot in buffs:
+                if end is None:
+                    bl.append((k, mv, 1.0, None))
+                elif now < end:
+                    bl.append((k, mv, max(0.0, min(1.0, (end - now) / tot)), end - now))
+            out.append((name, hp, bl))
+        out.sort(key=lambda m: m[0].lower())
+        return out[:HOUSE_SHOWN]
+
+
+HOUSE_BAR_PNG = "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"
+_house_cache = {}
+
+
+def house_bar_art(w, hp):
+    """The game's own HP bar picture (frame + red fill) at width w, filled hp % (None = unknown: empty). The part of the red that is
+    not filled turns into the dark empty colour with the same shading. Returns (picture, (x0, x1, y0, y1) of the red inside)."""
+    w = max(40, int(w))
+    key = (w, None if hp is None else int(max(0, min(100, hp))))
+    hit = _house_cache.get(key)
+    if hit is not None:
+        return hit
+    if len(_house_cache) > 400:
+        _house_cache.clear()
+    base = _house_cache.get(("base", w))
+    if base is None:
+        src = Image.open(io.BytesIO(base64.b64decode(HOUSE_BAR_PNG))).convert("RGBA")
+        h = max(8, int(round(src.height * w / float(src.width))))
+        img = src.resize((w, h), Image.LANCZOS)
+        a = np.array(img).astype(np.float32)
+        red = (a[..., 0] > 140) & (a[..., 1] < 100) & (a[..., 2] < 90) & (a[..., 3] > 200)
+        ys, xs = np.nonzero(red)
+        box = (int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())) if len(xs) else (0, w - 1, 0, h - 1)
+        base = _house_cache[("base", w)] = (a, red, box)
+    a, red, (x0, x1, y0, y1) = base
+    split = x0 if hp is None else x0 + int(round((x1 - x0 + 1) * max(0, min(100, hp)) / 100.0))
+    out = a.copy()
+    empty = red.copy()
+    empty[:, :split] = False
+    shade = np.clip(out[..., 0] / 190.0, 0.4, 1.4)
+    for c, v in enumerate((79, 62, 70)):
+        out[..., c] = np.where(empty, np.clip(v * shade, 0, 255), out[..., c])
+    img = Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGBA")
+    _house_cache[key] = (img, (x0, x1, y0, y1))
+    return _house_cache[key]
+
+
+def house_panel(members, s=1.0, numbers=False):
+    """The housemates' panel as one RGBA picture (the game's HP bar, the % in the middle, the buff icons on the right).
+    members = [(name, hp or None, [(kind, is_move, fraction, seconds or None)])]."""
+    s = max(0.4, min(3.0, float(s)))
+    BW, ICON, GAP = int(round(272 * s)), max(8, int(round(26 * s))), max(1, int(round(3 * s)))
+    NAME_H = max(8, int(round(13 * s)))
+    bar0, _box = house_bar_art(BW, 100)
+    BH = bar0.height
+    PITCH = NAME_H + BH - int(round(3 * s))
+    most = max([len(m[2]) for m in members] + [0])
+    W = BW + 8 + most * (ICON + GAP) + int(round(10 * s))
+    H = max(1, len(members)) * PITCH + int(round(10 * s))
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    f_name, f_pct = _name_font(max(8, int(round(13 * s)))), _num_font(max(8, int(round(12 * s))))
+    for i, (name, hp, buffs) in enumerate(members):
+        y0 = i * PITCH
+        by = y0 + NAME_H
+        d.text((int(round(5 * s)), y0), str(name).upper(), font=f_name, fill=(255, 255, 255, 255), stroke_width=(1 if s >= 0.7 else 0), stroke_fill=(20, 12, 14, 255))   # (capitals like the game's own name over your bar)
+        bar, (bx0, bx1, by0, by1) = house_bar_art(BW, hp)
+        img.alpha_composite(bar, (0, by))
+        txt = "?" if hp is None else f"{hp}%"
+        d.text(((bx0 + bx1) / 2.0, by + (by0 + by1) / 2.0), txt, font=f_pct, fill=(255, 255, 255, 255), anchor="mm", stroke_width=1, stroke_fill=(46, 20, 20, 255))
+        ix = BW + 8
+        cy = by + (by0 + by1) // 2
+        for kind, mv, frac, left in buffs:
+            try:
+                txt_ = str(int(math.ceil(left))) if (numbers and left is not None) else ""
+                if mv:
+                    ic = bmove_art(kind, frac, ICON, txt_)
+                    if not txt_:
+                        ic = ic.crop((0, ic.height - ICON, ic.width, ic.height))
+                    iy = cy - ICON // 2 - (ic.height - ICON if txt_ else 0)
+                else:
+                    ic = buff_art(kind, frac, ICON, txt_)
+                    iy = cy - ICON // 2
+                img.alpha_composite(ic, (ix, max(0, iy)))
+            except Exception:
+                pass
+            ix += ICON + GAP
+    return img
+
+
+HOUSE_DEMO = (("Merp Testhouse", 100, [("fire", False, 0.62, 31.0)]), ("Hiwi Testhouse", 80, [("tempest", True, 0.4, 12.0), ("fire", False, 0.9, 54.0)]))
+
+
+class HouseOverlay(Overlay):
+    """The housemates' panel: one see-through, click-through window with one picture."""
+
+    def __init__(self, root, log):
+        self.root, self.log = root, log
+        self.win, self.cv = self._make()            # (made at the start like the other overlays: a window first made while you play could take the focus from the game)
+        self.sig = None
+        self.shown = False
+        self._photo = None
+
+    def show(self, x, y, img):
+        if self.win is None:
+            self.win, self.cv = self._make()
+        w, h = img.size
+        self.cv.delete("all")
+        self.cv.config(width=w, height=h)
+        self.win.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+        self._photo = ImageTk.PhotoImage(keyed_image(img, w, h))
+        self.cv.create_image(0, 0, image=self._photo, anchor="nw")
+        self._visible()
+        flush_win(self.win, int(x), int(y), w, h)
+        self.shown = True
+
+    def _visible(self):
+        w = self.win
+        try:
+            if w.state() != "normal":
+                w.deiconify()
+            self._click_through(w)
+            if IS_WIN:
+                h = hwnd_of(w)
+                if not u32.IsWindowVisible(h):
+                    u32.ShowWindow(h, 4)
+            w.attributes("-topmost", True)
+            w.lift()
+        except Exception:
+            pass
+
+    def raise_top(self):
+        if self.shown and IS_WIN and self.win is not None and not needs_raise(hwnd_of(self.win)):
+            return
+        if self.shown:
+            self._visible()
+
+    def hide(self):
+        if self.shown and self.win is not None:
+            try:
+                self.win.withdraw()
+            except Exception:
+                pass
+        self.shown = False
+
+
 KDA_ORDER = (("kill", "Grip"), ("death", "Death"), ("assist", "Assist"), ("knock", "Knocked"))
 KDA_GOLD = "#ffd23f"
 
@@ -7398,22 +8936,31 @@ def inv_card_sig(rgb):
 
 
 HP_BAR_FRAC = (0.40, 0.86, 0.60, 0.93)       # where the HP bar (and the little bars under it) sit in the middle of the screen (fractions)
-def hp_bar_box(W, H):
+def ui_scale(bar):
+    """How much bigger than the 1080p one the game's own UI is on this screen (a big / high-DPI screen draws it larger): the hotbar's slot
+    spacing ('Find hotbar') against the 1080p spacing. 1.0 when it is not known."""
+    try:
+        return max(0.6, min(3.0, float(bar["pitch"]) / float(DEFAULT_BAR["pitch"])))
+    except Exception:
+        return 1.0
+
+
+def hp_bar_box(W, H, s=1.0):
     """(x, y, w, h) of the look at the HP bar, in the game window of W x H pixels. The game's own UI keeps its pixel size on every
     resolution (the bar is ~400 px wide at 1080p, 1440p and 900p) and sits in the middle, ~130 px above the bottom: so the look is a
     fixed size around that spot (the old fractions of the screen cut the bar's top edge off at 1600x900)."""
-    w = int(min(W, 700))
-    h = int(min(H * 0.4, 170))
+    w = int(min(W, 700 * s))
+    h = int(min(H * 0.4, 170 * s))
     x = (W - w) // 2
-    y = max(0, H - 205)
+    y = max(0, int(H - 205 * s))
     return x, y, max(1, w), max(1, min(h, H - y))
 
 
-def hp_fill_box(W, H):
+def hp_fill_box(W, H, s=1.0):
     """(x, y, w, h) of the wide look that has the whole HP bar in it: a fixed size (pixels) in the middle of the game window's lower part."""
-    w = int(min(W, 1200))
-    h = int(min(H * 0.3, 330))
-    y = max(0, H - h - 30)
+    w = int(min(W, 1200 * s))
+    h = int(min(H * 0.3, 330 * s))
+    y = max(0, int(H - h - 30 * s))
     return (W - w) // 2, y, max(1, w), max(1, h)
 
 
@@ -7568,7 +9115,7 @@ def _near(pr, pg, pb, color, tol):
     return (np.abs(pr - color[0]) + np.abs(pg - color[1]) + np.abs(pb - color[2])) <= tol
 
 
-def hp_bar_visible(rgb):
+def hp_bar_visible(rgb, s=1.0):
     """rgb = the HP bar area of a screenshot (HP_BAR_FRAC). True when the bar's FRAME is there: two long, straight, light
     frame lines about a bar apart (top and bottom edge) with the dark outline right inside them. Grass or other scenery
     can be the same red as the bar, but it never has these exact straight lines. (The game hides the whole bar while the
@@ -7577,15 +9124,15 @@ def hp_bar_visible(rgb):
     if H < 8 or W < 40:
         return False
     pr, pg, pb = (np.ascontiguousarray(rgb[..., i]).astype(np.int16) for i in range(3))
-    sh = 1080.0                                                      # (the bar keeps its pixel size on every resolution: sizes below are those of a 1080p screen)
+    sh = 1080.0 * s                                                  # (the bar keeps its pixel size on a normal screen; s = how much bigger the UI is on a big / high-DPI one)
 
     longest = _longest_runs
     # The bar's LENGTH is not fixed: it grows with the player's health (about 0.16 of the screen's width on a 2560x1440 screen, 0.21 for
     # others), so a line counts when a good stretch of the grab is unbroken light colour - not a share of the whole grab's width.
-    need = min(0.30 * W, 120.0)                                      # (pixels: the bar is ~400 px long when full)
+    need = min(0.30 * W, 120.0 * s)                                  # (pixels: the bar is ~400 px long when full)
     light = (longest(_near(pr, pg, pb, HP_FRAME, 70)) >= need) | (longest(_near(pr, pg, pb, HP_FRAME_BRIGHT, 40)) >= need)
     if not light.any():
-        return hp_bar_visible_loose(pr, pg, pb)                       # (no light frame line of the usual colour: no bar - unless the colours are off, see hp_bar_visible_loose)
+        return hp_bar_visible_loose(pr, pg, pb, s)                    # (no light frame line of the usual colour: no bar - unless the colours are off, see hp_bar_visible_loose)
     # (the dark outline is only a pixel or two thick and gets blended with the red / the frame when the screen isn't 1080p: any DARK
     # row - every channel low - counts, not only the exact outline colour)
     dark = (longest(_near(pr, pg, pb, HP_DARK, 30)) >= need * 0.8) | (longest(np.maximum(np.maximum(pr, pg), pb) <= 125) >= need * 0.8) \
@@ -7600,17 +9147,17 @@ def hp_bar_visible(rgb):
                 lo, hi = int(ya), int(yb) + 1
                 if dark[lo:hi + 1].sum() >= 2:                        # the dark outline sits between / next to the two lines
                     return True
-    return hp_bar_visible_loose(pr, pg, pb)
+    return hp_bar_visible_loose(pr, pg, pb, s)
 
 
-def hp_bar_visible_loose(pr, pg, pb):
+def hp_bar_visible_loose(pr, pg, pb, s=1.0):
     """The same look when the picture's COLOURS are off (a bright / washed-out spot of the world: glare, bloom, fog and the like change the
     bar's colours - and the scene behind it - so the exact frame colours of hp_bar_visible miss). It looks at the red FILL only, by how red it is
     against its own green / blue (so a washed-out red still counts): a long straight band, 10-50 px tall, every row of it a long unbroken red run
     of about the same length, with no red above or below it (a red wall / sunset fills the whole look, a bar doesn't).
     pr/pg/pb = int16 channel planes of the HP bar area."""
     H, W = pr.shape
-    need = min(0.30 * W, 120.0)
+    need = min(0.30 * W, 120.0 * s)
     red = (pr >= 100) & (pr - pg >= 45) & (pr - pb >= 35)
     lr = _longest_runs(red)
     rows = lr >= need
@@ -7621,13 +9168,14 @@ def hp_bar_visible_loose(pr, pg, pb):
             rows[g + 1] = True
     for y0, y1 in _runs(rows, 1):
         h = y1 - y0 + 1
-        if not (10 <= h <= 50):
+        if not (10 * s <= h <= 50 * s):
             continue
         seg = lr[y0:y1 + 1]
         if (seg >= 0.8 * seg.max()).sum() < 0.7 * len(seg):
             continue                                                         # (the band's rows are about the same length: a straight bar)
-        above = lr[max(0, y0 - 9):max(0, y0 - 2)]                            # (the band's own soft edge, 2 px, is left out)
-        below = lr[y1 + 3:y1 + 10]
+        e2, e9 = max(2, int(round(2 * s))), max(9, int(round(9 * s)))
+        above = lr[max(0, y0 - e9):max(0, y0 - e2)]                          # (the band's own soft edge, 2 px, is left out)
+        below = lr[y1 + e2 + 1:y1 + e9 + 1]
         if (len(above) and above.max() >= need) or (len(below) and below.max() >= need):
             continue                                                         # (red goes on beyond the band: not a bar)
         return True
@@ -7853,17 +9401,21 @@ MOUSE_SIDE_LABEL = {MOUSE4_ID: "MOUSE 4", MOUSE5_ID: "MOUSE 5", MOUSE3_ID: "MOUS
 MOUSE_PK_VK = {MOUSE3_ID: -4, MOUSE4_ID: -5, MOUSE5_ID: -6}     # (what the 'keys the user holds' set calls them)
 
 
+CTRL_ID = 0x400                                        # + this on a keyboard key's id = that key pressed WHILE Ctrl is held (Ctrl + A)
+CTRL_VKS = (0x11, 0xA2, 0xA3)
+
+
 def valid_press_id(i):
-    """A key id a keybind may be pressed with: a keyboard key or Mouse 4 / Mouse 5."""
-    return 0 < i < 0x200 or i in MOUSE_SIDE_LABEL
+    """A key id a keybind may be pressed with: a keyboard key (also with Ctrl) or Mouse 4 / Mouse 5."""
+    return 0 < (i & ~CTRL_ID) < 0x200 or i in MOUSE_SIDE_LABEL
 
 
 def _clean_key(d, mouse=False):
     """{"id", "label"} of a key; mouse=True also accepts Mouse 4 / 5 (only as the key that is PRESSED, never as a key the tool sends)."""
     try:
         i = int(d.get("id"))
-        if 0 < i < 0x200 or (mouse and i in MOUSE_SIDE_LABEL):
-            return {"id": i, "label": str(d.get("label") or "KEY")[:16]}
+        if 0 < i < 0x200 or (mouse and (0 < (i & ~CTRL_ID) < 0x200 or i in MOUSE_SIDE_LABEL)):
+            return {"id": i, "label": str(d.get("label") or "KEY")[:20]}
     except Exception:
         pass
     return None
@@ -7888,16 +9440,32 @@ def clean_keybinds(data):
     return out
 
 
+def slot_place(slot):
+    """The scan code of a hotbar slot's key on THIS keyboard layout (the "-" / "=" slots follow what the keys type: a Spanish keyboard has the "-" key at the
+    "/" place of a US one). Every other slot sits at the same place on every layout."""
+    if slot in ("-", "="):
+        for sc, n in SCAN_HOTBAR.items():
+            if n == slot:
+                return sc
+    return KB_SLOT_SCAN[slot]
+
+
 def build_kbmap(kb):
-    """{pressed key id: (scan to send, extended, event name for the tracker)}. A blank slot adds nothing: the normal key stays."""
+    """{pressed key id: (scan to send, extended, event name for the tracker)}. A blank slot adds nothing: the normal key stays.
+    The "-" / "=" slots are stored with extended = 2: send_slot then looks the key up on the layout of that moment."""
     m = {}
 
     def add(src, scan, ext):
         sid = src["id"]
-        if sid != (scan | (0x100 if ext else 0)):
-            m[sid] = (scan, ext, None if ext else SCAN_EVENT.get(scan))
+        if sid != (scan | (0x100 if ext == 1 else 0)):
+            m[sid] = (scan, ext, None if ext == 1 else SCAN_EVENT.get(scan))
     for slot, spec in (kb.get("map") or {}).items():
-        add(spec, KB_SLOT_SCAN[slot], 0)
+        if slot in ("-", "="):
+            add(spec, slot_place(slot), 0)                       # (skips a key that already IS that slot on this layout)
+            if spec["id"] in m:
+                m[spec["id"]] = (KB_SLOT_SCAN[slot], 2, slot)
+        else:
+            add(spec, KB_SLOT_SCAN[slot], 0)
     for e in kb.get("custom") or []:
         if e.get("key"):
             t = e["send"]["id"]
@@ -7906,8 +9474,10 @@ def build_kbmap(kb):
 
 
 def send_slot(scan, ext, up):
-    """Presses a physical key BY PLACE (tagged as the tool's own input)."""
-    if not ext and scan in SCAN_HOTBAR:
+    """Presses a physical key BY PLACE (tagged as the tool's own input). ext == 2: the "-" / "=" slot (scan 0x0C / 0x0D), pressed where this layout has it."""
+    if ext == 2:
+        send_key("-" if scan == 0x0C else "=", up)
+    elif not ext and scan in SCAN_HOTBAR:
         send_key(SCAN_HOTBAR[scan], up)
     else:
         send_raw_scan(scan, bool(ext), up, TRAIN_TAG)
@@ -8073,6 +9643,7 @@ class InputWatcher(threading.Thread):
                 if not physical and info.vkCode in self.INJ_WATCH:
                     self._inj[info.vkCode] = is_down                               # (what the tool itself holds down for the game right now, whatever sent it)
                 real = physical and not (info.flags & 0x10)                        # (typed on the keyboard: not injected by another program, e.g. your own AutoHotkey script)
+                held_real = real or (physical and not is_ahk_extra(info.dwExtraInfo))    # (the keys the run features count as held: also what a remapper / driver injects, never what AutoHotkey sends)
                 kreal = real or (physical and bool(self.app.cfg["settings"].get("kb_accept_injected")))     # (the keybinds can also take the keys a mouse driver sends)
                 if kreal and not real and is_down and self.kb_capture is not None:
                     cb, self.kb_capture = self.kb_capture, None
@@ -8081,25 +9652,37 @@ class InputWatcher(threading.Thread):
                     return 1
                 if real:
                     (self._pk.add if is_down else self._pk.discard)(info.vkCode)
+                    if self.kb_capture is not None and info.vkCode in CTRL_VKS:
+                        if is_down:
+                            self._cap_ctrl = (kb_key_id(info.scanCode, info.flags), key_label(info.scanCode, info.flags))     # (Ctrl: maybe the start of Ctrl + a key: wait)
+                        elif getattr(self, "_cap_ctrl", None):
+                            cb, self.kb_capture = self.kb_capture, None
+                            cid, clab = self._cap_ctrl
+                            self._cap_ctrl = None
+                            cb(cid, clab)                                          # (let go without another key: Ctrl itself is the key)
+                        return 1
                     if is_down and self.kb_capture is not None:                    # picking a keybind: this key is it (Esc = cancel)
                         cb, self.kb_capture = self.kb_capture, None
-                        cb(None if info.vkCode == 0x1B else kb_key_id(info.scanCode, info.flags),
-                           "" if info.vkCode == 0x1B else key_label(info.scanCode, info.flags))
+                        esc = info.vkCode == 0x1B
+                        combo = (not esc) and bool(self._pk & set(CTRL_VKS))
+                        self._cap_ctrl = None
+                        cb(None if esc else (kb_key_id(info.scanCode, info.flags) | (CTRL_ID if combo else 0)),
+                           "" if esc else (("CTRL+" if combo else "") + key_label(info.scanCode, info.flags)))
                         return 1
                 if real and self._alt_f4(info, is_down):
                     return 1                                           # Alt+F4: always closes the window, whatever keybind / script has F4
                 if info.dwExtraInfo != TRAIN_TAG:
-                    if physical and info.vkCode in self._phys:
+                    if held_real and info.vkCode in self._phys:           # (keys an AutoHotkey script sends go straight to the game: Block Run never counts them as yours)
                         was_k = self._phys[info.vkCode]
                         self._phys[info.vkCode] = is_down
                         if info.vkCode == 0x46 and is_down and not was_k and self._phys[0x57] and not keys_off(self.app):
                             self.block_run()                             # W held + F pressed (not a key repeat): the W + F Block Run
-                    if physical and info.vkCode == 0x47 and getattr(self, "_g_cut", False):
+                    if real and info.vkCode == 0x47 and getattr(self, "_g_cut", False):
                         if not is_down:
                             self._g_cut = False                          # they let go of G: back to normal (this release goes through)
                         else:
                             return 1                                     # (their key repeats: swallowed, the game already got the G release)
-                    if physical and info.vkCode == 0x47 and self.gf_g_event(is_down):
+                    if real and info.vkCode == 0x47 and self.gf_g_event(is_down):
                         return 1                                         # (G while the tool holds it for the user: swallowed, the tool lets it go)
                     if real and is_down and getattr(self.app, "gate_open", False) is True and (info.vkCode in (0x1B, 0x0D, 0xBF, 0x6F) or info.scanCode == 0x35):
                         self.gate_hide()                                # (Esc / Enter / "/" : the gate shortcut boxes go away)
@@ -8126,8 +9709,8 @@ class InputWatcher(threading.Thread):
                             self.app.q.put(("imenu",))                  # (a key press = one Instant Menu, whatever other keys are held)
                         elif not is_down:
                             self._imenu_held = False
-                    if real and not (getattr(self.app, "gate_open", False) is True and info.vkCode in self.GATE_NAV and info.vkCode not in self._gate_pre):
-                        rb_swallow = self.rb_event(info.vkCode, is_down)     # (Block Run: W / S / F / Q are taken and re-sent by the tool)
+                    if held_real and not (getattr(self.app, "gate_open", False) is True and info.vkCode in self.GATE_NAV and info.vkCode not in self._gate_pre):
+                        rb_swallow = self.rb_event(info.vkCode, is_down)     # (held_real: also the keys a remapper / driver / virtual keyboard injects - they were counted as held but never reached the run features)     # (Block Run: W / S / F / Q are taken and re-sent by the tool)
                     if kreal and not self._chat_typing() and self._gate_filter(info, is_down):
                         return 1                                       # (the gate shortcut boxes / a gate keybind took this key - also while the climb check
                                                                        # thinks the mana drains slowly: casting a Gate drains it too)
@@ -8228,7 +9811,10 @@ class InputWatcher(threading.Thread):
         vk, kid, held = info.vkCode, getattr(info, "kid", None) or kb_key_id(info.scanCode, info.flags), self._gate_held
         if not is_down:
             self._gate_pre.discard(vk)
-            return held.pop(kid, None) is not None
+            return (held.pop(kid, None) or held.pop(kid | CTRL_ID, None)) is not None
+        gm0 = getattr(app, "gate_map", None) or {}
+        if kid < 0x200 and vk not in CTRL_VKS and (kid | CTRL_ID) in gm0 and (self._pk & set(CTRL_VKS)):
+            kid |= CTRL_ID                                                 # (Ctrl + this key is a gate keybind)
         now = time.time()
         for k in [k for k, v in held.items() if (v[0] != vk and v[0] not in self._pk) or now - v[1] > 1.0]:
             del held[k]                                                    # (a key whose release the tool never saw: forgotten, so it can't block the next press)
@@ -8236,17 +9822,18 @@ class InputWatcher(threading.Thread):
             held[kid] = (vk, now)
             return True                                                    # (key repeat of a key that was taken)
         is_open = getattr(app, "gate_open", False) is True
+        both = getattr(app, "cfg", {"settings": {}})["settings"].get("gate_mode") == "both"      # (BOTH: the boxes are for clicks only; the keyboard types the letters + a number)
         if is_open and not self.game_active():
             self.gate_hide()
             is_open = False
         if is_open:
-            if vk in self.GATE_NAV:
+            if vk in self.GATE_NAV and not both:
                 if vk in self._gate_pre:
                     return False                                           # (held since before the boxes came up: the game keeps it)
                 held[kid] = (vk, now)
                 app.q.put(("gate_nav",) + self.GATE_NAV[vk])
                 return True
-            if vk in (0x11, 0xA2, 0xA3):
+            if vk in (0x11, 0xA2, 0xA3) and not both:
                 held[kid] = (vk, now)
                 app.q.put(("gate_ctrl",))
                 return True
@@ -8257,7 +9844,7 @@ class InputWatcher(threading.Thread):
             if hotbar_scan_name(info.scanCode, info.flags) in HOTBAR_KEYS:
                 self.gate_hide()                                           # (another spell: the boxes go away, the key goes through)
                 is_open = False
-        if getattr(app, "cfg", {"settings": {}})["settings"].get("gate_mode") in ("shortcut", "both") and not is_open and not (info.flags & 1):
+        if getattr(app, "cfg", {"settings": {}})["settings"].get("gate_mode") in ("shortcut", "both") and (not is_open or both) and not (info.flags & 1):
             ltr = GATE_LETTER_VK.get(vk)
             if ltr:                                                        # (letters go through to the game as always: the tool only listens)
                 buf = self._gate_buf
@@ -8335,7 +9922,7 @@ class InputWatcher(threading.Thread):
         app = self.app
         vk, kid, held = info.vkCode, getattr(info, "kid", None) or kb_key_id(info.scanCode, info.flags), self._kb_held
         if not is_down:
-            h = held.pop(kid, None)
+            h = held.pop(kid, None) or held.pop(kid | CTRL_ID, None)
             if vk == ALT_L:
                 self._alt_sw = False
                 if self._alt_inj:
@@ -8347,6 +9934,10 @@ class InputWatcher(threading.Thread):
                             self.events.put(("up", h[3], time.time(), None))
                     send_raw_key(ALT_L, 0, True, TRAIN_TAG)                 # the system got LAlt for Alt+Tab: it gets the release too
                     return True
+            if h is not None and h[0] == "blade_x":
+                send_raw_key(0x58, 0, True, TRAIN_TAG)                         # (the X release goes to the game too)
+                self.events.put(("up", "x", time.time(), None))
+                return True
             if h is not None and h[0] == "map":
                 send_slot(h[1], h[2], True)
                 if h[3]:
@@ -8358,7 +9949,20 @@ class InputWatcher(threading.Thread):
                 send_raw_key(ALT_L, 0, False, TRAIN_TAG)                    # (LAlt itself was taken: hand it to the system now)
                 self._alt_inj = True
             return False
+        if vk == 0x58 and kid < 0x200 and not (self._pk & set(CTRL_VKS)):
+            if held.get(kid, (None,))[0] == "blade_x":
+                return True                                                # (key repeat)
+            if kid not in held and self.game_active() and app.tracker.blade_waiting():
+                held[kid] = ("blade_x",)                                   # X while Blade Crash waits for the click: the tool sends the X to the game itself,
+                msg = app.tracker.blade_cancel(time.time())                # and the move goes on cooldown
+                send_raw_key(0x58, 0, False, TRAIN_TAG)
+                self.events.put(("down", "x", time.time(), None))
+                if msg:
+                    app.q.put(("msg", msg))
+                return True
         pm = getattr(app, "potion_map", None)
+        if kid < 0x200 and vk not in CTRL_VKS and (self._pk & set(CTRL_VKS)) and (kid | CTRL_ID) in ((pm or {}).keys() | (getattr(app, "kb_map", None) or {}).keys()):
+            kid |= CTRL_ID                                                 # (Ctrl + this key is bound)
         if pm and kid in pm:                                               # a potion key: opens the inventory and drinks it (see App.potion_press)
             if kid in held:
                 return True
@@ -8442,6 +10046,28 @@ class InputWatcher(threading.Thread):
             return
         send_raw_key(RB_VK[name], 1 if name in ("up", "down") else 0, up)
 
+    def _rb_why_log(self):
+        """Writes WHY the run features did nothing for this key (once per reason, at most every 5 s) - for the tester's log."""
+        try:
+            S = self.app.cfg["settings"]
+            if not S.get("all_dir_run"):
+                why = "All directional run is switched off"
+            elif not (S.get("block_run") or S.get("cast_run")):
+                why = "Block Run and Cast Run are both off"
+            elif getattr(self.app, "chat_open", False) is True:
+                why = "the chat / Esc menu is believed open (press Esc or Enter once)"
+            elif climb_paused(self.app) or getattr(self, "_climb", False):
+                why = "the tool thinks you are climbing (the mana is draining slowly)"
+            else:
+                why = "the game window is not in front (title: %r)" % (str(S.get("game_title")),)
+            now = time.time()
+            if why != getattr(self, "_rb_why", None) or now - getattr(self, "_rb_why_t", 0.0) > 30.0:
+                if now - getattr(self, "_rb_why_t2", 0.0) > 5.0:
+                    self._rb_why, self._rb_why_t, self._rb_why_t2 = why, now, now
+                    self.app.append_log("Run features are off: " + why)
+        except Exception:
+            pass
+
     def rb_enabled(self):
         S = self.app.cfg["settings"]
         if not S.get("all_dir_run") or not (S.get("block_run") or S.get("cast_run")) or keys_off(self.app) or getattr(self, "_climb", False):
@@ -8487,8 +10113,14 @@ class InputWatcher(threading.Thread):
                         item[1].set()
                 else:
                     self.rb.handle(item[0], item[1])
-            except Exception:
-                pass
+            except Exception as ex:
+                if time.time() - getattr(self, "_rb_err2_t", 0.0) > 10.0:
+                    self._rb_err2_t = time.time()
+                    try:
+                        import traceback
+                        self.app.append_log("Run features: the run engine failed: %r (%s)" % (ex, traceback.format_exc().strip().splitlines()[-3].strip()))
+                    except Exception:
+                        pass
 
     def rb_poll(self):
         """Called often (not from the hook): Block Run goes off / on with a slow mana drain or climbing. Space twice + a climbing-speed drain
@@ -8612,6 +10244,8 @@ class InputWatcher(threading.Thread):
                 return False
             en = self.rb_enabled()
             self._rb_transition(en)
+            if not en and is_down and name in ("w", "a", "s", "d"):
+                self._rb_why_log()
             if name == "w" and (en or not is_down):
                 self._fw_held.discard(vk)                   # (a W release, or the script being on again, always ends the "climbing press" - a stale one swallowed every later W press)
             if name == "w" and not en and self._fresh_w(is_down):
@@ -8629,8 +10263,18 @@ class InputWatcher(threading.Thread):
             else:
                 self._rb_held.discard(vk)
             self._rb_put(name, is_down)
+            now = time.time()
+            if now - getattr(self, "_rb_seen_t", 0.0) > 20.0:
+                self._rb_seen_t = now
+                self.app.append_log("Run features: the tool got %s %s and handed it to the run engine" % (name.upper(), "down" if is_down else "up"))
             return swallow
-        except Exception:
+        except Exception as ex:
+            if time.time() - getattr(self, "_rb_err_t", 0.0) > 10.0:
+                self._rb_err_t = time.time()
+                try:
+                    self.app.append_log("Run features: error while handling a key: %r" % (ex,))
+                except Exception:
+                    pass
             return False
 
     def cast_run_why(self, pt):
@@ -9093,7 +10737,7 @@ class InputWatcher(threading.Thread):
                     return 1
             if n_code >= 0 and w_param in (WM_LBUTTONDOWN, WM_LBUTTONUP):
                 _inf = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                if _inf.dwExtraInfo != TRAIN_TAG and not (_inf.flags & 0x1):      # (a click another program sent, e.g. an AutoHotkey script: not the user's button)
+                if _inf.dwExtraInfo != TRAIN_TAG:                                  # (a click an AutoHotkey script sends counts as the button held: it feeds the autoclicker too)
                     self._lheld = (w_param == WM_LBUTTONDOWN)
             if n_code >= 0 and w_param in (WM_MBUTTONDOWN, WM_XBUTTONDOWN):
                 info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
@@ -9160,7 +10804,7 @@ class InputWatcher(threading.Thread):
                     if w_param == WM_RBUTTONDOWN:
                         self.gate_rclick((info.pt.x, info.pt.y))              # (Gate armed: the shortcut boxes come up)
                         self.gf_cast((info.pt.x, info.pt.y))                  # (snap Ignis with a green / white box: the click goes through as it is, then G + F)
-                    if w_param == WM_LBUTTONDOWN and not (info.flags & 0x1):          # LLMHF_INJECTED: clicks from AutoHotkey never start the autoclicker
+                    if w_param == WM_LBUTTONDOWN:                                      # (clicks from AutoHotkey start the autoclicker like a real one)
                         self.autoclick((info.pt.x, info.pt.y))
             if n_code >= 0 and w_param == WM_RBUTTONUP and self._vir_drop_up:
                 info = ctypes.cast(l_param, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
@@ -10203,6 +11847,25 @@ SETTINGS_TIPS = (
     "reach the slot's border; type 2 for more, 0 for the exact size, or -1 to make it smaller."
 )
 
+CHANGELOG = [          # newest first: (version, [one line per change]). The "What's New?" window shows the first entry (also used by show_notice for other pop-ups)
+    ("1.3.4", [
+        "Added Ctrl + Keybinds (Ctrl + A etc.).",
+        "Added Blade Crash cancel (pressing X cancels the move / slam).",
+        "Added more buff icons: Soul Berserk.",
+        "Optimized the tool even more: it should take less RAM / CPU and is now 26 MB, down from 60 MB.",
+        "Added Update Logs pop-up, and pop-ups for other things.",
+        "The tool now knows Power Surge resets the axe M2 cooldown.",
+        "Fixed the Gate \"BOTH\" variant not working at all.",
+        "The tool now snaps to your screen by itself: when you switch windowed / fullscreen it finds the hotbar and mana bar again, no need to click Find hotbar / Find bar.",
+        "Climb Detection now works even if Mana % isn't shown.",
+    ]),
+]
+CHANGELOG[0][1][0:0] = [       # (the House System exists only in this test build: its lines go first)
+    "House System: make a \"House\" inside the tool. It is stored locally and its data goes through public MQTT brokers (or set up your own server for more privacy). The data is used to show things like health bars.",
+    "Shows housemates' Health / Buff Duration / Potion Duration.",
+]
+
+
 CREDITS_TEXT = (
     "Cooldown Indicator\n\n"
     "Ideas from yo1 (Hate Ebk goat abyss) on YouTube, rebuilt from scratch.\n\n"
@@ -10492,7 +12155,7 @@ class HotbarWatcher(threading.Thread):
 
 TRAIN_DESC = ("How to set this up\n\n1. Add the Spell to \"Main\" Tab first.\n2. Add Mana Marks in Mana Overlay. (The box that shows cast%)\n"
               "3. Click on Spell Key to Train box and press what Key the spell you wanted to train is on.\n4. Press Start/Stop")
-EXTRA_ICONS = {'dayfarm': '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', 'sell': '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', 'auto': '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', 'brew': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAPeUlEQVR42u2ae7BfVXXHP2vvfX7n/F735ikWK68QDAECiICCJQxREK39S0WUcaYddWwdbYf2D5mpOq1O8Q9tZ8o4VdppOw6tTevUTh1qEbEEgfAQA+EVDIEQFYGQ5N7f8zz23qt//H73cpP88rgxqJ16Zu7Mnd85Z6+1znrs7/6uJbx6lyzyeeXX16v/lf/PefB4G2iBsGrNORdo1I2qMYKaI6gQRYwRI9fs2PboQ3NrHC+F3GHumWNYzwAqaMsYu0r16L6fiEEJrfH75hi9GRdrYDxWIWU17GkwUVXjUXyoKCJGbOyN34/HM6TcIbwQT1299m+sMefEEKMeMczG8WmsDId9XXXamqlrr7nOlGVpRA7vRVU1tVqNr2+85R9CGTv1elNCDHp0+SXRWGNCjI8+u/2J35/T/eg8GLnYOHP+KISEOUVVFVVl4e86TmZjDM4npLWMNWvOoigKjsJA0jQlrWXnuCTBJQ4Tzfyak+Qt1MMYQ/CxsegcFKEXQgiqhLLMbQijvE+SBOdGr3nvqapyZKSOFBgM+gwGfXHOGu/NURnonGUw6MfZ2VmtKo+qIjK6lyS1A+RVo2ixllotDarBitBbTBUdhejpZ97tnLt0mA/D+ksvt6ecfCoihgd/+ABPPPkYAGvPPJuL3nQxw+GQNMtotloYI3Q6HbZtewJjzZHLhUAMkTVr1jI1NUWMSr/Xo8hz6vU6D/zg/v3kXfjGi1CN7HzuWTbdc2eoZ3Xrvb/n2aeffOsRQ3T9+vVu9+7dZuXKlfGnP9sj1lpUlVNPOY3zz7sAI5ZdP3mOJ558FIATXnMCb3rjRXQ6szTbbZYsW0qWZWzd+jBf+epNZFk2H0YTsyBGRIQ8z7nyyqtZt+488jxnZu8++t0uU1PTPLdr537yLjj/QqIGRIQ77/4frLVoVFmo+6ZNm/xEAxfeOOHEk6ukltDtdQkhYI3FiKEsS7q9LgBlWWKtQcRgjGDGzziXUG+2ybKMGALFcDjRwKzexFiL2ATnEoyY0RpGEDFYO0GeMYhCCIFur4uIUJVVtWnTY/5QISrjfUdOXX3mDcbIyqKo4hWXbXj/9PT0id57HQwHUpUlCtTrddI0A6Aocob5EFGwSUKapRhj6c7s4alH7kOBRqvNeb91xUQDH/7+9xj0ugjwhnPfTHvJcmIMFHlBqCpUoJ4dIG84RICkVqNRb6hzTmZnZ5//3l13/EuaJiZG3f3s9idvnLNp/yKjcr2zyXJvImeftY5Vp56OdUZu/vuv8MCD9xE18v73fIAr33Y1INx2+61845sbabeniD4QNRIVWqll9coGRVmwYmmDK9951UQDX3jsPl4uZkhrKfdtvoteETDCyJPO0u12+OA1H+Kqt70TUL7z3W/zH9/6d4wYLrrwzXz09z4mwUd2PPv0iZvuvvN6ZxPKUO0BbpwYooK+7L2fDsFHVBM5JJQTUJ0PxXq9SYwRRIgKmVUqH/BRKSrPvr37JoAToag8PirGR7J6E60JZrQ3YIzBx5GMcYk+dJVU1RB85b01gr58yCKjgjMizlobtzzykOz6yS5C8KxcsZIrN1yFAnmRc9vtt+Jcwo93bmdF3ZC4MFICiKpkztBspCQFTLUanHTKyROVm2o1KDs1amlKO1QkEjBzhoiS1g0/3rmdO+4E7yuKsuCqt109H6K33f5trHXs2bNbrLVOREyU/W06wIOEGKO31sVN99yZANLv9/n4Rz/Bmy++BCOWf9r4Nb7xzY00Gm1WNAyvm67hY3wlmVWp1QxL2i2KxLFsyTSnrlp1sAdUWbZkmqozQ5plhDBLWYbR/gcoiqvXePqpR7hvyxYGgy7vesfv8MFrPkTUwH3338uXb76JZrMJoFla9zFGIwcAdXfAeWWps86pKo16A2MMVixVVTE7O4sRgyBMtafI6k0SF/BxlHfoSClV0NLTnZmhyHOaS5aONucJBvY6HbozM5RZRlEGfAQRRRglh49KUktpGYuzgiDMzs4QNVJVFVOtKeqNOjFGAamJCD5USw9toLIxhPBa0KjKFSKywgevaZZJq93GiMEmDu89McYR4pjDoVaouQTvPUuXL+fci99CmedMr1g5QjMTcmjdJZdx8hlnUssyHrl/M/v27ME5R+k9Iep8RMQY8d5jE0er3SZqJM0yfPCqqhJCfFmE74EYVV440MC57NedTz/5ibkbq844a5O19jIRYr3dstPLlmKMJc3SETYcKzwfltaxbKpFv9fltNVn8OHPfoEyz1FViuFgIhZ8zx9cj4hQyzL+6g8/wrbuAzRbLfbOdhmE6hWYJzLCrFnK9PJlxBiot1uIEK21Nsb4xI4fPX7NJCR4SCw6HAylSioGgz5GhCzLMGIx1hJ1HIr6CuiN4z/VEWbsd2Yp8xwx5pBIZtjvoTFSlQXee1RZsM6cDJn/3VhLlmZEHRWjwaCPcwm+8nJUYHvVqjUXqDX1PC/iG85YsyRLU/qDvnQ7HbZufRjnErr79tBKHZlVUifUEofEEWB+xTmCsaOPcTiwbYxBx88ufM45S02VxAipVzJVSB3dfXt47PGteF/R7XRYt+58aTaa5EWxBCOXZFlqJMThjh3bHlpo4DySiSL/6WxyojUV177/OtasOQtnrfnil27kqzffRL3RZmUDVq/IKIOnWU+ZatSJY3dG1Z+PBJGRp1pZSqueYUQwdkhjWFBrZmx7ZDPf37yZ4aDL+ss28IW/+EvjQ2DbtsfP+dznP3OPtQk+ls8DvzkZyYj0NcaoqrEsS1cUBd6OQixNM9I0xZgwCiH2D9HjSfDouOLNywCigjGONLXEUGGMIS9yQoiUZYmqeo3RINI/zHlQ5ziR+cPlwQfdXyZ9qRMPwGMdx7rvzz6Y4yl+XpjIsby83wc9XtdxM1BVCd4TvCeGxbN+MYT59+c89GrThosyziUJab2BdY6s0Vz0GlmjSXNqmqzRpBgO8JPQzy/DQGMtg36PtRdt4Lo/+TT97ixJUqM6CsJpLqyrouAD199AVZU029Pc8sXPsWXTHbSmpn81PBhjxLmE5tQ0jM9zMcZFe7CmdZrtaZxLFv3+q2egCGLMfjmIsYsOrxgCIYb5HBRjfnkhaqxl2J3lsqt/m/d99ON09u2l0WpTDIdYa49tRxTBWksxHPLu3/0YG977QaaWLuNfb/4yt31jI+mS6WNqWbgDGyFz9Lmqmsmk63hfjJF6q80Jrz+FrDWFESH4ucJw7FVQo2dq2QpaS5czvXQZ9VYbnQ/XyXvzWMe4wIZDGKjaFGOMiJharUaapjhriTFSFDnGJkQLRlIEHUEpA8aMvr5NHMdpz4EQRmuLzMuK0VMUnqLIiTGSpRk+BGq1GiLixBgIvnlI4vcAsP2VLE3P6Q/68a2XrjcnnXQyziXccfut3L/5Llwt46TfWMkZp72OvKzIkoRmI/35gY5Af1CQVxVZLeFHz/yUXT/bjS9zLn7LZWx4+7vwvmLXrue4+55NsdlomrwoHn3qR9s+diiwPX8tvEHUGZc4Op0Zvfrqd7Nu3XkYsTzwg/voFp5WmvDCCy+Qv7STSqFRS5huNV/ZpMeRKsKoYByUl4rGOKJyFkS1iDDb6zMoKxKBmZhRSUav6NFeupyzz1pH1MC+mX1s3bpFp6aW4Cs/8/xPnrl3UUWm3qhrkiR4XxFVyfMcYywxhPmwSZKERj2hikq9ltBYYGAcn/ZjjJMPvEA6pkUU5skmEaFUgaQiMUJ/CFKNQzQE8iInxhHgbzSaNBoNqqrSwxWZ+ePSKaef+ddGzGtBY4y6NoSAKmbY7TG7dx9GDEU+3sDHyR3i6GBaVBV7O70RqrGGVj2jqiqmV6zk2j/61ERO5lv/+FVmX96NSxI6gyE+jKj8arxVjNYeyRIRirxgds9eokaG3R6qmBACMera01av3QhiosYXdj795CcnHpdEuMZau3Lu1CAiOOukyHN63S5GDKHyOOcwxiCi6Di2QlB8KEf0ReJoN4QQAmm9zpuuuGqigd/Z+DVCCCS1GkXlKSs/qpJj0knnDs/G4JwjVJ5et0vUSJHnOOtERLDWrAB5n4igIe4GPnko2nBfCH4pSMyL4TxtmCQJ09PTGLEoSqfbwQclaxhcvYaPo3aXMKIXnBGMyKiPAJT5cKKBAlhjMCI4I6h5pd+ojNapyoLeIDIYdFGU6eklRA0kSUKn1yFomKMNK1AjsO9wvYnt1thVVVXFSy6+1CxfvpIQPIPhgP16E7V0nvjd/tQjJLX0IOL3Ne2EsihYceLr+PCnb5yYH3/3uRt4+fmfUktTXupW5D4uIH5Hxq1+w7m8/pTV88TvAb2JOeKXe++/JyZJYkIMO57d/uTqySGqeFX1IYR4/rkXJKeftlqMMxzcm3gnqHLHnbD54S20jd2Puq9UaQ4KSl9S6w3YtfO5idR9pzegX5RUAbqVZRjcftR9dxi54pTVbLj87SDCd777Xwf2Jog+8vQz2/X7997lnXNGFH8Y4ldWJM4578OIqjscqSCC9xXDfhdnZL/mi6SWpNUgRiFNHEuXLZ1cRROHM0LiDPmwT/+A5suw38UfAR3puPRa62rOOcqyWvH/qn12SFR8wokn35nUkvWdbid8/COfsBdf+BaMGP75327hv2+/FYB3vP1dXHfth5iZmaU11WLJsuVkacpjjz/KZ//8T4/YAE3rdYy15HnOn33m85x91jnkRcHM3j30Oj2WLJnmlq9/bT95H3jvdUSN3P/gZr78tzeFqfaUrcpq04vPP3f5ETf6A1rYiUscqoq1lhADKlCr1Wi32sDo/xAiqpEYdbwBx/nQ1VAdtoWdD/vzLewRoIijNaKiGgkhHiwvRqIGrLW0W21azRa+5pM1i2hhzw0hqIRR2X525zPjyQfDiy+9OA+7XnzpRX7wwwcmDiFcvn7DooYQdu16jpmZfQcNIRwo76EtD84PIYiM9toQgy7U/aimLE47fe1dYuSS0RhJsagxknXrzpcv3Pglk+f5UY2RZFnGp27447h16xZtNJqLGiMRwWrUe595+onLFjUIpErLjRobtl6vTxwEStN0NEmxYBAoSRyNRhPvA2EMvY5koPeBRqNppqenqdcbo87VhEGgOXkL9LDGGKrgW4s/0RvujzEOFjvK5atKizKf2rbt8XPKsjwqA2u1GkWZP+qrquOdX9QoF2AwPPoLnRc9adWqCzSYBxY5jHfRrh07HjreuhzvcUoLhFpSb0lijWo8mjXMAeOUxzov+gsZp5RRn0R6MYYdRz8Qq0aMzI1TyvEcqZRfD6Xz66H0X2kP/i/C5xFcJ02VhAAAAABJRU5ErkJggg==', 'inv': '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', 'snap': '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X99k/eYd7NrTTFtnkt2NLezY3VTUjq9LEYp0QjT06UN9n3oGjTiSd995h9GjR/Pt686huqqKmpoaaqqrqa6pobq6iiGDh7DioxXMvmM2yz/84IDwHcdly5YtzJz5JebNf5PLLzyLc848EQFEqysZNWIIAAWtR3zaRu8YY7UQYpDrOPTrU4vFkkyluWLWXYSjcY6aMAEhBMNGH8X0mRezZMliBg0cyI033kh9XR39B/SnsrISRzkgBGeffTael+d/3XPPQfXX3NLCxk2b2L59O4MHDy4lv8YYwuEwruOwceNGNm7cyNcunM7D992GMYZsziMSCTN0cH9bzPD1QA4SspW+HDBgQAxY36eu2jaueEGnN823tulde/VXzrF9+jTYj1assOXt2WeftSdMmWL3bb7vW2OMvfnmmy1gt23bZn3ft4VCwQZBYIMgsL7vW621Xb16tXVd186bN88GQWALhUKpnz/98Y+2tq7OAvbG73zFejsW2vTm+Ta5/g3bte51axuX2Fcf/5UPWCHEX/bdC+W+KIMgWQVUNdTXEo9FhLGWbCbHL392PQMbqph0zGQeeugPpedPP/101q5bx8svv4wxhiAISuYqhGDq1KkALFiwAMdxkFKilEIpVeJpGhoaMMbQ2NiIUgrXdVm1aiWXXPJlvnn11RTyWR657zbuu3MWXr6A1kWSqkg5WqorY70aq913q5D7atDznDhQ1aeuhkgkCtYSBAEVsShz/3If006YyHe+cy1nzZjB/HnzqK2tZfbs2dx///1IKXvohGKapLXmuOOOw3VdnnrqKYwxPeyb7mHSJFJK+vbty4wZM0gkEixY8DaXXXYZEycezbPPPseZJx/H0lce4urLzyfZlQIssiyottZQURFDKYm1Nr4vJyP3J2KDKiAej0Ws40hhrUVKST7vUV9TxdwnfsVPfvgN5r3xBtPPOoujj56El8/T0tzsz58/v6Qd13VRSjFgwACuvPJK3n77bbq7u0vfSynJZrNs3rSJOXOexhjD7T/5Kaeddjpz5szhuIljePLBO3n18Xs5cuQQujq6UErtTTwJgdaWcCgkotEwQGTy5MluucKcfTUYBKIaIBYNWyWl6GW1lJJ4XgEpJXfffh1XXHw2Dz3xIn9+9lVuu/12ADXz3POYPPkYxowezeDBg6mtraG2ppYhQwajdcBtt91G//792bVrF1u2bGHrtu3s2L6tJMCwwf2ZfuEZXDLzdE4+/igisUiRdLYWx1EHKbpaIuEQ0XCYdDoXbW9vVz31iv28jQJ0ZTR6bncu99IVF88wjz0wW3YlkjhK7ZWwamOIR6O4kTDtbZ2899Ea5i9axocr17Fy9QbSucJnKkyOGDqAcaNHcvyksZx07AQmHDmSPn3qQBcpSW00SqlDFHgsjuOQ6k6b4875tty1p2VLQ0PD0W1tbele/Pvlg8baKEA8Hi0WAuz+RRZHKXJ5j0wuRzwWZuaZJzHz7JPxcx5dyW5a2hO0dqZIJJKkM1l8P0ApSXVVBdXVldRVV9Kntora6koqKuKgJDYIyOU8uhJdCHrpevWpE2WtQTpKhEIOQLhaa9l2qITXFqu4xCJhe6hKsZQCiSox3b3cS0U8Sm11JeOOUAgl96a3rcXqoqMJtO55t7vIcMtiDdH5DKDK7cBaUMrBdRyAUNb33UNn9MWqDI7jfOaymSorswWBxvd1saZoy2uLZbX/Evkk9iKk/q4TBtaipOhdo66OGUX3oQAKYXqigr9vzFLlSfCPbr1ZgpQSVdxTHa2jCjIcfJuAHEB3OidKden/D5r9xPGIA9EUZb5UtQO0J7qwWiO+wAhtbxVKG3w/AMiHQl7hYABtD/O7G8g3NrXLfN77z62RfzhCi5KSXDZLqjsDkDImnjskwFAo1ATsXrdpOy2tncZ1nc9Uvv5vwofrKto6ukxreydAa0tLS648o98XoOro6OhWSn2YSmfs4mWrbDgSRhvzBQVoUK7L2k07rB9oq5Ra1xOHyoOvQSCk1DOAeOSJl4UONPKLa6EgBAveXS4AEXbkOwfjQvei7nOFwqtSyjUL3/tIPD93gamqr6Hg+184gCHXoaM9wWtvv6+AjEYuOFS61PuDBHKOEP8ihBA33PFrs2XzTupqqns91Rei+X5ArKqCl+a9o3c2tiClXOB53tZywmk/Frh8LWpr1yohBqXSmWPnL1rmTztxkho6fBD5bK6Uy/13tUIQUBmPkuhK8Y0f3m26kt0yFJKztLZbys7eHRRgSbsWXpdSjmvtSIyb89Jbum99NcdOHCOi0QieV8ysy2t+/8jWe0xFCkF1bTXJVIavf3+2v+xv61wpxfNBYO7ZV3ufBhAgsNY+p5SKZbK5qS++tlgs/mCVrqurYcSwgaKqphJHyp6aebE8VnYGpxh9is/rOOxeaVlvwh2PRYhWxvH8gJfmLtBXzrrLvLdijSulXGmMvZSeCOxQB2IPeZBXKXWOtfYuY8xkgGPGH2G/fN7p+ox/mizHHD5UVFVVCKQErQn8AK01gTY9ZWuzF3C73+DFiRBSoqQoMgKOgwy5YAzdqYxdu2mbnbfoQ/PMK2+pVWs3i56g5K/GmGt7jl0e8NDxZ5lfUVYaDodd92u+1t82xpzYA5xRwwcx+ajRZuKRh5vRI4eIwYP6UV9TLSoroiIcDhFyXaRS4pOTTGIvZ2eMxWht/YJPNu+RTGXsntY2u3rdNj78eD1LP/xYrd+8s0QnSimXKMVvfN/MKT+t/PdocF9z7k0xZCQSOVFrf6bv69OAcUBFufuORSPU1lTRp7aa6uoK4rGojYRD1nUUjpI9PKYRfvFAgshmcyKR7Ka1PUFXspvuTK48gsoAq11XzXec0Cu5XO69A87UfxLgvtostaqq8Ejft+Ot5ihf+6O0tsOB/kDlPme6D7nee9ZRuqfuuN113TVKsdx1xfLu7sLGQ0w4/1UAy9/rBRscKCccOHBg1OvsrPYcp0JrHZHSxK21EWuVK611KZ6ALwihAylFTmmZ1Urlolp3DxozJrFi+XL/AGpxPu/B9P8q/y73qVTZz1Iv/xx9mr+3v/8HJJCuHRQHrQUAAAAASUVORK5CYII=', 'dash': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAATkElEQVR42sWbeZQfVZXHP/e9+m3dv17S6aSXJE1IQsi+ILKLDI47gkFccRkPIiqOynHjjI4LCgw6446ADqKijCLu6ygKKgiEBEJYQ0InIelOd3rv/u1V9e78UfVrft12kgbUeefU+VV1Le99737vu22Z3TCAxufzgJOAtYAAgzXPSM1zRxoC2PiQ+H0TX/9DR3XCLuArwF4j4qyICowDvwVeOsPzRwI227nl2SxeZjFBCJwM3CLQyTQWWRGcKgo3Ax8G9tRwXKfNZeLvASSBE4Hjib5bB+SA3cAW4P6aZ734XP+WnDPx71KgT6KPVwC3vrFBz2xt1dZkwgEB4IyIAgeAt8zwDVPzt0XApcA2AWdFtPYwkWT4wGbgklglZisdT4uzBqgH7orBBc2JhH5j4zp98kVnau+LX6D3nn6qvvPoLs1Yq4AfL06Ba2OOVKlPfH0l0G9iIDFH/JhIQc252qe+tQd4V8zxpy22h3rQiye6QeBfRCSw4H37Oet58fz5jFQqJIwhaQwJEbaMjvGZXd38fmBQibhiQ9XNwJuBHbEU3CRwgkQiHQLSkU7Jc5ubZUW2npQ1jFR8to6O88D4uBbCUGOgNlQFuBv4d+DWaerztAFWX3w/8J9WJAhVvY8du4xLli6h5BwV5+grlxGF+akkrakkuSDkG08+yWd37mbE9wMBTyPqvxm4RmC1Rhzy1jc2yvkLO3lJ2zzaUymsCAI4oOwcT+QL3NzTy437exjzAweoEbEuAvp14BNA72ystsygdw44B/iRFdFQ1by6s0Ou37CWId/nRwf6+N7+XrrzBUSEZfV1nNvZzrkd7XRm0twzPMondzzOHweHHWAUSgJpBZcyxnx8xTGcv3ABWWvJhyG+c1MtkQhpY0hbw2MTOb66ey837e9FI8kQpyoK+4FPAf89gzE7JMCq5esCNhuR+U7VbWxqNL85+QSeLBS55KFHuGN4ZMYPrWts4LKVy3lFWxu/GxjkZXdtxoEKiIioAbl2/Rpes6CDwYpPqDrJuenDqeKAOmtJG8MfBof49I5dPDA+TixdVWPzHuDLhxNXOw2sAl82cIqDsC2Vsj878Xj2FAq8est9PDyRwxPBARlrSFmD7yLi9Zcr/LTvIF11GazA93oOUAXnVOVDxyzh7YuPor9cxohMglNAY0BVVghgRAico+gcx2br2dTRRtoYHs3lTCl0vkSP5YBbpgUiMwK0sWgeB3xORAxgrtuwVlpTSc66ewv95QqeCIEq5y/q5ItrV/GmRQtpSSZ5ZCJHyTkCVX7TP8CI7+uufEFigyJrGrN8fu0qiqHDVPUt8p0kjaHOs2SsJR0fSWOQmJAKlFz03svb27hneJTH83msiFX4CXBbjZ+c0VrW+u5/NZB0qm5tY4NZ1ZDlvHvvY7BSwUokTJ9bvZK3dC2k7BwO+MjyZbyyo433PvgIW0fHqKjyq/6BKfJ/4VFdZK3HiO9jRQhVyXoeRoTeYpHHcnkGK5VoQSI0JxIsyqRZlMnQmPDIBSGBc+zOF3hofAJAYoPTy1P+uepr3Uw6WJXhj8bKG9RZ47UkEuwvlWOxVL64djVvWbSA/nIlCjxjjjZ6Hrkg4I1bH+DukRESxhDExmNeKsmtp5xISyJBRRUDZD3LXcMj3LivlzuGhjlQLv8V5ZsTCZbWZzi3o4NXdrSxpL6O3x4c4NzN9+FUEUFVGVW4A7ga+N9phnIKwOpvCvgO8Kr4IZMQwVflo8uX8f5lSxisRKJaO0JV0taQ8wNev3Ub94+NkzSGinOc3d7G1zasIReEWBGSRrhqZzdX795L7N+QmFgAqqDT1GlJXYb3L1vCw7FVrUpBNVSMz38AvC/m6iRImcHIJGLFPdsTcYGq2dTRztc2rGHcD5BDWL5QlXrPsr9Y4uV338vBciRyF3Qt4j9WH8twxaclmeDyHbv4QveeKHWI9YzYyABkLLook5EDpQoTQXhIk7+usYHeUlkHKhUXGxyjsAvYBDxUBWlmMDoGaDRAoMrS+jouX3ksxdDBIcBVKZkLQroyGa5Zv4a2VAqAO4eHGar4zEkmuWd4lC/FHHDx910NOE8EX5FFmQzXrFvLB5YeTdbaGJxM8lWBK1at4LennCCv6eywGoHzgWUxc9qqNLEzRDAfAN4mIqFnxF63fi0rGxvIh+GkoaFmIo2tIbHpL4QhG5uaGPN97hweYSwIeMG8uSyrr+Mr3XvYMjqGEcGIUG8t7ek0Wc9jIggiq6nQXSiyfXyCS49ZynuXLWbE99mVzyEIIfBPrXO5aHEX9Z7HuZ1tzE0kuX1wyCISAPPj48eAsdOc/BLgRiuSdKrmgq4uuXBxFyO+P0XvnCqIkDRmilkPnMMaw7gf8KnHdzJQqQDCrlyer+3dx5+Ghgnj98/r7OD649bx9sVdvKqznZe1zQeUhyZyGGDI9/l530HWNjbw64ODHKyUcUp4Xme7+dK61RgRKs5RCB1ntM4lIcJtg0NiwGmUjP8W2G+n6d+VBk5TcAvTaXP1ulWTyi81utYQm/ieYpE9hSK95RK+c7Qkk8xNJrh1YJDr9u6bpFpPqczBcgVfFQQ8K+zKF+gvlzmhuZnF9Rnmp1Js6mjn6LoMfxgcIlAlH4b8ou+g7iuWKoHDw4jpK5VZXp9ldUOWsnN4IuTDkBPnNHP74LD0lstqRDyFAvAbr8birADeiIhTVfO+pUfTnkkzXHmKe6FCUyLB7YNDXN29lwcnxidFq9HzOL6piUuXL+XHB/oisYjdyBSxVghCJSDkh7193Dk0wpfWrub5rS30lcu8bmEnWc/jgvu3E6gSoJy0qmn84Jg/t7unYAYrPu9+8GEWZNKsa2ygEIY4IG0Nr1/YwX1jY1VenAakbI14fsKInOpU3aqGrPn0ymMpOzdpNZ0qzYkEN+zdxzu3P8TuQoFi6Ag1koli6HiiUOD7PQfYmS9EBiSe6fkbW/j0O5bz1rMWsen57WTrLA93T+Ac5FzIz/v6WdWQZUNTI32lMsc3N+FU+dPQMIA01Cfqr710jdz5wAgjEz6+Kk8U8py3oBOHTroZTwzf6zlAoCoSeYPvVtF2AA8akRanyn+tWSlvWbSQ0ZrIo9Hz+EFvHxdvfygy76oYgSUL6jAi7NyfRxXERJxTp5y0dg4fftNSVi6up7UpSdlXjIGEZ7jjgWHe9/lH6O4pYIyQEcN3n7OBE1vmUAhDUOXMO+9hb7EIwB+uPpHQKWd/YCvlSohTuGHjOs5qn8+oH5AyhjE/4CV33UNPqYxAWeH5VTexycBcp6oL0ml56fz55MMwWiiQtpYni0U++ugORCJuLlmQ4UdXPYdfff4Efvn553LLlcexYXkj6iAMFadw0aYu/vm5rVgjDI/7FEoBE4WAobEKJ6+Zww+vfA7rljXgXKRvF29/mOFyhYwx9JfLNHixixDYua/A6RtbeOEJrcTxPf+zv5fQRdFRqEqdZ6nzvGralQSaq7HoK0VEUdXzF3bSlkoyFGftoSoZY/jGk/sZ8X2MCO1zk9x02UaWd2UZy/mIwPM2zOWHVzbxzV/u49Z7BzlpdTNnHDeXA0NR9mCmedzRnE97a5JvfXw9r/63++jeX6CnVOJt2x7EM/DA+AS5MCDhCX4Q5xkKSxdGlRBj4M/DIzySy7Eim424PrX4I4BXBZjROOAeqFRAIONZikFI2lr2Fovc3HNgknvvee1iVizO0j9UJpkwqMJYzscY4eJXL+Ydm7pIeIZ8KcSaQ9RErDBRCOlqy3D5Rcfyho9tI2GFu0am5pvOKZ4Vju6soxIoUSUDPDEUw5DbBodY09hIWpW0sZipoYhWp/+5UzUC7oYn9/O2+7fTXyrTnEzQlEjw075+BisVVGFRW5pzTm9ndCIg4ZlJy5j0hKZ6DyMQOhjLB0csCCWsMDoR8LyNLRy/somoOhGN1uYkp62bw4XnLOLbH1/PiqOyFMshB4amBuZ/GR4hZYTHc3k+9tjj7CsVAUKn6qoiKsA1wLkKJxqR4McH+u2fh4blXUcfxVntbdy0r3fSUb7hRZ3Mb0kyOuFjTaSj1gp+4PjMjU8wOObzjnO7WDAvTaniMEeof4lEXPrMu1fwnd/0UJe2nLa+hSUL6mhrSZFJGYJQGc8H1KXtpERUCx2PTuS44P7t/Kp/gEIYVlPIqn93VRGdAM4GrneqZ1kRBit+cNmOXfaL3Xtk3A+it4xw6roWgkCpBjbqlEzGctWNT/DVW/YCsKe3wLc/sT6OHuWIACu+Y/lRWTpb09y2dYgF89KccVwL4/mAUiWM3UBcLU48JTUAvaUyt/T2OUCsiIkziz7gJuAnXozYAAdjkO8NVS8VaBMRxvwgjGNpQqeM5CoR5+K1iwhBoNyxbRjPCiKw5dFRBkYqtDYn8WuIMdMIQ6WpweN7vzvAJ6/fCcCftg2zZEEdp61vIV8MMEYIXRQFJRNTar9OaipuoeqfgW8BPwMGmJYFV5fxBeB4hauc6rDE4FQhlTC0zUkThG5y0U4jI3DO6W0EoeIHyktOmc+8OSn8wB0WXDVgt8YwNBqlV6mYQ7t7CyQ8YVogRCSFTxXKFGyoerdGzDkDuD4GZ2pLFrVlC0tUlrsU+JrCRRIlksmmhgSd81L4oVJNnKwRCuWQC8/p4tiuevxQOX1DC87prArQ1gi5QsB5Z3bwp23D/HnbMBuXN3Lm8a3kSyFmmhLHBKh+/Ia4IHwjUKzZ2HHVhNebSWriBxNAN/BNQS5RVI9qS9OU9SScJnaqkaN90UnzEIkWHIR6RO5VdTAIlaasx/UfWceu/QW62tJk6zzKlRoJUDACC9syVYmzwF1xIdjUpHvhTBssM0lOGN8/VYQE4LraM1KX9ibLBdPHeD5gLOej8WKc6qw3ECq+I5U0rF3aQCpppoKbwvEpl6tqkvTwcDtIhxoOWF69aGtJHZYr1ggJa/CsECpkUpYgPDxIF4dayYThsT05Jgo+KIecJ5jqXpuOtK1mZkHfRdWTozszh9UqVUh4wmXX72TTB7ewY2+eeXOSuDhFcqpRUUkjYEGopJOW+ozlM9/p5mWX3MtP/3iQhjovspoziJU/1cikp9mPWQOUGl1cFL8tDfUeR5I6h7J1xxjbn5jgtR+5j6//5EmSntDSmCCTtCQ8IZkwZOs85jYl6BkoccHlD/Llm/dQqrhI/OXQilP2w6ezgTujkZlitIAmjVHVp21sHQ8BTpWkZ7n4VYt52xXbOThS4YNffowf/P4Ar3thJ+uOaaSlMUHFd+zrL/G7zQPc8oc+hsd9AFYeneXcM9qZKAR/ZT2rUHKFKQDzRwJ6JIAJgWSVa5mU5XAEtkaYyIecffp8Pjuxko9eu4Oy79j8yBibHxmjLm1pqPPwAzcJqjoWzk9zzYfWkM1YCjO4h6oKjOamvDc2223qIzYMiEQx55HsojEwUQh461kL+f7lGzlxdfPkvUIppH+4/FfgXnxSKz+44jhWHJWd0fc9BVAZmfpu7tmK6OTemyq4UGe1d2xEGJ3wOXnNHG6+4jhu2zrErZsHebh7gsGxCkaE1uYk649p5KWnzOPUdXNQB7ligD0EOGOEUsUxFAOMCT34rAEqhNVQLVcMETO7VgdrhYl4wS87ZR6vOG0+E4WAXCFEBLIZj2xd5EbyxXAymD/UIqwVcsWQ/ihdqsZwe58twDJQlHino3AY8TmUTlYDgOp1Y72Hxv5vZDyqBhgjR+5nEcgXA8ZyQTUG1ThBeEYAq7GeDwxUM6PRnP+MunJqOVN1/FWdns1QVaxn6R+ukCsGCogq4zUAn5Gjr97rrf5hd0/hWXfiiDCrGHU6tRNW6B0o4QeqsRSNAkPPBmB19FRPDgyVcY7/lyHCZLkipk//bKzobADuqPrBPb1F8oVDW7q/51CFXfvztdx6tCYheEYcrL60S1EHmJ7BEkPjFTwrqP7jwBkRyr5jd2+xtlqxdzbh2mwAdqsyJIKMTgS6u7cYlwr1H8Y5a4WB0TKP78tFFjSa+4Gn03B3uEhmEHgiLtfr9l3jeFYInP7duRg6xQ8czVmP+3eMc3CookbEqJIHth3JwMyGgybuWdsS+x3367sGCJ3SVJ+Y1EWn0WLCUKNfpzg3NT2aDadqvyMCjXUerU1JHt49wWe/040y2Vnyl7jaYKZ3VRyuEehwnb6iyvkiuN6BstnXX6KjNUU6bUgmLOmkoT7tUZexpJKWVMKQSBisjUv2NX5hOtjqLWujNKoubalLRwH37fcN8cWb9/DJr+9k38GSi+MNG/fR7TiSgZlNPlW9n4i7/J4nUFHwrBHpnJeSOQ0JOlpTdM5NM6cxQWtzkva5KeY2JchmPBrqPbIZSzplsGIwlqi8Hod/qhHHihXH4GiZvQdK3P3wCLduHuKxvblqVUFFsDFxrgPeMRvuMcu+y+qHlgA/AtYbI9W80M1AwcnWlGTCkM1Yshkr6ZQlkzKkk5ZkQqJOJqeUK458KSRXDBkarWi+FE4284hgq1t1qhyM+2E+XTOn/i0bZAHmxK2MjwqUjKDGiBojao2otdF5XNGffriaqtf0Y7JVTQS1ZrJhNgD+SNQQu/Dv0bM9EycBMjFHV8Qtx23AUfF5CzAXaBIhHXf6JiUWy0OZs7hXo6jKKPA4cDvwi7h/m6fTBPtMAc7UWH4oQtQD2Rjc/Bh4c0wYO+1fEMK412wkbl/ujfcWps/pnolI/h/+3iZffGrSmAAAAABJRU5ErkJggg==', 'rc': 'iVBORw0KGgoAAAANSUhEUgAAADgAAAA4CAYAAACohjseAAAZTElEQVR42sWbeZRddbXnP/v3O8O9NaZSSchoJVQSyEAiSIAMJGIYVHyIQKGAiq7ngC77NdpLV9tvaVYan726nz5b7can3bZPQYaUEwjKoIFIogmEIQMVMpGEzEOlUvO955zfb/cf51SlAoj4fHbfWmfVreHec75nT9/93fsKf+FDQW6kzbTT7kb+/urG85qauxsmgm316BSgwaIhgENSoMcg+8Ht7myUQw93r+0a+fo22mw77T4/xb/+IX/Ja9vOBCY3h4vmB2mwDPxSROeiMhGR2gArADLiUlUgwynQ7+CQVd3qjP4usbqmPf39piFgfynQfxXA4qQuf75kbGj89daHNxvcxRFh5AFB8QheHAqeV12h5IcRBMFgMKh6UrJEhQ1OzD2pdz9tZ+3xV5/zrwZwBZiV+XXqlQ2XjB7fE9xmkE8E2BbB4nCAOgUEEYPI0Dm0sNrwiTX/g6Lqiz+DIog1WMCTkO5zxnzvuE/++THWnwRkBcjK4ob9mwIceQdvMhd9ONDwSyWNpns8Hu8EKzJsGEFEXnOi06DAy4gLUC2sqzgZuheqRrGIJSHb5dXdcTfrfvTnWlP+HHBtvGNSLe4bRmhTFFGcgghiLObMNz5tvOGHGeGjXs78vZKDdDIEFVS9F7yKWIsqDt/uST/7I9YffLMg5c2CuylYsixw/KCk0bQU7wUIkGFUluCPnED+RBbWV2fl4rvH41AEj/eKJyQwCW5PEviP3putXfNmQNo3A+4WFn0w8vbeEDvOiXciYo2cdkLBIK/zNRKeMQZrTB6HhcVk2JWH/ldGJCDBn+HziMO7EDvaetrmMOmV+3h0UxtttoMO/bMBDoG7lSWfCAi+j9hIwVkxVopICoKIIAxR9QXIkS5agLKWKI6IShFhGGIDW4C1OTjVM1zpDItL7uoy9ByMRx2YWDDvm8PZh+/n4Y1vBNK+EbgPsuiWkOD7BiOgahFrAIPkFxkKb7v2Mg5u34vxYMSACMYIQRAUwErEcUwYxwQ1ETYMsNYQmvy7iEFUEcAUYMwZHpAXkRE/GQ/eYCTAXz2XSbvfyJL2teCw7XS4m4IlyyJv780tp2pFjCncyRghsAEuySAImLn8Qg5s2klkQwDCICQqxURxjA3yU4i1uVUV8EUhKSxpRFBVVDW3WHHoCIuefq6FWVUVFWf0nefalnXt/pE9bWA7XkUIXg3QdIB+gMsnhpo9FGLHOkQDxMgwOENgA+KaEnHDKHa8/ByX33oDcWMDe7Zuob6mkTAKCYI86WRpSpZliFfCmhh1DldJyTIHmsehLSznvRZIcgowdK0iihbuijGItRixoqABxFb1sllMXrWK/b2AGckpzJmFfAUAEcm3ajRuUbwLh9iG5q4SmpjaUY1MXTKPedcv5uqPfoi7v/BPXHDNIs6a3gppRmBC1AtpJcUPZEiipH0JrUvPp751Al4F4wQ3mOEGUzRVrDNYDbASYMSSuowgDrE2wKNENsCrR4DIBhgBq2JU1ZU0bImQb43E8BqAbbTZlaz0N5lLbg6R61OcE4wZGfjGGMI4ptLbT/PEcQwM9NN6yTw+/M3Ps+mR33POwvmoGKwKmrn8KNwxjiOM9djaiDgu5c6mHu8dWZaReZ/HpCreZ5x3zWIW3HIV6j2lqIbBrJexLZOYNHcGWZaS8z8PiEnJXERw/QfNpTevZKVvo82+GqCsot23NVwy2qi5w+epTXJfKXzZGsIwRL3DqrDuvgdZfN3lPPnDB9j04JNMnns2TVPHUx7VgKsmkDrE5SwliiwexznL5zNj4Vyq1cE8XQ0xG++xgcVlVRqmjuGCD11J66LzqCaDgGew2sucK5cxffFb6Tx4JI9P55ARuRZQVb3jyoZLRq/KybkMA1zBChHQck/4yRqNpwHekCeVnFFaAhvlCcHnZVd6Hb/4yne55av/nr1P72DNf2tn3++3EFqLTx2kivg84aRJP+MWTKNh5iQuuOFSsjpFjGLFEmhIbCPSpMqo2ZN515dvZe+mrbgkoffACQa0n4tueSdzrriQjQ8+TnpyEHGCwRIQYLEYrMnwPtZg2ui+8JMCuoIVOcCcQK/0H2J5s6Cf8njVVzEcaw3GWlDFOY96T02pnkMbd/HML9Zw+y+/jlPHwXU7GDzWi3pQVYwYJDC4sfUs+8x1/O57D1NVx/nXvZ2e/j5sHGFNQKYp516zkOvu+BSPf+3HJAe6aTyrmZ1rNjNv+aXU1DXwqy//CBnIi6GOqJ15nRQMRgQ09PKpa1nevJKVfgUYO44200GHzjYTbi1reLNHVcBYzPCLAxtgxOC9B69YG2BEqC01sHvtFuKGMrOWX8jedVtQVazklSwoB3QOnuCKL9wM/Z6tP/8DCY6lH34X6378KJEG+Y0wwvhpLaz+zk/ofOUQMy+/mK7OTs571yL6u7p54Z7HiU2eZFxRM0f2lUNh5vAaY0dhKnu26P6N42gztoMOVoDp1ZZ/CgmmAGoxOcAivVgMoqBesUGUlwAxiIXGpkYObtyJLdWCEXqOniQKSxAomWaMntXCe//+Vu6+7b8ytXUGWx7fwNuuuRQTKnvXbSaMS0gGR3bsxlbBSMD4xTOZPGMqBzftoOOB31MfNZJoBuIR70aQw9NsVkUB7wURlFHX8tEf3smdagDdHl481yALXM7+zMiOQIoi7L0nsJYojHLgRrA2t2pcLrHz4T9waudByqUyHiWMIyrVKtes+Aj9h3s4dHQ/YUMtpqo89pX7WP7vboTGGKOCd47QxIi1RFFMc80oNv7gcbb9fD21cSPVLM3rpbUENnhtKyZDeUZMgWHB1vC3cwE1AEEaLg+JYwUnr9NheBQxhiiKsXFAubkBFGwQAkJaTQjikBDBiMGGIUnqGLNgKrOuPJ9f/sNd1EkJn6Y0NDXy/KOPk3RXWfyxd9NT6cJGQe7+qgQ2YP33HuLU7qPEcZnUZ6iANUIUhtgwwBj7mpbIYBAxAuoCTBw7v3w4iyqyxOfdOCKCtQEiFlUDmncAYSlGAsPUJXOoHV2HeDA2QBxo4nDVFC+CBSJrqMbKLXd+lv5DPex9agu1WoZqBiqUKPGjW7/K3Hcuom7KGDxSpAjFZ1khYAjGeSJr8mrsFGMt5eacKQlS9CM5hw1sTuKHOhnVcAmAbWt6W2NQDf8+xDQDGGvFWovBDJUXojDAqKFlybkEUcDLT75A7aj6/N45j88cKATWEoQBA9kg57ZdzOL3L+fuz36b0TVNdB86St/Rbga7+iibEp1HDxGWa5j81pkcfGYXkQmG83ceEg5jJL+JIqj3KI7x50yjWklIBgdzZiMgRjDWgBFUPaqIE2/Pahp7l7FdDZOt6iSP5g4mBhsEIIL3CU5TfOKpH9vEzCsuZPvqjUShIXN+JE/AGIuIIYhCdHTMZbe9lyRNybpSyvUNGBviBhNs6lA8tVLP2u8/TNexTponjkXFgzndYhkjI3smvIJzysnjnYyfezaKYI05w1HNEFqUQJk0pqs02US4VhUpO/GoQcQaEpfhYqF+ylgap0wgntrM5KvmQSD4upC62VMIa0NMmuUxqqDGYkoRic+Yf81Cxk0Zzz9edjuXXPcOKiVPTWNjnnxsRJpVMWNKXPf1TzFhxmTi2pCwoZw3fMYO3ywvkmcJY3J39ELS3UfrotlETbXgfZ5G1GBMkPcOasTnkkjZoq2BR6dEBRNAxHj1zLxsARPntTBt3iyMClmWMOWCs+nqOsl7v/hxXnluG1YMOx94GrLcTYIAwnJIJRIu+/R1PPTFf+H4izvZ8MNHaXnHXA4/tRljA7qyE7QsPI9rv/4Zdq7dyou/WIfrTzDGEgRRHlNhQKC5S9owwAM+80BGpbOP1CecvXQOz/9sNZHUDGdVGeo4wAcYk8CUAGgYTpua06dXNrzIrqee5zcD9+R3dEyJD337drq7e+jZd4LjW/dTPdmTNyXWIKkSijDY388FH7iSw5v38sT/WcWkaAp7nn6WxmnNjJ89nRc3rOUdn7uJpZ+7jpee2MTzv/0D069awNhzJvLKE9t46YF1GBdS7e6nSpWMjHiwhEepMEhsSzj1NE5sZrC7F3B5L3laphrROwLQEAzJ6VKoW2IESR2x5n3X+Flnc/vqr2FrAl54cAP9/gQD4SCmKaJcX6ZypIuGsc3UTGrCGZi8aBaPfGMV46dOo3qwjxrKdNy/hnHnTWfOFYu54eu30XXsFLMWzmfGW2exc+0mOn79NDOXnM+B9VvBWBZc/x68UbxzZH0JLktxPmPbr56l53gnuzZsJiAiIAIv2FAxoaBqEJ9b0QIhEgZn6FuquUZi8wIfxWWO7T7I/V/6X1z1meupa65n4QeuxA863GBG5WQfB492MWriWMbOmszEt03n0I49XP7xazFZwMtPbabaM4CNLT1HujDOcvcn/ztHOvbT+dIhSJTOngOMmTCFxR9+N847xkw5Cx+npL0V0li44ONvJ61kPHHnz6lISsOkMQz2V1h43aVs++16oiBmsHcgb5x8rgdLJlgEoxmBQ9KRZVO95ofLU3WAZftDG5m3+ELu+fy34GRKTVwisCE+gtqaMl27DnN82wHCxlp6Bnt46AvfpZYyYVQmMAEYpTqYUdU+zq1eTNeLh3CnuoltHXVBHW+9dglBbUyaCpUjPez91Ys0zBjH3BsWcdbYCTz90FoiF/E3X/4IjS1NjJ48FlJoWXY+cTlm7++20nu0C7FyhmDh0TQAekZKpIqimmdGn3mstdj+jFee3UXT6DEk/d3YOMCavDmt9lWJShH1Y+rY8rN13PKDz9Oz+xA7HlhPmNUSKFS0h7lXv53eo90cfWU/F33sajavWk2y/ySpppx39SJ2rX2B9NQgSblE84QmMoXNP13PxrvXEMcxJ7fs4/EnN1OpJrz7qx+h68AJNtz9CCUJCeKIMI7IqilptUrqHSlCqllPYHD7HXgpOGgu/viCDYB3Du8d3cc6yZKE1GVoqqi1eOcxxpClKWklI3Cetf/7Qdr+8e/4yurnMYOQZAlhYxNNb5lI5+FOxo0/i2PP7mHGJRew5chqmkZPYNL8Vh799n2IQv/RXk6+vJEkraJAFMVF45tRU1dHkqa4akrvkW4Co0RBiFfIModzuf7j1RsneFXZbxJkt8KgIHhUvfe5zDCsbCkuc5w6fJyJ50wlqVbzfr8Qt1QVl3mqA1VKpRIvP7aVw9v2ceM3b+dQdoC6SWO47D98kJc2vEDngSPUnTWKfes7SDOHjwwT50yl69gJDmzYThBaMk2wUUgcl6mvr6NcU6JcU4O1YR5no2ImnXs2h7a+jHhw/rSw7fM+UQ2CooMudLvNiabKAQ8HzRAtLeQ7FY+Ix3uPSED/y8dpGNdEubEWl2bDvaE6nytl1SqDA4PUlkv8+h9+xDlL5zPvA1cw5+ZL2fv8i/jjvSTHOyk11lKp9HGiYx+mscy5f3MJ2556DtebYTJBEvBJhrp85qTO41JPEOTdycwl8zm6+yAvrX2W2NbgNFfcVH3RaIsW06mDrq5ywPym69luVLcaHfZQnHf5UKu4K857ksEqO57ciPWSN55FxhpqpbxzJJUKapTK4VM8+q12/u7e/8yhPfs4su1lqj0VQg2pDlQQY+k6cJiJM6cxY/E8On6RZ8MsSfBZhnqHGPBGScnwxuHFkcUBF7VdyZPffYAQyS1ayP/e52rDkAWBre1dz3YbAG/8WsWjKF5zqznnCzcFl6b09/YzecFs4omNJNXK8ETIiOCdJ8s8SZrR29tPXeModv5qI8//8g8s/eR7kHKJwf5+qqSMv+BsRrdO5ETfETKbcuzwYfZv2EkUlMiylDTLcHhsaEEMSSWhWh2gGsO1X/kY6+5+mFO7j1AT1eG9O4Oc50YpkAhrh9ulqnW/TUirINaLqnMOMpe7qgHnc5c59OwOlnz8PZSaakkrKcYImmVIKQITQgrV/gF8klIf1vDgf/oBrRfPYvrSufRl3ShKUq3Q0NxIRsaiW9/NS6ufQypAluIyhw1LhDVlpDhvuWUMExfN4aL3X0XHExs5tH0Pk2ZOI9Es12KKPJGPUZ0qaquSVavW/HYIoMxN37nVizwTYBXweReUu+EQz1OBzj2HefrHj9J66XwIlP7ufuIpjcy6bhGEkFJlzIxJDHT3YcQS9Xnu/9z/5F1ffD9NkybjxbNz9WaSzj7GjGmhYXwTL/x0DTW1tbkCLo6acXXMuPxCEpfg1TNm/BgaRzfy8nMvUTnWj1XY/vRzSKq5/go4V3gc6i1GFZ6Zmy7fCohto83eyZ1+rmmJQ5X3+FwCkKFhx9AkyHuHhJbuIyfJ+jMq3aeY895LGTO7hSkXtbJrzQssuu29lGvL7N/wEoihtr6Ww1t3UzN2FNPffgG/e+jnXLh0GaNmTKFmQj3V6gC7fv08gQ1x1RQbhHSf6qLx7PHUNtTRva+T7gPHOLB9FyYVBo51cfLQEcKgjBtyRc3DSlXxOCzGpCb7L/9D736mjTZrZtOuANZX2qsk+y0iWozNczGnmBMYyLKUqKbM0VcOM+emy2hdMpddazbRc6ST2W0LmTJ/Os/8+BHK9TX09/XRe6qbxromHv9aOy0XTuf8ZcvZ89yLpCXH5AXTefkP2yiV6sgGq/nFeqUc1bBj9TOMmjGZYHQZYw2loJae4yfo7TpFYEsFyc6dzfv8UPXeCJKQ7Lc+bQeYTbualeBXsMLcxTOdzgTfyX3Sa74nocPZ1BaC0GB3Dws++g5aF8xm1X/8Ns1Tz2LGsvnUj2nmnk9/nZpyHU5BVRjsH6RSqRCk8MAd3+f6r95Gb28vps7S191N19aDBNagTvOuRYSBpI9q5RRbf/kUUy44l+7kFKqOQMKiT6SYRg3VPR3mX0ZD8cZ+5y6e6VzBCrMSvAVYwxoU5P76CS9qojdaMU0juw5jctneGMNbFs9j9NhmVn/jPnzVMXbBdKbOaeUnt38T25sVk1uLtRbnlCxLKZVLdO0+RtfJLlqXzqduXCPbf7YO7aky0NMLmitmthQwffnbGD+nlfK4GiYtOYf6xib2b9tOYMK807H5BobzuVtq7qreYExFsr2J1nzyRXZXLmPNGbMJvZE2096z/qSI/5Iooqh6UXVFHXTOURpdj/OOJ773EzTzBFGAHcxY9elvQ58jEyGpZCRJgiuGKd4rg70D1NXWsv83mzm48SVKxOgp6O+t4JxiQsgko+mtLUxePJ1zrz6fee9bQuO4BpJKQiaCt7myB0o2VHvxpOLVi8+piciX2nns5I20DY/Q5FXjM7OSlfohlrSXia5PcE4QG0g+hg7DkCxNscaiaYYpRbhqRuAUVcH7QqeyhiCICMMACYr+zFqiUkSaOjJRNPFklQScQ4ySVKpMWjiX1FXZtn4tlhgPRISUTQ0a5QK9844sS3MyAjhxLtTAVkl+ehfr2lawQlay0r/uAHQNayQPzslrFW4ICZo83gsq6hUVwUQhUsjtmuXu6Hw6PCbTIXaj+QwDNJ9IFpTKhALq8IkvJr1K5h3WGA7v3cuF119B9WRC1jVIORpFIBYCA9bmFsuy4n3zFGMwNsPvC/E3PM/+vgKD/rEJr7aBXcX+npnBhOet0iYQCV5RFS3SsbFBHg9ecC7Lp01D7iB50yyau7VmDnWOLPN4FJziM49LksISGc45nHdYG7LjmS0s/ui7ObJzH0lvHzYOkMCimsezcw4vis87IHHCQBr4trv8uq3FCNu/4Yy+A7SNNtvuH9szm8n7jJj3GSS/bFXxWhBWyaVCrMmVb8iJb1E/tUDsUVzBXZUcfJZmpElStGK5ok0xvfbq6O3q5eyF53Fk+yuEcYz63HLOZUViwZviVib4v73Xr/1lvjjR4d7UlkUHHdpGm72fRzfNoeWIhfeIqFHUAUaLxIMYjDVF8FOwWc44kJwFDS/8iOC9wzs3PAYb2nNSgTCO6TnaSfPkcTSNH8eJfQfxLiPJig4GdYhYBTKyT93D2n95o4WgP7oncxrkrzfOYcpuJ3JVICZW9U5VDerB++EVEMkHBHmZ8CPl2MJCongzXLPIihVEFbBWMFGAjUPEGkrlEp2vHMW5lEpvP2mWkalH8c5grRffX8X97T2s/cGf2nZ6w02nIZD38cimc4O3rLNelsUEox2+CErJk08Rm1q4muiQxYQi8oaPYtaMc/kcxBSyu4QBmovSpGnujn2nulGjpN559aoRoXX4PWngbrxv2C3/glWukSDb/SN7ZtL6E0s2JcDMNRjJKa7iVUVPU6YRuo/iixUQPZ1/hl1TR8z28h7TkWYZaZrisgzB+wy8xVqjSEraDsH7f+zXbPk3W8Z7vXXKD7L4w4L9UihmulHB4VzOWocmiiPf3JyxmCcjRnKnRVo//DzNF3xUQK0aa0xEIumuVNM77vV/pXXKP7YQ29wX3RZ5PhFjWxxKhkdEi41IKUJzeLXtjKWc05BQxZ+2q4g1mo/BUvw+h3zvOMf++TE6/roLsW+00lwy/npVezNwcYiNTC5gnXbB4oJeZ1/UCLkKbTQn91VxiSgbgHsq6P/bleY/tZTeFi6aHzlZhpqlCnND1YlOpNYWa3ZWT8dmJuByy/UrMryU3md1zQP/v5fS3+zHCuq7GyZabKsUHyuQYg6ixccKFNnvQre7t+b1P1awinYvf+HHCv4v62ON3Fmbp/gAAAAASUVORK5CYII=', 'class': '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', 'race': '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'}
+EXTRA_ICONS = {'housesetup': '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', 'house': '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', 'housemate': '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', 'dayfarm': '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', 'sell': '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', 'auto': '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', 'brew': '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', 'inv': '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', 'snap': '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X99k/eYd7NrTTFtnkt2NLezY3VTUjq9LEYp0QjT06UN9n3oGjTiSd995h9GjR/Pt686huqqKmpoaaqqrqa6pobq6iiGDh7DioxXMvmM2yz/84IDwHcdly5YtzJz5JebNf5PLLzyLc848EQFEqysZNWIIAAWtR3zaRu8YY7UQYpDrOPTrU4vFkkyluWLWXYSjcY6aMAEhBMNGH8X0mRezZMliBg0cyI033kh9XR39B/SnsrISRzkgBGeffTael+d/3XPPQfXX3NLCxk2b2L59O4MHDy4lv8YYwuEwruOwceNGNm7cyNcunM7D992GMYZsziMSCTN0cH9bzPD1QA4SspW+HDBgQAxY36eu2jaueEGnN823tulde/VXzrF9+jTYj1assOXt2WeftSdMmWL3bb7vW2OMvfnmmy1gt23bZn3ft4VCwQZBYIMgsL7vW621Xb16tXVd186bN88GQWALhUKpnz/98Y+2tq7OAvbG73zFejsW2vTm+Ta5/g3bte51axuX2Fcf/5UPWCHEX/bdC+W+KIMgWQVUNdTXEo9FhLGWbCbHL392PQMbqph0zGQeeugPpedPP/101q5bx8svv4wxhiAISuYqhGDq1KkALFiwAMdxkFKilEIpVeJpGhoaMMbQ2NiIUgrXdVm1aiWXXPJlvnn11RTyWR657zbuu3MWXr6A1kWSqkg5WqorY70aq913q5D7atDznDhQ1aeuhkgkCtYSBAEVsShz/3If006YyHe+cy1nzZjB/HnzqK2tZfbs2dx///1IKXvohGKapLXmuOOOw3VdnnrqKYwxPeyb7mHSJFJK+vbty4wZM0gkEixY8DaXXXYZEycezbPPPseZJx/H0lce4urLzyfZlQIssiyottZQURFDKYm1Nr4vJyP3J2KDKiAej0Ws40hhrUVKST7vUV9TxdwnfsVPfvgN5r3xBtPPOoujj56El8/T0tzsz58/v6Qd13VRSjFgwACuvPJK3n77bbq7u0vfSynJZrNs3rSJOXOexhjD7T/5Kaeddjpz5szhuIljePLBO3n18Xs5cuQQujq6UErtTTwJgdaWcCgkotEwQGTy5MluucKcfTUYBKIaIBYNWyWl6GW1lJJ4XgEpJXfffh1XXHw2Dz3xIn9+9lVuu/12ADXz3POYPPkYxowezeDBg6mtraG2ppYhQwajdcBtt91G//792bVrF1u2bGHrtu3s2L6tJMCwwf2ZfuEZXDLzdE4+/igisUiRdLYWx1EHKbpaIuEQ0XCYdDoXbW9vVz31iv28jQJ0ZTR6bncu99IVF88wjz0wW3YlkjhK7ZWwamOIR6O4kTDtbZ2899Ea5i9axocr17Fy9QbSucJnKkyOGDqAcaNHcvyksZx07AQmHDmSPn3qQBcpSW00SqlDFHgsjuOQ6k6b4875tty1p2VLQ0PD0W1tbele/Pvlg8baKEA8Hi0WAuz+RRZHKXJ5j0wuRzwWZuaZJzHz7JPxcx5dyW5a2hO0dqZIJJKkM1l8P0ApSXVVBdXVldRVV9Kntora6koqKuKgJDYIyOU8uhJdCHrpevWpE2WtQTpKhEIOQLhaa9l2qITXFqu4xCJhe6hKsZQCiSox3b3cS0U8Sm11JeOOUAgl96a3rcXqoqMJtO55t7vIcMtiDdH5DKDK7cBaUMrBdRyAUNb33UNn9MWqDI7jfOaymSorswWBxvd1saZoy2uLZbX/Evkk9iKk/q4TBtaipOhdo66OGUX3oQAKYXqigr9vzFLlSfCPbr1ZgpQSVdxTHa2jCjIcfJuAHEB3OidKden/D5r9xPGIA9EUZb5UtQO0J7qwWiO+wAhtbxVKG3w/AMiHQl7hYABtD/O7G8g3NrXLfN77z62RfzhCi5KSXDZLqjsDkDImnjskwFAo1ATsXrdpOy2tncZ1nc9Uvv5vwofrKto6ukxreydAa0tLS648o98XoOro6OhWSn2YSmfs4mWrbDgSRhvzBQVoUK7L2k07rB9oq5Ra1xOHyoOvQSCk1DOAeOSJl4UONPKLa6EgBAveXS4AEXbkOwfjQvei7nOFwqtSyjUL3/tIPD93gamqr6Hg+184gCHXoaM9wWtvv6+AjEYuOFS61PuDBHKOEP8ihBA33PFrs2XzTupqqns91Rei+X5ArKqCl+a9o3c2tiClXOB53tZywmk/Frh8LWpr1yohBqXSmWPnL1rmTztxkho6fBD5bK6Uy/13tUIQUBmPkuhK8Y0f3m26kt0yFJKztLZbys7eHRRgSbsWXpdSjmvtSIyb89Jbum99NcdOHCOi0QieV8ysy2t+/8jWe0xFCkF1bTXJVIavf3+2v+xv61wpxfNBYO7ZV3ufBhAgsNY+p5SKZbK5qS++tlgs/mCVrqurYcSwgaKqphJHyp6aebE8VnYGpxh9is/rOOxeaVlvwh2PRYhWxvH8gJfmLtBXzrrLvLdijSulXGmMvZSeCOxQB2IPeZBXKXWOtfYuY8xkgGPGH2G/fN7p+ox/mizHHD5UVFVVCKQErQn8AK01gTY9ZWuzF3C73+DFiRBSoqQoMgKOgwy5YAzdqYxdu2mbnbfoQ/PMK2+pVWs3i56g5K/GmGt7jl0e8NDxZ5lfUVYaDodd92u+1t82xpzYA5xRwwcx+ajRZuKRh5vRI4eIwYP6UV9TLSoroiIcDhFyXaRS4pOTTGIvZ2eMxWht/YJPNu+RTGXsntY2u3rdNj78eD1LP/xYrd+8s0QnSimXKMVvfN/MKT+t/PdocF9z7k0xZCQSOVFrf6bv69OAcUBFufuORSPU1lTRp7aa6uoK4rGojYRD1nUUjpI9PKYRfvFAgshmcyKR7Ka1PUFXspvuTK48gsoAq11XzXec0Cu5XO69A87UfxLgvtostaqq8Ejft+Ot5ihf+6O0tsOB/kDlPme6D7nee9ZRuqfuuN113TVKsdx1xfLu7sLGQ0w4/1UAy9/rBRscKCccOHBg1OvsrPYcp0JrHZHSxK21EWuVK611KZ6ALwihAylFTmmZ1Urlolp3DxozJrFi+XL/AGpxPu/B9P8q/y73qVTZz1Iv/xx9mr+3v/8HJJCuHRQHrQUAAAAASUVORK5CYII=', 'dash': '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', 'rc': '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', 'class': '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', 'race': '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'}
 EXTRA_ICONS.update({'kbbinds': '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'})
 
 
@@ -10539,6 +12202,11 @@ class App:
 
     def __init__(self):
         self.cfg = load_cfg()
+        try:
+            if sync_auto_marks(self.cfg):
+                save_cfg(self.cfg)
+        except Exception:
+            pass
         apply_grab_mode(bool(self.cfg["settings"].get("grab_layered")))
         self.q = queue.Queue()
         self.selecting = False
@@ -10660,6 +12328,13 @@ class App:
         self.ac_badge = AutoclickBadge(r, self.append_log)                 # "Autoclicker: ON / OFF" + its pause key
         self.kda_ov = KdaOverlay(r, self.append_log)                  # the KDA counters (bottom left of the game)
         self.kda_hits, self.kda_rects, self._kda_sig, self._kda_top = [], (), None, 0.0
+        self.house_ov = HouseOverlay(r, self.append_log)              # the housemates' HP bars + buffs
+        self.house_demo_until, self._house_sig, self._house_top = 0.0, None, 0.0
+        self._housepos, self.house_btn = {"x": 0.0, "y": 0.0, "w": 100.0, "h": 40.0}, None
+        self.house = HouseLink(self)
+        self.house.start()
+        self.root.after(300, self._house_pump)
+        self.rebuild_house()
         self.check_ov = ChecklistOverlay(r, self.append_log)          # the checklist right of the mana bar
         self.gate_ov = GateOverlay(r, self.append_log)                # the Gate shortcut boxes (right click with a Gate spell)
         self.mascot = Mascot(r, self.mascot_pop, self.mascot_moved)
@@ -10803,6 +12478,9 @@ class App:
                     raise
                 self.append_log(f"The {key} page couldn't be built:\n" + traceback.format_exc())      # (after a resize: the other pages still work)
         self.select_tab("main")
+        if not getattr(self, "_wn_checked", False):
+            self._wn_checked = True
+            self.root.after(1500, self.maybe_show_whatsnew)
 
     def bg_photo(self, h1, fast=False):
         """The frame picture for an (unscaled) height, at the window's scale."""
@@ -11054,7 +12732,163 @@ class App:
         elif self._drag:
             self.root.geometry(f"+{e.x_root - self._drag[0]}+{e.y_root - self._drag[1]}")
 
+    # ---- the notice window: a dark panel over the page area (title, subtitle, lines, Close). The "What's New?" log uses it; later pop-ups can too ----
+    def close_notice(self):
+        ov = getattr(self, "_notice", None)
+        self._notice, self._notice_cv = None, None
+        self.scroll_cvs.pop("_notice", None)
+        if ov is not None:
+            cb = getattr(ov, "_on_close", None)
+            try:
+                ov.destroy()
+            except Exception:
+                pass
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    pass
+
+    def show_notice(self, title, sub, lines, button="Close", on_close=None, bullets=True, confirm=False, on_button=None, second=None):
+        """lines: list of text (one bullet each). The list scrolls (mouse wheel + thumb) only when it does not fit."""
+        self.close_notice()
+        DARK = "#4d4238"
+        holder = self.pages["main"].master
+        ov = tk.Frame(holder, bg=DARK)
+        ov.place(x=0, y=0, relwidth=1, relheight=1)
+        ov.lift()
+        ov._on_close = on_close
+        self._notice = ov
+        px = UI_FONT_PX
+        hd = tk.Canvas(ov, bg=DARK, highlightthickness=0, bd=0, width=PAGE_W, height=58)
+        hd.pack(fill="x", pady=(8, 0))
+        def outlined(y, text, font):
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+                hd.create_text(PAGE_W // 2 + dx, y + dy, text=text, font=font, fill="#000000")
+            hd.create_text(PAGE_W // 2, y, text=text, font=font, fill="#ffffff")
+        outlined(22, title, (self.family, -int(px * 2.1)))
+        if sub:
+            outlined(46, sub, (self.family, -(px - 3)))
+        bot = tk.Frame(ov, bg=DARK)
+        bot.pack(side="bottom", fill="x", pady=(0, 12))
+        state = {"n": 0}
+        def press():
+            if confirm and state["n"] == 0:             # (confirm: the first click only asks again, the second one closes)
+                state["n"] = 1
+                btn.lbl.config(text="Click again")
+                return
+            cb = on_button
+            self.close_notice()
+            if cb:
+                cb()
+        bb = tk.Frame(bot, bg=DARK)
+        bb.pack()
+        btn = PixBtn(bb, button, press, self.f, 120 if confirm else 100, 26)
+        btn.pack(side="left", padx=4)
+        if second:
+            PixBtn(bb, second, self.close_notice, self.f, 100, 26).pack(side="left", padx=4)
+        body = tk.Frame(ov, bg=DARK)
+        body.pack(fill="both", expand=True, padx=(10, 14), pady=(6, 6))
+        cv = tk.Canvas(body, bg=DARK, highlightthickness=0, bd=0, yscrollincrement=26)
+        cv.pack(fill="both", expand=True)
+        f = tk.Frame(cv, bg=DARK)
+        inner_w = PAGE_W - 40
+        cv.create_window(0, 0, window=f, anchor="nw", width=inner_w)
+        for line in lines:
+            row = tk.Frame(f, bg=DARK)
+            row.pack(fill="x", pady=2)
+            if bullets:
+                tk.Label(row, text="-", font=self.f, bg=DARK, fg="#ffffff", anchor="n").pack(side="left", anchor="n", padx=(2, 6))
+            tk.Label(row, text=line, font=self.f, bg=DARK, fg="#ffffff", justify="left", anchor="w",
+                     wraplength=inner_w - (30 if bullets else 12)).pack(side="left", fill="x", expand=True, padx=(0 if bullets else 4, 0), pady=(0, 0 if bullets else 6))
+        thumb = tk.Frame(body, bg="#d7cbbf", width=5)
+        def region(_e=None):                         # (never smaller than the view: a short list can't be scrolled away)
+            cv.configure(scrollregion=(0, 0, S(inner_w), max(f.winfo_reqheight() + 8, cv.winfo_height())))
+        f.bind("<Configure>", region)
+        cv.bind("<Configure>", region, add="+")
+        def on_scroll(a, b):
+            a, b = float(a), float(b)
+            if b - a >= 0.999:
+                thumb.place_forget()
+            else:
+                thumb.place(relx=1.0, x=-7, rely=a, relheight=b - a, width=5)
+        cv.configure(yscrollcommand=on_scroll)
+        self._notice_cv = cv
+        self.scroll_cvs["_notice"] = cv
+        return ov
+
+    def _wn_version(self):
+        """The version whose log is shown: this one (a test build shows the newest bundled entry)."""
+        return APP_VERSION if parse_version(APP_VERSION) else CHANGELOG[0][0]
+
+    def _wn_local(self, ver):
+        """The log without the internet: the text read from GitHub last time, else the entry bundled in this file."""
+        c = self.cfg["settings"].get("whatsnew_cache")
+        if isinstance(c, dict) and c.get("v") == ver and c.get("lines"):
+            return list(c["lines"])
+        return next((list(l) for v, l in CHANGELOG if v == ver), None)
+
+    def _wn_fetch(self, ver, repo, fetch=None):
+        """The release description of this version on GitHub -> list of lines (None when it can't be read)."""
+        fetch = fetch or fetch_url
+        for tag in ("v" + ver, ver):
+            try:
+                rel = json.loads(fetch(f"https://api.github.com/repos/{repo[0]}/{repo[1]}/releases/tags/{tag}", 400000).decode("utf-8", "replace"))
+                lines = clean_notes(rel.get("body"))
+                if lines:
+                    return lines
+            except Exception:
+                continue
+        return None
+
+    def open_whatsnew(self, auto=False):
+        """The "What's New?" window: this version's release description from GitHub (the bundled text when GitHub can't be reached)."""
+        ver = self._wn_version()
+        repo = github_repo_of(self.cfg["settings"].get("update_base")) if parse_version(APP_VERSION) else None
+        if repo is None:                                            # (a test build, or no GitHub link: the bundled text)
+            self.on_whatsnew(ver, None, auto)
+            return
+        if not auto:
+            self.show_notice("What's New?", "Version " + ver, ["Loading the update log..."])
+
+        def work():
+            try:
+                lines = self._wn_fetch(ver, repo)
+            except Exception:
+                lines = None
+            self.q.put(("whatsnew", ver, lines, auto))
+        threading.Thread(target=work, daemon=True).start()
+
+    def on_whatsnew(self, ver, lines, auto):
+        """lines = the text from GitHub, or None: then the saved / bundled text."""
+        S = self.cfg["settings"]
+        if lines:
+            S["whatsnew_cache"] = {"v": ver, "lines": list(lines)}
+        else:
+            lines = self._wn_local(ver)
+        if not lines:
+            if not auto:
+                self.show_notice("What's New?", "Version " + ver, ["The update log could not be loaded. Check your internet connection and try again."])
+            return
+        if auto and getattr(self, "_notice", None) is not None:
+            return                                                  # (another window is open: it comes next start)
+        self.show_notice("What's New?", "Version " + ver, lines)
+        S["seen_log"] = ver
+        save_cfg(self.cfg)
+
+    def maybe_show_whatsnew(self):
+        """Once per version: the update log opens by itself the first time a version starts."""
+        try:
+            ver = self._wn_version()
+            if APP_VERSION != "TEST" and parse_version(APP_VERSION) is None:
+                return
+            if self.cfg["settings"].get("seen_log") != ver and getattr(self, "_notice", None) is None:
+                self.open_whatsnew(auto=True)
+        except Exception:
+            pass
+
     def select_tab(self, key):
+        self.close_notice()
         for k, rect in self.tab_rect.items():
             self.cv.itemconfigure(rect, fill=TAN_DN if k == key else TAN)
         self.pages[key].lift()
@@ -11069,7 +12903,11 @@ class App:
             pass
 
     def _wheel(self, e):
-        key = (self.extra_page if (self.cur_tab == "extras" and getattr(self, "extra_page", "") in ("dash", "class", "inv", "race", "brew", "sell", "dayfarm", "gank", "check", "cview", "kbbinds", "gatepin", "gatekeys"))
+        ncv = getattr(self, "_notice_cv", None)
+        if ncv is not None:
+            ncv.yview_scroll(-1 if e.delta > 0 else 1, "units")
+            return
+        key = (self.extra_page if (self.cur_tab == "extras" and getattr(self, "extra_page", "") in ("dash", "class", "inv", "race", "brew", "sell", "dayfarm", "gank", "check", "cview", "kbbinds", "gatepin", "gatekeys", "housemate", "housesetup"))
                else self.cur_tab)
         cv = self.scroll_cvs.get(key)
         if cv is not None:
@@ -11442,7 +13280,18 @@ class App:
             self.root.update_idletasks()                   # let the page size settle first
             cv.yview_moveto(y)
 
+    def auto_marks_sync(self):
+        """The spells' own mana marks (see sync_auto_marks): made / moved / removed after a name, key or list change."""
+        try:
+            if sync_auto_marks(self.cfg):
+                save_cfg(self.cfg)
+                self.mana_ov.sig = None
+                self.rebuild_marks()
+        except Exception:
+            pass
+
     def rebuild_moves(self):
+        self.auto_marks_sync()
         self._keep_scroll("main", self._rebuild_moves)
 
     def _rebuild_moves(self):
@@ -11536,6 +13385,24 @@ class App:
 
         def set_name(v, m=mv):
             m["name"] = v
+            if "cd2" not in m:                             # a snap spell row: Gelidus / Gate have a fixed cooldown, shown in the box
+                try:
+                    fx = snap_fixed_cd(v, self.cfg["settings"].get("gate_cd"))
+                except Exception:
+                    fx = None
+                if fx is not None and float(m.get("cd") or 0.0) != fx:
+                    m["cd"] = fx
+                    try:
+                        self.root.after_cancel(self._basecd_rb)
+                    except Exception:
+                        pass
+                    self._basecd_rb = self.root.after(900, self.rebuild_moves)
+            if apply_base_cd(m):                           # a known move name: its blank cooldown boxes are filled (the rows are redrawn when typing stops)
+                try:
+                    self.root.after_cancel(self._basecd_rb)
+                except Exception:
+                    pass
+                self._basecd_rb = self.root.after(900, self.rebuild_moves)
             if "cd2" in m and not m.get("spell"):          # a normal move called 'Soul Rip' IS Wraith Knight's Soul Rip (found by its name)
                 if is_soul_name(v) != bool(m.get("soul")):
                     if is_soul_name(v):
@@ -11577,6 +13444,7 @@ class App:
                     pass
                 self._snarv_rb = self.root.after(900, self.rebuild_moves)
             save_cfg(self.cfg)
+            self.auto_marks_sync()                                          # (a known spell name: its mana mark is made / changed)
             if m.get("ininv") and sync_inv_links(self.cfg):                 # (an inventory spell: its entry + marks follow the new name)
                 save_cfg(self.cfg)
                 self.mana_ov.sig = None
@@ -12100,6 +13968,8 @@ class App:
             self.close_mana_edit()
             if same:
                 return
+        if item is not None and item is self._housepos:
+            item.update(zip(("x", "y", "w", "h"), self.house_rect()))
         if item is not None and self.is_kda_item(item) and item.get("follow"):
             item.update(zip(("x", "y", "w", "h"), self.kda_follow_rect()))
         if item is not None and self.is_pct_item(item) and item.get("follow"):
@@ -12132,6 +14002,8 @@ class App:
             self.pct_btn.lbl.config(text="Done")
         elif item is not None and self.is_kda_item(item) and self.kda_btn is not None:
             self.kda_btn.lbl.config(text="Done")
+        elif item is self._housepos and self.house_btn is not None:
+            self.house_btn.lbl.config(text="Done")
         elif item is not None and self.is_dash_item(item):
             self.dash_btns[item["id"]].lbl.config(text="Done")
         elif item is not None and item["id"] in self.decor_btns:
@@ -12151,8 +14023,12 @@ class App:
         save_cfg(self.cfg)
         if self.mana_edit_btn is not None:
             self.mana_edit_btn.lbl.config(text="Move / resize")
-        for b in list(self.decor_btns.values()) + list(self.dash_btns.values()) + [x for x in (self.pct_btn, self.kda_btn) if x]:
-            b.lbl.config(text="Move / resize")
+        for b in list(self.decor_btns.values()) + list(self.dash_btns.values()) + [x for x in (self.pct_btn, self.kda_btn, getattr(self, "house_btn", None)) if x]:
+            try:
+                b.lbl.config(text="Move / resize")
+            except Exception:
+                pass
+        self._house_sig = None
         self.mana_ov.sig = None
         self.mana_fill_entries()
         self.decor_fill_entries()
@@ -12164,7 +14040,14 @@ class App:
     def _edit_render(self):
         t = self._edit_dict()
         w, h = max(16, int(round(t["w"]))), max(16, int(round(t["h"])))
-        if self._edit_item is not None and self.is_kda_item(self._edit_item):
+        if self._edit_item is not None and self._edit_item is self._housepos:
+            pil = Image.new("RGB", (w, h), (66, 52, 62))
+            try:
+                pic = house_panel(HOUSE_DEMO, max(0.4, min(3.0, float(self.cfg["settings"].get("house_scale", 1.0)))), bool(self.cfg["settings"].get("house_numbers")))
+                pil.paste(pic, (0, 0), pic)
+            except Exception:
+                pass
+        elif self._edit_item is not None and self.is_kda_item(self._edit_item):
             pil = Image.new("RGB", (w, h), (66, 52, 62))
             ImageDraw.Draw(pil).text((6, max(0, h // 2 - 5)), "Grip 0  Death 0  Assist 0  Knocked 0", fill=(255, 255, 255))
         elif self._edit_item is not None and self.is_pct_item(self._edit_item):
@@ -12217,6 +14100,19 @@ class App:
             if h < 16:
                 y, h = (y + h - 16 if "t" in mode else y), 16
         d_ = self._edit_dict()
+        if d_ is self._housepos:
+            S_ = self.cfg["settings"]
+            w0, h0 = house_panel(HOUSE_DEMO, 1.0, bool(S_.get("house_numbers"))).size
+            sc_ = max(0.4, min(3.0, w / float(w0)))                   # (it keeps its shape: only the size changes)
+            S_["house_scale"] = round(sc_, 2)
+            w1, h1 = house_panel(HOUSE_DEMO, S_["house_scale"], bool(S_.get("house_numbers"))).size
+            if "t" in mode:
+                y += h - h1
+            if "l" in mode:
+                x += w - w1
+            w, h = w1, h1
+            mb_ = self.cfg.get("mana") or DEFAULT_MANA
+            S_["house_dx"], S_["house_dy"] = int(round(x - float(mb_.get("x", DEFAULT_MANA["x"])))), int(round(y + h - float(mb_.get("y", DEFAULT_MANA["y"]))))
         d_.update({"x": x, "y": y, "w": w, "h": h})
         if "follow" in d_:
             d_["follow"] = False                              # moved by hand: it stays where you put it
@@ -12770,6 +14666,13 @@ class App:
 
     def mark_delete(self, mk):
         lst = self.marks()
+        if mk.get("auto"):                                              # (an automatic mark: it must not be made again for that spell)
+            for kind, src in (("move", [m for m in self.moves() if m.get("spell")]), ("snap", self.snaps())):
+                if kind == mk.get("kind"):
+                    for mv in src:
+                        a = auto_mark_for(mv.get("name"), kind == "snap")
+                        if a and a[0] == mk["auto"] and (mv.get("key") == mk["key"] or (mv.get("ininv") and inv_vkey(mv.get("name") or "") == mk["key"])):
+                            mv["nomark"] = a[0]
         lst[:] = [m for m in lst if m is not mk]
         if self.sel_mark is mk:
             self.sel_mark = None
@@ -13136,7 +15039,7 @@ class App:
         self.train_total = 0
         self.extra_pages = {}
         self.dash_btns, self.dash_vars = {}, {}
-        for name in ("menu", "auto", "snap", "brew", "sell", "dash", "rc", "class", "race", "inv", "other", "gank", "check", "cview", "kda", "imenu", "dayfarm", "kbbinds", "gate", "gatepin", "gatekeys"):
+        for name in ("menu", "auto", "snap", "brew", "sell", "dash", "rc", "class", "race", "inv", "other", "gank", "check", "cview", "kda", "imenu", "dayfarm", "kbbinds", "house", "housesetup", "housemate", "gate", "gatepin", "gatekeys"):
             pg = tk.Frame(f, bg=PARCH)
             pg.place(x=0, y=0, relwidth=1, relheight=1)
             self.extra_pages[name] = pg
@@ -13147,6 +15050,8 @@ class App:
         self.build_sell(self.extra_pages["sell"])
         self.build_dayfarm(self.extra_pages["dayfarm"])
         self.build_kbbinds(self.extra_pages["kbbinds"])
+        self.build_housesetup(self.extra_pages["housesetup"])
+        self.build_housemate(self.extra_pages["housemate"])
         self.build_gate(self.extra_pages["gate"])
         self.build_gatepin(self.extra_pages["gatepin"])
         self.build_gatekeys(self.extra_pages["gatekeys"])
@@ -13157,6 +15062,7 @@ class App:
         self.build_inv(self.extra_pages["inv"])
         self.build_other(self.extra_pages["other"])
         self.build_gank(self.extra_pages["gank"])
+        self.build_house_menu(self.extra_pages["house"])               # (after the Other Stuff icons exist: Gank Ping lives here now)
         self.build_check(self.extra_pages["check"])
         self.build_cview(self.extra_pages["cview"])
         pg = self.extra_pages["kda"]
@@ -13197,15 +15103,405 @@ class App:
         self.key_btns["imenu"] = self.btn_imenu
         self.show_extra("menu")
 
+    def build_house_menu(self, f):
+        """Extras > House Stuff: House Setup (join / make a house, invites, members), Housemate HP, Gank Ping."""
+        self.back_button(f)
+        big = (self.family, -(UI_FONT_PX + 6))
+        self.label(f, "House Stuff", font=big).pack(fill="x", padx=12, pady=(8, 0))
+        for i, (key, text, icon) in enumerate((("housesetup", "House Setup", self.extra_icons["housesetup"]), ("housemate", "Housemate HP", self.extra_icons["housemate"]),
+                                              ("gank", "Gank Ping", self.other_icons["gank"]))):
+            row = tk.Frame(f, bg=PARCH)
+            row.pack(fill="x", padx=12, pady=(14 if i == 0 else 6, 0))
+            tk.Label(row, image=icon, bg=PARCH, bd=0, width=62).pack(side="left")
+            PixBtn(row, text, lambda k=key: self.show_extra(k), big, 200, 44).pack(side="left", padx=(8, 0))
+
+    def build_housesetup(self, f):
+        """Extras > House Stuff > House Setup: join / make a house, invite codes, members and roles, leaving. Every house feature uses this house."""
+        self.house_host = self.scroll_page(f, "housesetup", PAGE_W - 12)
+        self.house_msg = ""
+        self._house_done, self.house_roster, self.house_form, self.house_invite = [], None, {}, None
+        self.rebuild_house()                                            # (drawn for real once the link exists: see App.__init__)
+
+    def build_housemate(self, f):
+        """Extras > House Stuff > Housemate HP: what is shown on the screen (needs a house from House Setup)."""
+        self.hm_host = self.scroll_page(f, "housemate", PAGE_W - 12)
+        self.rebuild_housemate()
+
+    def rebuild_housemate(self):
+        if getattr(self, "hm_host", None) is not None and getattr(self, "house", None) is not None:
+            self._keep_scroll("housemate", self._rebuild_housemate)
+
+    def _rebuild_housemate(self):
+        host = self.hm_host
+        for w in host.winfo_children():
+            w.destroy()
+        S = self.cfg["settings"]
+        small = dict(font=self.fs, justify="left", wraplength=PAGE_W - 60, fg=DIM)
+        self.back_button(host, "house")
+        self.label(host, "Housemate HP", font=(self.family, -(UI_FONT_PX + 6))).pack(fill="x", padx=12, pady=(8, 0))
+        if not self.house_in():
+            box, p = self.panel(host, "No house yet")
+            box.pack(fill="x", padx=6, pady=6)
+            self.label(p, "Housemate HP uses your house. Join or start one in House Setup first.", **small).pack(fill="x", padx=8, pady=(0, 4))
+            PixBtn(p, "Open House Setup", lambda: self.show_extra("housesetup"), self.f, 150, 26).pack(anchor="w", padx=8, pady=(2, 6))
+            return
+        box, p = self.panel(host, f"{S.get('house_title') or 'My house'}")
+        box.pack(fill="x", padx=6, pady=6)
+        self.check_row(p, "Show my housemates' HP", "house_on")
+        self.check_row(p, "Share my HP and buffs with my house", "house_share")
+        self.check_row(p, "Show the seconds on the buff icons", "house_numbers")
+        self.hm_status = self.label(p, "", **small)
+        self.hm_status.pack(fill="x", padx=8, pady=(4, 4))
+        self._house_status_tick(True)
+        box, p = self.panel(host, "Where The Healthbar Sits")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        self.label(p, "Housemate Healthbar is relative to your mana bar so if it isn't on your screen it won't show their Housemate Healthbar", **small).pack(fill="x", padx=8, pady=(0, 3))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(4, 6))
+        self.house_btn = PixBtn(row, "Move / resize", lambda: self.toggle_mana_edit(self._housepos), self.f, 110, 26)
+        self.house_btn.pack(side="left")
+        PixBtn(row, "Reset", self.house_reset_pos, self.f, 70, 26).pack(side="left", padx=(6, 0))
+
+    def house_reset_pos(self):
+        S = self.cfg["settings"]
+        S["house_dx"], S["house_dy"], S["house_scale"] = 7, -25, 1.0
+        save_cfg(self.cfg)
+        self._house_sig = None
+
+    def house_rect(self, n=None, numbers=False):
+        """(x, y, w, h) of the panel on the screen from the mana bar + the saved offsets; n = members (None = the demo ones)."""
+        S = self.cfg["settings"]
+        try:
+            sc = max(0.4, min(3.0, float(S.get("house_scale", 1.0))))
+            dx, dy = int(float(S.get("house_dx", 7))), int(float(S.get("house_dy", -25)))
+        except (TypeError, ValueError):
+            sc, dx, dy = 1.0, 7, -25
+        mb = self.cfg.get("mana") or DEFAULT_MANA
+        mx, my = float(mb.get("x", DEFAULT_MANA["x"])), float(mb.get("y", DEFAULT_MANA["y"]))
+        w, h = house_panel(HOUSE_DEMO, sc, numbers).size
+        return mx + dx, my + dy - h, w, h
+
+    def house_in(self):
+        S = self.cfg["settings"]
+        return bool(S.get("house_hid") and S.get("house_secret"))
+
+    def house_creds(self):
+        S = self.cfg["settings"]
+        return {"house": S.get("house_hid"), "id": S.get("house_mid"), "secret": S.get("house_secret")}
+
+    def house_do(self, path, payload, done=None):
+        """A request to the house server on its own thread; done(status, answer) runs on the window's thread afterwards."""
+        base = house_server_url(self.cfg["settings"].get("house_server") or HOUSE_DEFAULT_SERVER)
+        if base is None:
+            self.house_msg = "Type the server address first (it has to start with https://)."
+            self.rebuild_house()
+            return
+
+        def work():
+            try:
+                st, body = house_call(base, path, payload, 8.0)
+            except Exception as ex:
+                st, body = 0, {"error": "Can't reach the server (" + type(ex).__name__ + ")."}
+            self._house_done.append((done, st, body))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _house_pump(self):
+        try:
+            while self._house_done:
+                done, st, body = self._house_done.pop(0)
+                if done:
+                    done(st, body)
+        except Exception:
+            self.append_log("HOUSEMATE ERROR:\n" + traceback.format_exc())
+        try:
+            self.root.after(150, self._house_pump)
+        except Exception:
+            pass
+
+    def house_refresh(self):
+        if self.house_in():
+            self.house_do("/v1/roster", self.house_creds(), self._house_roster_done)
+
+    def _house_roster_done(self, st, body):
+        if st == 200:
+            force, self._house_force = getattr(self, "_house_force", False), False
+            self.house_invite = None                                    # (the list shows every code, this one included)
+            if body != self.house_roster or (force and getattr(self, "extra_page", "") == "housesetup"):
+                self.house_roster = body
+                self.cfg["settings"]["house_title"] = str(body.get("house_name") or "")
+                if getattr(self, "extra_page", "") == "housesetup":
+                    self.rebuild_house()
+        elif st == 403:
+            self.house.removed = str(body.get("error") or "You are not in this house any more.")
+
+    def _house_joined(self, st, body):
+        S = self.cfg["settings"]
+        if st == 200 and body.get("secret"):
+            S["house_hid"], S["house_mid"], S["house_secret"] = str(body["house"]), str(body["id"]), str(body["secret"])
+            S["house_title"] = str(body.get("house_name") or "")
+            S["house_on"] = True
+            self.house_msg, self.house_roster, self.house_form = "", None, {}
+            save_cfg(self.cfg)
+            self.house_refresh()
+        else:
+            self.house_msg = str(body.get("error") or "That didn't work (" + str(st) + ").")
+        self.rebuild_house()
+
+    def house_join(self):
+        F = self.house_form
+        self.cfg["settings"]["house_name"] = str(F.get("name") or self.cfg["settings"].get("house_name") or "").strip()
+        self.house_msg = "Joining..."
+        self.house_do("/v1/join", {"code": F.get("code", ""), "name": self.cfg["settings"]["house_name"]}, self._house_joined)
+        self.rebuild_house()
+
+    def house_create(self):
+        F = self.house_form
+        self.cfg["settings"]["house_name"] = str(F.get("name") or self.cfg["settings"].get("house_name") or "").strip()
+        self.house_msg = "Making the house..."
+        self.house_do("/v1/create", {"house_name": F.get("hname", ""), "name": self.cfg["settings"]["house_name"], "key": F.get("key", "")}, self._house_joined)
+        self.rebuild_house()
+
+    def _house_after(self, st, body):
+        self.house_msg = "" if st == 200 else str(body.get("error") or "That didn't work (" + str(st) + ").")
+        self.house_refresh()
+        self.rebuild_house()
+
+    def house_invite_make(self):
+        def done(st, body):
+            if st == 200:
+                self.house_invite = (str(body.get("code") or ""), int(body.get("hours") or 24))
+                self.house_msg = ""
+                self.house_refresh()
+            else:
+                self.house_msg = str(body.get("error") or "That didn't work (" + str(st) + ").")
+            self.rebuild_house()
+        self.house_do("/v1/invite", self.house_creds(), done)
+
+    def house_invite_cancel(self, iid):
+        def done(st, body):
+            self.house_msg = "" if st == 200 else str(body.get("error") or "That didn't work (" + str(st) + ").")
+            self.house_invite = None
+            self.house_refresh()
+            self.rebuild_house()
+        self.house_do("/v1/invite_cancel", dict(self.house_creds(), invite=iid), done)
+
+    def house_member_act(self, path, target, extra=None):
+        p = dict(self.house_creds(), target=target)
+        p.update(extra or {})
+        self.house_do(path, p, self._house_after)
+
+    def house_leave(self):
+        def done(st, body):
+            if st == 200 or st == 403:
+                S = self.cfg["settings"]
+                S["house_hid"] = S["house_mid"] = S["house_secret"] = S["house_title"] = ""
+                self.house_roster, self.house_invite, self.house_msg = None, None, ""
+                save_cfg(self.cfg)
+            else:
+                self.house_msg = str(body.get("error") or "That didn't work (" + str(st) + ").")
+            self.rebuild_house()
+        self.house_do("/v1/leave", self.house_creds(), done)
+
+    def house_disband(self):
+        def done(st, body):
+            if st in (200, 403, 404):
+                S = self.cfg["settings"]
+                S["house_hid"] = S["house_mid"] = S["house_secret"] = S["house_title"] = ""
+                self.house_roster, self.house_invite, self.house_msg = None, None, "The house was disbanded."
+                save_cfg(self.cfg)
+            else:
+                self.house_msg = str(body.get("error") or "That didn't work (" + str(st) + ").")
+            self.rebuild_house()
+        self.house_do("/v1/disband", self.house_creds(), done)
+
+    def _house_confirm(self, key, text, action, w=100):
+        """A button that has to be pressed twice (the first press turns it into 'Sure?')."""
+        st = self.__dict__.setdefault("_house_sure", {})
+        btn = PixBtn(self._house_row, text, lambda: None, self.f, w, 22)
+
+        def press():
+            now = time.time()
+            if now - st.get(key, 0.0) < 3.0:
+                st.pop(key, None)
+                action()
+            else:
+                st[key] = now
+                btn.lbl.config(text="Sure?")
+                self.root.after(3000, lambda: btn.lbl.config(text=text) if btn.winfo_exists() else None)
+        btn.command = press
+        return btn
+
+    def rebuild_house(self):
+        if getattr(self, "house_host", None) is not None and getattr(self, "house", None) is not None:
+            self._keep_scroll("housesetup", self._rebuild_house)
+        self.rebuild_housemate()
+
+    def _rebuild_house(self):
+        host = self.house_host
+        for w in host.winfo_children():
+            w.destroy()
+        S = self.cfg["settings"]
+        small = dict(font=self.fs, justify="left", wraplength=PAGE_W - 60, fg=DIM)
+        self.back_button(host, "house")
+        self.label(host, "House Setup", font=(self.family, -(UI_FONT_PX + 6))).pack(fill="x", padx=12, pady=(8, 0))
+        entry_w = PAGE_W - 70
+        F = self.house_form
+
+        def field(parent, text, key, secret=False, initial=""):
+            self.label(parent, text, font=self.fs).pack(anchor="w", padx=8, pady=(4, 0))
+            box, var = self.bound_entry(parent, F.get(key, initial), lambda t, k=key: F.__setitem__(k, t), entry_w, 24, justify="left")
+            box.pack(anchor="w", padx=8, pady=(0, 2))
+            if secret:
+                try:
+                    box.entry.config(show="*")
+                except Exception:
+                    pass
+
+        if not self.house_in():
+            relay = house_server_url(S.get("house_server") or HOUSE_DEFAULT_SERVER) == "relay"
+            box, p = self.panel(host, "Start a new house")
+            box.pack(fill="x", padx=6, pady=6)
+            self.label(p, "You become the Leader. Then make invite codes for your friends.", **small).pack(fill="x", padx=8, pady=(0, 3))
+            field(p, "House name", "hname")
+            if not relay:
+                field(p, "Server key (only if your server asks for one)", "key", secret=True)
+            PixBtn(p, "Create house", self.house_create, self.f, 110, 26).pack(anchor="w", padx=8, pady=(4, 6))
+            box, p = self.panel(host, "Join a house")
+            box.pack(fill="x", padx=6, pady=(0, 6))
+            self.label(p, "Ask officers or the leader for an invite code. They must be online with the tool open when you enter a code otherwise it won't work", **small).pack(fill="x", padx=8, pady=(0, 3))
+            field(p, "Invite code", "code")
+            field(p, "My name (what my housemates see)", "name", initial=str(S.get("house_name") or ""))
+            PixBtn(p, "Join", self.house_join, self.f, 90, 26).pack(anchor="w", padx=8, pady=(4, 6))
+            box, p = self.panel(host, "Server Address (Optional)")
+            box.pack(fill="x", padx=6, pady=(0, 6))
+            self.label(p, "If you host this through a Server like Fly.io and etc, paste their address here. (Optional, the public broker runs practically 24/7)", **small).pack(fill="x", padx=8, pady=(0, 3))
+            self.make_entry(p, "house_server", str, entry_w, 24).pack(anchor="w", padx=8, pady=(0, 4))
+            if self.house_msg:
+                self.label(host, self.house_msg, **small).pack(fill="x", padx=14, pady=(0, 8))
+            return
+
+        role = (self.house_roster or {}).get("role") or self.house.role or "member"
+        boss = role == "leader"
+        staff = role in ("leader", "officer")
+        box, p = self.panel(host, "My house")
+        box.pack(fill="x", padx=6, pady=6)
+        self.label(p, f"{S.get('house_title') or 'House'}  -  I am {'the' if boss else 'an' if staff else 'a'} {HOUSE_ROLE_NAME.get(role, 'Member')}", font=self.f).pack(fill="x", padx=8, pady=(0, 2))
+        self.label(p, "My name", font=self.fs).pack(anchor="w", padx=8, pady=(4, 0))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(0, 2))
+        self.make_entry(row, "house_name", str, PAGE_W - 150, 24).pack(side="left")
+        PixBtn(row, "Save", lambda: self.house_do("/v1/rename", dict(self.house_creds(), name=S.get("house_name", "")), self._house_after), self.f, 56, 24).pack(side="left", padx=(4, 0))
+        self.house_status = self.label(p, "", **small)
+        self.house_status.pack(fill="x", padx=8, pady=(4, 4))
+        self._house_status_tick(True)
+        if self.house_msg:
+            self.label(p, self.house_msg, **small).pack(fill="x", padx=8, pady=(0, 4))
+
+        if staff:
+            box, p = self.panel(host, "Invite someone")
+            box.pack(fill="x", padx=6, pady=(0, 6))
+            self.label(p, "Makes a code that works ONCE. Send it to your friend; they type it in 'Join a house'. Stay online with the tool open until they have joined.", **small).pack(fill="x", padx=8, pady=(0, 3))
+            PixBtn(p, "Make invite code", self.house_invite_make, self.f, 130, 26).pack(anchor="w", padx=8, pady=(2, 3))
+            pend = ((self.house_roster or {}).get("invites")) or []
+            if not pend and self.house_invite:
+                pend = [{"id": "", "by": "", "code": self.house_invite[0], "expires": time.time() + 3600 * self.house_invite[1]}]
+            for inv in pend:
+                code = str(inv.get("code") or "")
+                row = tk.Frame(p, bg=PARCH)
+                row.pack(fill="x", padx=8, pady=(3, 0))
+                self.label(row, code or "(made before codes were kept)", font=(self.family, -(UI_FONT_PX + 4))).pack(side="left")
+                if inv.get("id"):
+                    PixBtn(row, "x", lambda i=inv["id"]: self.house_invite_cancel(i), self.f, 24, 24).pack(side="right")
+                if code:
+                    PixBtn(row, "Copy", lambda c=code: (self.root.clipboard_clear(), self.root.clipboard_append(c), setattr(self, "house_msg", "Copied.")), self.f, 56, 24).pack(side="right", padx=(0, 6))
+                left = max(0, int((float(inv.get("expires") or 0) - time.time()) // 60))
+                by = f"made by {inv['by']}, " if inv.get("by") else ""
+                self.label(p, f"{by}runs out in {left // 60}h {left % 60:02d}m", font=self.fs, fg=DIM).pack(anchor="w", padx=10, pady=(0, 1))
+            if pend:
+                self.label(p, "Each works once. 'x' cancels a code. The Leader sees every code, an Officer only their own.", **small).pack(fill="x", padx=8, pady=(2, 3))
+
+        box, p = self.panel(host, "Members")
+        box.pack(fill="x", padx=6, pady=(0, 6))
+        mems = (self.house_roster or {}).get("members") or []
+        if not mems:
+            self.label(p, "Loading...", **small).pack(fill="x", padx=8, pady=(0, 3))
+        mine = str(S.get("house_mid"))
+        for m in mems:
+            row = tk.Frame(p, bg=PARCH)
+            row.pack(fill="x", padx=8, pady=(2, 0))
+            tag = {"leader": "Leader", "officer": "Officer"}.get(m["role"], "")
+            dot = "(online) " if m.get("online") else ""
+            self.label(row, f"{m['name']}{'  (me)' if m['id'] == mine else ''}", font=self.f).pack(side="left")
+            self.label(row, f"  {tag}  {dot}".rstrip(), font=self.fs, fg=DIM).pack(side="left")
+            if m["id"] == mine:
+                continue
+            row2 = tk.Frame(p, bg=PARCH)
+            row2.pack(fill="x", padx=8, pady=(1, 3))
+            self._house_row = row2
+            if boss:
+                if m["role"] == "member":
+                    PixBtn(row2, "Make Officer", lambda i=m["id"]: self.house_member_act("/v1/role", i, {"role": "officer"}), self.f, 96, 22).pack(side="left", padx=(0, 4))
+                else:
+                    PixBtn(row2, "Make Member", lambda i=m["id"]: self.house_member_act("/v1/role", i, {"role": "member"}), self.f, 96, 22).pack(side="left", padx=(0, 4))
+                self._house_confirm("lead" + m["id"], "Make Leader", lambda i=m["id"]: self.house_member_act("/v1/transfer", i), 90).pack(side="left", padx=(0, 4))
+            if boss or (role == "officer" and m["role"] == "member"):
+                self._house_confirm("kick" + m["id"], "Remove", lambda i=m["id"]: self.house_member_act("/v1/kick", i), 66).pack(side="left")
+
+        row = tk.Frame(host, bg=PARCH)
+        row.pack(fill="x", padx=12, pady=(2, 10))
+        self._house_row = row
+        self.label(row, "Leave this house (you can join another or start your own afterwards):", font=self.fs, fg=DIM).pack(anchor="w", pady=(0, 3))
+        row = tk.Frame(row, bg=PARCH)
+        row.pack(fill="x")
+        self._house_row = row
+        self._house_confirm("leave", "Leave house", self.house_leave, 110).pack(side="left")
+        if boss:
+            self._house_confirm("disband", "Disband house", self.house_disband, 120).pack(side="left", padx=(6, 0))
+            if len(mems) > 1:
+                self.label(row, "(Leave: hand the house over first. Disband ends it for everybody.)", font=self.fs, fg=DIM, wraplength=PAGE_W - 40, justify="left").pack(anchor="w", pady=(4, 0))
+
+    def _house_status_tick(self, first=False):
+        """The status line, every second; and the member list every 5 s while this page is open."""
+        try:
+            if first and getattr(self, "_house_tick_on", False):
+                return
+            if not first and not getattr(self, "_house_tick_on", False):
+                return
+            self._house_tick_on = True
+            lbls = [l for l in (getattr(self, "house_status", None), getattr(self, "hm_status", None)) if l is not None and l.winfo_exists()]
+            if not lbls:
+                self._house_tick_on = False
+                return
+            for lbl in lbls:
+                lbl.config(text="Status: " + str(self.house.status))
+            if getattr(self, "extra_page", "") in ("housesetup", "housemate") and time.time() - getattr(self, "_house_rt", 0.0) > 5.0:
+                self._house_rt = time.time()
+                self.house_refresh()
+            self.root.after(1000, self._house_status_tick)
+        except Exception:
+            self._house_tick_on = False
+
+    HOUSE_NOTICE = ("House Setup shares your health bar through free public MQTT brokers (EMQX, HiveMQ, Eclipse - these are used by hundreds of thousands of users). "
+                    "Everything sent is encrypted, and your housemates never see your IP address. But the broker's servers do see the address you connect from, like any website would.",
+                    "If you'd rather keep your IP private, use a VPN, or a free one like Cloudflare WARP, while you play.")
+
     def show_extra(self, name):
         self.extra_page = name
         self.extra_pages[name].tkraise()
+        if name == "housesetup" and not self.cfg["settings"].get("house_notice_seen"):
+            self.cfg["settings"]["house_notice_seen"] = True            # (once: the first time House Setup is opened)
+            save_cfg(self.cfg)
+            self.show_notice("House Setup Notice", "", list(self.HOUSE_NOTICE), button="Close", bullets=False, confirm=True)
+        if name in ("housesetup", "housemate") and getattr(self, "house", None) is not None and self.house_in():
+            self._house_rt, self._house_force = time.time(), True       # (the members are asked for right now, not after the first 5 s)
+            self.house_refresh()
+            self._house_status_tick(True)
 
     def build_extras_menu(self, f):
         big = (self.family, -(UI_FONT_PX + 6))
         self.extra_icons = {k: ui_img(_img(v)) for k, v in EXTRA_ICONS.items()}      # (kept alive here)
         self.other_menu_icon = ui_img(_img(CHECK_ICONS["other"]))
-        for i, (key, text) in enumerate((("auto", "Automation"), ("dash", "Dash/PB CD"), ("rc", "Race/Class"), ("inv", "Inventory"), ("kbbinds", "Keybinds"), ("other", "Other Stuff"))):
+        for i, (key, text) in enumerate((("auto", "Automation"), ("dash", "Dash/PB CD"), ("rc", "Race/Class"), ("inv", "Inventory"), ("kbbinds", "Keybinds"), ("house", "House Stuff"), ("other", "Other Stuff"))):
             row = tk.Frame(f, bg=PARCH)
             row.pack(fill="x", padx=12, pady=(14 if i == 0 else 6, 0))
             tk.Label(row, image=(self.other_menu_icon if key == "other" else self.extra_icons[key]), bg=PARCH, bd=0, width=62).pack(side="left")
@@ -13919,7 +16215,8 @@ class App:
         tints = self.mana_tints()
         seen = mana_bar_present(arr, boxes, tints, alpha)
         self._mana_seen_now = seen
-        b = mana_fill_boundary(arr, boxes, alpha, tints=tints)
+        b = mana_fill_boundary(arr, boxes, alpha, tints=tints, prev_row=getattr(self, "_mana_prev_row", None))
+        self._mana_prev_row = b
         if len(arr) - b <= 2:                                                   # (a few filled rows at the very bottom = a tick line)
             pct = 0.0
         else:
@@ -13961,10 +16258,10 @@ class App:
             self.mana_listen(now)
         except Exception:
             pass
-        if not (S.get("mana_pct_on") or S.get("mana_on")):
+        pic_on = bool(S.get("mana_pct_on") or S.get("mana_on"))        # (the number / picture is shown; the bar is read for the climb detection even when both are off)
+        if not pic_on:
             self.mana_pct = None
             self.mana_absent = False
-            return
         if not self.game_focused() and now >= self.demo_until:
             self._mana_gone = 0
             self.mana_absent = False
@@ -13990,6 +16287,9 @@ class App:
             prev, self._last_pct = self._last_pct, v
             if prev is not None and v > prev + 0.3 and (self.g_held or now - self.g_t <= MANA_G_KEEP):
                 self.mana_keep_until = max(self.mana_keep_until, now + MANA_G_KEEP)      # G charged the mana: the overlay stays on for 2 more seconds
+        if not pic_on:
+            self.mana_absent = False                  # (nothing is shown: the checklist doesn't wait for the bar either)
+            return
         if self._mana_seen_now:                       # (the game's bar is on screen: both pictures show at once)
             self._mana_gone, self.mana_absent = 0, False
         else:                                         # (not there: the menus / loading; three looks in a row hide the pictures)
@@ -14272,9 +16572,10 @@ class App:
                         m_ = dict(sct0.monitors[1])
                 c_ = self._hp_mon_c = (now, m_)
             mon = c_[1]
-            bx, by, bw, bh = hp_bar_box(mon["width"], mon["height"])
+            us = ui_scale(self.cfg["bar"])
+            bx, by, bw, bh = hp_bar_box(mon["width"], mon["height"], us)
             arr = self._grab_rgb({"left": mon["left"] + bx, "top": mon["top"] + by, "width": bw, "height": bh})
-            seen = hp_bar_visible(arr)
+            seen = hp_bar_visible(arr, us)
             self._hp_dbg = {"crop": arr, "bar": bool(seen), "size": (mon["width"], mon["height"]), "t": now}
         except Exception:
             return
@@ -14292,7 +16593,7 @@ class App:
             if seen and now - getattr(self, "_hp_fill_t", 0.0) < 1.0 and self.tracker.bloodline_key() is None:
                 raise _SkipLook                                      # (the bar is there and nothing needs its fill: once a second is enough for the picture the Settings button saves)
             self._hp_fill_t = now
-            gx, gy, gw, gh = hp_fill_box(mon["width"], mon["height"])
+            gx, gy, gw, gh = hp_fill_box(mon["width"], mon["height"], us)
             wide = self._grab_rgb({"left": mon["left"] + gx, "top": mon["top"] + gy, "width": gw, "height": gh})
             frac = hp_fill_fraction(wide)
             self.tracker.hp_frac = (frac, now)
@@ -15739,7 +18040,7 @@ class App:
         self.kb_cap = None
         self.inputs.kb_capture = lambda kid, label: self.q.put(("gatecap", kid, label))
         self._gk_rebuild()
-        self.say("Press the key (or Mouse 3 / 4 / 5) you want to use (Esc = cancel).", "Press a key...")
+        self.say("Press the key (or Mouse 3 / 4 / 5, or Ctrl + a key) you want to use (Esc = cancel).", "Press a key...")
 
     def finish_gk_cap(self, kid, label):
         ref, self.gk_cap, self.inputs.kb_capture = self.gk_cap, None, None
@@ -15827,7 +18128,7 @@ class App:
         self.kb_cap = ref
         self.inputs.kb_capture = lambda kid, label: self.q.put(("kbcap", kid, label))      # (runs in the input thread: only queues)
         self._rebuild_kb()
-        self.say("Press the key (or Mouse 3 / 4 / 5) you want to use (Esc = cancel).", "Press a key...")
+        self.say("Press the key (or Mouse 3 / 4 / 5, or Ctrl + a key) you want to use (Esc = cancel).", "Press a key...")
 
     def kb_add(self):
         self.kb_pick(("new",))
@@ -16284,6 +18585,62 @@ class App:
         self._kda_sig = None
         save_cfg(self.cfg)
 
+    def _house_tick(self, now):
+        """The housemates' panel (left of the screen, where you put it). Only while the game is in front, like the other overlays."""
+        S = self.cfg["settings"]
+        if self.house.removed:                                         # the server says I am out of the house: forget the keys
+            msg, self.house.removed = self.house.removed, ""
+            S["house_hid"] = S["house_mid"] = S["house_secret"] = S["house_title"] = ""
+            self.house_roster = None
+            save_cfg(self.cfg)
+            self.say(msg, "Housemate HP")
+            self.rebuild_house()
+        demo = now < self.house_demo_until
+        mem = list(HOUSE_DEMO) if demo else (self.house.view(now) if S.get("house_on") else [])
+        hidden_by_focus = (S.get("mana_only_focused", True) and self.mana_edit is None and now >= self.demo_until and not demo
+                           and not self.game_focused())
+        bar_seen = self.house_bar_seen(now)                            # (my own health bar is on the screen)
+        if self.mana_edit is not None and self._edit_item is self._housepos:
+            bar_seen, mem = False, []                                 # (the editor shows the panel itself)
+        if not mem or self.selecting or hidden_by_focus or (not bar_seen and not demo):
+            if self.house_ov.shown:
+                self.house_ov.hide()
+            self._house_sig = None
+            return
+        try:
+            sc = max(0.4, min(3.0, float(S.get("house_scale", 1.0))))
+            dx, dy = int(float(S.get("house_dx", 7))), int(float(S.get("house_dy", -25)))
+        except (TypeError, ValueError):
+            sc, dx, dy = 1.0, 7, -25
+        numbers = bool(S.get("house_numbers"))
+        icon = max(8, int(round(26 * sc)))
+        mb = self.cfg.get("mana") or DEFAULT_MANA
+        mx, my = float(mb.get("x", DEFAULT_MANA["x"])), float(mb.get("y", DEFAULT_MANA["y"]))
+        sig = (round(mx), round(my), dx, dy, sc, numbers, tuple((n, hp, tuple((k, mv, int(round(f * icon)), (int(math.ceil(lf)) if (numbers and lf is not None) else 0))
+                                                              for k, mv, f, lf in bl)) for n, hp, bl in mem))
+        if sig != self._house_sig:
+            self._house_sig = sig
+            pil = house_panel(mem, sc, numbers)
+            x, y = int(round(mx)) + dx, int(round(my)) + dy - pil.height               # (the panel stands on the mana bar: its bottom edge a little above the bar's top)
+            self.house_ov.show(x, y, pil)
+        elif now - self._house_top > 1.0:
+            self._house_top = now
+            self.house_ov.raise_top()
+
+    def house_bar_seen(self, now):
+        """True while the tool sees my own health bar, or while the inventory is open (the bar hides there)."""
+        try:
+            f = getattr(self.tracker, "hp_frac", None)
+            seen = bool(f and f[0] is not None and now - f[1] <= 3.0 and not getattr(self, "hp_absent", False))
+            if seen:
+                self._house_hp_seen = now
+                return True
+            if self.inv_is_open(now) and now - getattr(self, "_house_hp_seen", -1e9) < 300.0:
+                return True                                            # (the health bar hides while the inventory is open: the panel stays, but only if the bar was there a moment ago)
+            return False
+        except Exception:
+            return False
+
     def _kda_tick(self, now):
         """Grip / Death / Assist / Knocked counters at the bottom left of the game (only the ones ticked in Other Stuff > KDA)."""
         S = self.cfg["settings"]
@@ -16397,7 +18754,7 @@ class App:
         self.label(f, "Other Stuff", font=big).pack(fill="x", padx=12, pady=(8, 0))
         self.other_icons = {k: ui_img(_img(v)) for k, v in CHECK_ICONS.items()}      # (kept alive here)
         self.other_icons["gate"] = ui_img(gate_icon())
-        for i, (key, text, icon) in enumerate((("gank", "Gank Ping", self.other_icons["gank"]), ("check", "Checklist", self.other_icons["check"]),
+        for i, (key, text, icon) in enumerate((("check", "Checklist", self.other_icons["check"]),
                                               ("kda", "KDA", self.other_icons["kda"]), ("imenu", "Instant Menu", self.other_icons["imenu"]),
                                               ("gate", "Gate", self.other_icons["gate"]))):
             row = tk.Frame(f, bg=PARCH)
@@ -16761,7 +19118,7 @@ class App:
         if not url:
             self.say("Gank Ping: paste your webhook link first (Extras > Other Stuff).", "No webhook")
             return
-        name, title = S.get("gank_name", ""), str(S.get("game_title", "Roblox"))
+        name, title = (str(S.get("house_name") or "").strip() or S.get("gank_name", "")), str(S.get("game_title", "Roblox"))
         rect = game_window_rect(title)                       # (read now, on the main thread; None unless the Roblox game itself is in front)
         if rect is None:
             self.say("Gank Ping: Roblox isn't the window in front, nothing was sent.", "Roblox not in front")
@@ -16819,9 +19176,9 @@ class App:
             pass
 
     def build_gank(self, f):
-        """Extras > Other Stuff > Gank Ping."""
+        """Extras > House Stuff > Gank Ping (the name in the message is the one from House Setup)."""
         host = self.scroll_page(f, "gank", PAGE_W - 12)
-        self.back_button(host, "other")
+        self.back_button(host, "house")
         box, p = self.panel(host, "Gank Ping")
         box.pack(fill="x", padx=6, pady=6)
         self.label(p, "Discord webhook", font=self.fs).pack(anchor="w", padx=8, pady=(2, 0))
@@ -16831,7 +19188,7 @@ class App:
         PixBtn(wrow, "Test", self.gank_test, self.f, 52, 24, bd=2).pack(side="left", padx=(6, 0))
         self.gank_lbl = self.label(p, "", font=self.fs)
         self.gank_lbl.pack(anchor="w", padx=8)
-        self.label(p, "Your name (shown in the message)", font=self.fs).pack(anchor="w", padx=8, pady=(4, 0))
+        self.label(p, "Your name (shown in the message). The name from House Setup is used when you set one there; this is the fallback.", font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 60).pack(anchor="w", padx=8, pady=(4, 0))
         nrow = tk.Frame(p, bg=PARCH)
         nrow.pack(fill="x", padx=8, pady=2)
         self.make_entry(nrow, "gank_name", str, 196, 24).pack(side="left")
@@ -17192,6 +19549,7 @@ class App:
     def build_cred(self, f):
         self.label(f, CREDITS_TEXT, justify="left", anchor="nw", wraplength=PAGE_W - 24
                    ).pack(fill="both", padx=12, pady=12)
+        PixBtn(f, "What's New?", self.open_whatsnew, self.f, 130, 26).pack(anchor="w", padx=12, pady=(0, 8))
 
     def build_settings(self, f):
         inner = self.scroll_page(f, "settings", PAGE_W - 12)
@@ -17319,10 +19677,29 @@ class App:
             note = f" - {info['notes']}" if info.get("notes") else ""
             self.upd_set(f"New version {info['version']} is available (you have {APP_VERSION}){note}", show=("check", "update"))
             self.say(f"Update available: {info['version']} (Settings > Updates).", "Update available")
+            self.offer_update_popup(info, manual)
         else:
             self.upd_set(f"Version {APP_VERSION} - you have the newest version.")
             if manual:
                 self.say("You have the newest version.")
+
+    def offer_update_popup(self, info, manual):
+        """The "Update Available" window: the new version and its list of changes, with Update now / Later. Shown once per version by itself
+        (every time when the user pressed Check for updates)."""
+        try:
+            S = self.cfg["settings"]
+            ver = str(info.get("version") or "")
+            if not ver or getattr(self, "_notice", None) is not None:
+                return                                              # (another window is open: it comes next start)
+            if not manual and S.get("seen_update") == ver:
+                return
+            S["seen_update"] = ver
+            save_cfg(self.cfg)
+            lines = list(info.get("notes_list") or ([info["notes"]] if info.get("notes") else []))
+            self.show_notice("Update Available", "Version " + ver, lines or ["No notes were written for this update."],
+                             button="Update now", on_button=self.start_update_install, second="Later")
+        except Exception:
+            pass
 
     def start_update_install(self):
         base = str(self.cfg["settings"].get("update_base") or "").strip()
@@ -17579,7 +19956,9 @@ class App:
         self.capturing = None
         mv = token[1]
         if token[0] == "mark":
-            if name != "esc":
+            if name != "esc" and mv.get("auto"):
+                self.say(f"This mark follows its spell: change the key of '{mv['auto']}' in the Main tab and the mark moves with it.", "Follows its spell")
+            elif name != "esc":
                 mv["key"] = name
                 save_cfg(self.cfg)
                 self.mana_ov.sig = None
@@ -17678,6 +20057,9 @@ class App:
             return
         if kind == "msg":
             self.say(item[1])
+            return
+        if kind == "whatsnew":
+            self.on_whatsnew(item[1], item[2], item[3])
             return
         if kind == "update_checked":
             self.on_update_checked(item[1], item[2], item[3])
@@ -17886,6 +20268,10 @@ class App:
             self._kda_tick(time.time())
         except Exception:
             self.append_log("KDA ERROR:\n" + traceback.format_exc())
+        try:
+            self._house_tick(time.time())
+        except Exception:
+            self.append_log("HOUSEMATE ERROR:\n" + traceback.format_exc())
         try:
             self._mascot_tick()
         except Exception:
@@ -18239,6 +20625,10 @@ class App:
         self.inputs.stop()
         try:
             self.ahk_guard.stop()
+        except Exception:
+            pass
+        try:
+            self.house.stop()
         except Exception:
             pass
         self.hotbar.stop()

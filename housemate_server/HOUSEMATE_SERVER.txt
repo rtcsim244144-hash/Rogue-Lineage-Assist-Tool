@@ -1,0 +1,48 @@
+HOUSEMATE HP - SERVER SETUP (once, by whoever hosts it)
+=======================================================
+How houses work
+  - A house has one LEADER, any number of OFFICERS and MEMBERS.
+  - Nobody joins with a shared password. The Leader or an Officer presses "Make invite code" in the tool; it makes a code like
+    K7PM2-X9QRT that works ONCE and runs out after 24 hours. The new player types it into "Join a house" and the code is used up.
+  - Every player then holds a private key of their own (the server stores only a hash of it). Removing someone locks that one
+    player out at once; nobody else has to change anything.
+  - The Leader can make Officers (and take it back), hand the house to someone else, and remove anyone.
+    Officers can make invite codes and remove plain Members.
+
+The server needs to REMEMBER the houses (who is in them, their roles), so it must run somewhere that keeps its files.
+
+WHERE TO RUN IT
+  Good:  - a small VPS, or any always-on computer + Cloudflare Tunnel (free) for the https address
+         - Fly.io / Railway / Render WITH a persistent disk/volume (set DATA_FILE to a path on that disk, e.g. /data/house_data.json)
+  Not good: a free host whose files are wiped on every restart (Render's free plan does this): everybody would be thrown out of
+         their house each time it sleeps. Use one of the options above.
+
+RUN
+  python3 housemate_server.py                (Python 3.8+, no packages; port 8080 or $PORT)
+  Check it in a browser: the address should answer {"ok":true,"service":"rlat-housemate",...}
+
+SETTINGS (environment variables, all optional)
+  PORT          the port
+  DATA_FILE     where the houses are saved (default: house_data.json next to the script)
+  CREATE_KEY    if you set this, making a NEW house needs this key. Set it, so strangers can't make houses on your server.
+                (You type it once in the tool when you press "Create house".)
+  INVITE_HOURS  how long an invite code lives (default 24, at most 168)
+  TRUST_PROXY   set to 1 when the server is behind Render / Cloudflare / nginx (the real visitor address is then read from
+                X-Forwarded-For; it limits how fast one address can try invite codes)
+  The tool needs the server to be https:// (a server on the same computer, http://127.0.0.1:8080, is allowed for tests).
+
+IN THE TOOL
+  Extras > House Stuff > House Setup
+  - First person: type the server address, "Start a new house" (house name, your name, the server key if you set one). You are the Leader.
+  - Then "Make invite code" > send the code to your friend (Copy button).
+  - Friend: type the server address, the invite code and their name > "Join". Done: no password to remember.
+  - Leader: under "Members" there are buttons per player: Make Officer / Make Member, Make Leader (hands the house over) and Remove.
+  - Everybody: "Show my housemates' HP", "Share my HP and buffs", where the panel sits (X / Y / Size) and a Preview.
+  TO SHIP THE SERVER ADDRESS INSIDE THE TOOL: set HOUSE_DEFAULT_SERVER near the top of the Housemate HP part of CooldownIndicator.py.
+
+GOOD TO KNOW
+  - The tool reads HP from the screen like everything else; the buffs are the ones it already follows (potions it saw you drink and
+    the buff moves you cast).
+  - Invite codes are 10 letters/digits (about 50 bits) and a wrong guess costs a try: more than 10 tries a minute from one address are refused.
+  - The keys are stored in the tool's config file on each player's computer; if someone gives away their config, remove that player.
+  - A house holds up to 40 players. The last person leaving deletes the house.
