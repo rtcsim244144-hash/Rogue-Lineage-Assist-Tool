@@ -30,6 +30,7 @@ Needs:    pip install mss numpy pillow keyboard      (Windows - run as administr
 Files:    scroom_assets.py must sit next to this file. Put Manufaktur.ttf next to it too (optional).
 """
 import uuid
+import shutil, tempfile
 import collections, types, ast, subprocess, base64, ctypes, hashlib, urllib.request, zlib, glob, io, json, math, os, queue, re, sys, threading, time, traceback
 import urllib.error
 import http.client
@@ -96,7 +97,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -224,6 +225,9 @@ DEFAULT_SETTINGS = {
     "inv_hide": True,        # hide the coins while the inventory is open
     "house_notice_seen": False,   # the House Setup notice (public MQTT brokers, your IP) was shown
     "whatsnew_cache": {},     # the last "What's New?" text read from GitHub: {"v": version, "lines": [...]} (used when GitHub can not be reached)
+    "weaponcd_done": False,  # the one-time fix of weapons that kept the 10 s placeholder as their main cooldown was done
+    "chargecd_done": False,   # the one-time fill of the Charged Blow / Dark Charged Blow / Azure cooldown boxes (hardcoded numbers) was done
+    "spellcd_done": False,   # the one-time fix of the Normal Spells' cooldowns (hardcoded: 0, Telorum / Viribus 3, Percutiens 5) was done
     "basecd_done": False,    # the one-time fill of the known moves' base cooldowns was done
     "seen_update": "",       # the newest version whose "Update Available" window was shown
     "seen_log": "",          # the version whose "What's New?" window was already shown
@@ -339,7 +343,7 @@ GATE_CD, GATE_WAIT = 6.5, 5.0
 DEFAULT_PROFILE = "Solan"
 SEED_SOLAN = (("1", "Sword", 0.0), ("2", "Thunder Charge", 5.0), ("3", "White Fire Charge", 5.0),
               ("4", "Flame Charge", 5.0), ("5", "Ice Charge", 5.0), ("6", "Charged Blow", 0.0))
-SEED_CHARGED = {"thunder": 13.0, "white fire": 12.0, "flame": 12.0, "ice": 18.0}
+SEED_CHARGED = {"thunder": 12.0, "white fire": 12.0, "flame": 12.0, "ice": 18.0}
 # ========================================================
 
 
@@ -353,6 +357,10 @@ WK_CHARGES = (("fallen lightning", "Fallen Lightning"), ("darkflame burst", "Dar
               ("impure crystal", "Impure Crystal"))
 WK_ALIASES = {"dark flame burst": "darkflame burst", "impure crystals": "impure crystal"}   # other ways to write them
 SEED_DARK = {"fallen lightning": 10.5, "darkflame burst": 16.5, "impure crystal": 11.0, "threading needle": 11.5}
+# HARDCODED starting cooldowns of every Charge-style box (Charged Blow, Dark Charged Blow, Azure Ignition's three, Threading Needle): a new profile starts with
+# these, and the first start of the version fills the boxes that are still blank (a number somebody typed stays).
+AZURE_SEED = {"brandish": 11.0, "puncture": 16.5, "blade crash": 20.0}
+CHARGED_DEFAULTS = {**SEED_CHARGED, **SEED_DARK, **AZURE_SEED}
 SOLAN_KINDS = tuple(k for k, _ in CHARGES)
 WK_KINDS = tuple(k for k, _ in WK_CHARGES)
 CHARGE_LABEL = dict(CHARGES + WK_CHARGES)
@@ -549,7 +557,7 @@ SPELL_MARKS = {
     "gate": ((75, 85), (75, 85)),
     "snarvindur": ((55, 75), (15, 30)),
     "ignis": ((85, 95), (50, 60)),
-    "gelidus": ((80, 90), (90, 100)),
+    "gelidus": ((80, 95), (80, 100)),
     "nocere": ((70, 80), (70, 85)),
     "trahere": ((70, 90), None),
     "manus dei": ((95, 97), (50, 60)),
@@ -718,6 +726,28 @@ def base_cd_for(name):
     return v
 
 
+def apply_name_rules(m):
+    """What typing a name into a Move row does besides the base cooldown (Soul Rip, Decompose, Ink Blot, The Soul, picks, Awakened, buff moves): the
+    same flags for a row made without typing."""
+    v = m.get("name")
+    if m.get("spell") or "cd2" not in m:
+        return
+    if is_soul_name(v):
+        m["soul"], m["cd"], m["cd2"] = True, 0.0, 0.0
+    if is_decompose(v) and m.get("cd2") != DECOMPOSE_M2:
+        m["cd2"], m["split"] = DECOMPOSE_M2, True
+    if is_ink_blot(v) and float(m.get("cd") or 0.0) != INK_BLOT_CD:
+        m["cd"] = INK_BLOT_CD
+    if is_the_soul(v) and float(m.get("cd") or 0.0) <= 0:
+        m["cd"] = THE_SOUL_CD
+    if is_pick_name(v):
+        m["pick"], m["cd"], m["cd2"] = True, 0.0, 0.0
+    if is_awk_name(v):
+        m["awk"], m["cd"], m["cd2"] = True, 0.0, 0.0
+    if bmove_kind(v):
+        m["bmove"], m["cd"], m["cd2"] = bmove_kind(v), 0.0, 0.0
+
+
 def apply_base_cd(m):
     """Fills the BLANK cooldown boxes of a Move row (not a Normal Spell / snap spell) from BASE_CDS. What an earlier fill put there for a name typed so
     far (\"Axe\" on the way to \"Axe Kick\") is taken back first, if nobody changed it since. Returns True when the row changed."""
@@ -737,6 +767,8 @@ def apply_base_cd(m):
     new = list(cur)
     if cur[0] == 0 and not m.get("zero") and want[0] > 0:
         new[0] = float(want[0])
+    elif cur[0] == 10.0 and not m.get("zero") and (m.get("fresh") or (want[0] == 0 and want[1] > 0)):
+        new[0] = float(want[0])                                 # (a weapon never has a 10 s main cooldown: that is the placeholder of a new row)                                 # (the 10 s a new move starts with and nobody typed: the real one - a weapon's is blank)
     if cur[1] == 0 and want[1] > 0:
         new[1] = float(want[1])
         if want[2]:
@@ -746,6 +778,51 @@ def apply_base_cd(m):
     m["basecd"] = {"prev": list(cur), "now": list(new)}
     m["cd"], m["cd2"], m["split"] = new[0], new[1], bool(new[2])
     return True
+
+
+# NORMAL spells (left click) have no cooldown of their own except these (a snap spell with the same name has another one: they are never touched here).
+# Snarvindur stays as it is (its box is 0: the snap spells' "Snarvindur seconds" setting does the work).
+NORMAL_SPELL_CDS = {"telorum": 3.0, "viribus": 3.0, "percutiens": 5.0}
+
+
+def normal_spell_cd(name):
+    return NORMAL_SPELL_CDS.get(_norm_name(name), 0.0)
+
+
+def apply_spell_cd(m, force=False):
+    """A Normal Spell row (not a snap spell, not Snarvindur): its cooldown box gets the hardcoded number of its name (0 for most). force = overwrite
+    whatever is in the box (the one-time fix of the old 10 s placeholders). Without it only a blank box is filled, and what an earlier name put
+    there follows a rename. Returns True when the row changed."""
+    if not m.get("spell") or "cd2" not in m or is_snarvindur(m.get("name")):
+        return False
+    want = normal_spell_cd(m.get("name"))
+    cur = float(m.get("cd") or 0.0)
+    rec = m.get("spellcd")
+    if force or (rec is not None and abs(cur - float(rec)) < 1e-9) or (cur == 0.0 and want > 0):
+        new = want
+    else:
+        new = cur
+    if new == want and want > 0:
+        m["spellcd"] = want
+    else:
+        m.pop("spellcd", None)
+    if new == cur:
+        return False
+    m["cd"] = new
+    return True
+
+
+def sweep_spell_cds(cfg):
+    """Once per config: every Normal Spell gets its hardcoded cooldown (the old rows all had the 10 s placeholder). Snap spells aren't touched."""
+    n = 0
+    fps = cfg.get("pack_fp", {})
+    for prof, moves in cfg.get("profiles", {}).items():
+        same = prof in fps and profile_fp(cfg, prof) == fps[prof]
+        k = sum(1 for m in moves if apply_spell_cd(m, force=True))
+        if k and same:
+            fps[prof] = profile_fp(cfg, prof)
+        n += k
+    return n
 
 
 def sweep_base_cds(cfg):
@@ -804,10 +881,24 @@ def clean_charged(d):
     d = d if isinstance(d, dict) else {}
     for kind, _ in CHARGES + AZURES + WK_CHARGES + SOUL_MODES:
         try:
-            out[kind] = max(0.0, float(d[kind] or 0.0)) if kind in d else float(SEED_DARK.get(kind, 0.0))
+            out[kind] = max(0.0, float(d[kind] or 0.0)) if kind in d else float(CHARGED_DEFAULTS.get(kind, 0.0))
         except Exception:
-            out[kind] = float(SEED_DARK.get(kind, 0.0))
+            out[kind] = float(CHARGED_DEFAULTS.get(kind, 0.0))
     return out
+
+
+def sweep_charged_cds(cfg):
+    """Once per config: every profile's BLANK Charged Blow / Dark Charged Blow / Azure boxes get their hardcoded number. Returns how many boxes changed."""
+    n = 0
+    for prof, d in cfg.get("charged", {}).items():
+        if not isinstance(d, dict):
+            continue
+        for kind, v in CHARGED_DEFAULTS.items():
+            if kind in CHARGE_LABEL or kind in AZURE_LABEL or kind in dict(SOUL_MODES):
+                if not float(d.get(kind) or 0.0):
+                    d[kind] = float(v)
+                    n += 1
+    return n
 
 
 def norm_key(name):
@@ -2625,9 +2716,16 @@ def load_cfg():
     first_run = not cfg["pack"]                            # the first start that gets the pack (once: a config that has any pack version recorded never gets it again)
     added = merge_default_pack(cfg)                        # the default profiles of this version, once
     added = list(added) + merge_extra_packs(cfg)           # the extra packs (each id once)
-    if not cfg["settings"].get("basecd_done"):
+    if not (cfg["settings"].get("basecd_done") and cfg["settings"].get("weaponcd_done")):
+        cfg["settings"]["weaponcd_done"] = True
         cfg["settings"]["basecd_done"] = True              # (once: blank cooldown boxes of known moves are filled; typing a name does it from then on)
         sweep_base_cds(cfg)                                # (saved with the next save, like the pack marker)
+    if not cfg["settings"].get("spellcd_done"):
+        cfg["settings"]["spellcd_done"] = True
+        sweep_spell_cds(cfg)
+    if not cfg["settings"].get("chargecd_done"):
+        cfg["settings"]["chargecd_done"] = True
+        sweep_charged_cds(cfg)
     if first_run:
         cfg["settings"]["opacity"] = 0.3                   # 1.2.0: everyone's Red Box Strength starts at 0.3 (changeable afterwards)
         cfg["pack"] = DEFAULT_PACK_VERSION                 # (saved with the next save: until then the same thing happens again, which changes nothing)
@@ -4689,7 +4787,154 @@ def detect_hotbar(rgb, n=12):
             if wchk.max() - wchk.min() <= 3 and gaps.max() - gaps.min() <= 3 and gaps.min() > wchk.max():
                 return {"x": int(st[0]), "y": int(y_lo + y0), "w": int(round(np.median(wchk))), "h": int(h),
                         "pitch": float(st[-1] - st[0]) / (n - 1)}
+    return _detect_hotbar_partly(rgb, mask, y_lo, n)
+
+
+def _detect_hotbar_partly(rgb, mask, y_lo, n=12):
+    """The hotbar with some slots COVERED (the tool's own window on top of the game, a chat box ...): 6 or more evenly spaced slots are enough when
+    the game centres its hotbar - the first one seen is then slot k, found from where the middle of the screen would put slot 1. Returns the bar
+    dict (x = slot 1) or None."""
+    W = rgb.shape[1]
+    rows = mask.sum(axis=1)
+    if rows.size == 0 or rows.max() < 6 * 20:
+        return None
+    for y0, y1 in sorted(_runs(rows >= 0.5 * rows.max(), 15), key=lambda t: t[0] - t[1]):
+        h = y1 - y0 + 1
+        runs = _runs(mask[y0:y1 + 1].sum(axis=0) >= 0.5 * h, 20)
+        for i in range(len(runs) - 5):
+            j = i + 1
+            while j < len(runs) and runs[j][0] - runs[j - 1][0] > 0 and abs((runs[j][0] - runs[j - 1][0]) - (runs[i + 1][0] - runs[i][0])) <= 3:
+                j += 1
+            seq = runs[i:j]
+            if len(seq) < 6:
+                continue
+            full = seq[:-1] if (seq[-1][1] - seq[-1][0] + 1) < (seq[0][1] - seq[0][0] + 1) - 3 else seq        # (the last one may be cut by the cover)
+            if len(full) < 6:
+                continue
+            ws = np.array([e - s + 1 for s, e in full])
+            st = np.array([s for s, _ in full], dtype=float)
+            if ws.max() - ws.min() > 3:
+                continue
+            pitch = float(st[-1] - st[0]) / (len(full) - 1)
+            w = float(np.median(ws))
+            if pitch < 20 or pitch < w + 1:
+                continue
+            x1_centred = W / 2.0 - ((n - 1) * pitch + w) / 2.0
+            k = (st[0] - x1_centred) / pitch
+            if abs(k - round(k)) > 0.2 or not (0 <= round(k) <= n - len(full)):
+                continue
+            return {"x": int(round(st[0] - round(k) * pitch)), "y": int(y_lo + y0), "w": int(round(w)), "h": int(h), "pitch": pitch}
     return None
+
+
+# ---------- 'Find moves': reads the move names on the hotbar with Tesseract (only when the button is clicked) ----------
+MOVE_EXTRA_NAMES = ("rapier", "needle's eye", "the soul", "agility", "bladeflip", "bane", "scrupus", "health potion", "sprint", "soul rip")
+
+
+def known_move_names():
+    """Every move / spell name the tool knows (lower case): the base cooldown table, the spell table and a few more."""
+    return sorted(set(BASE_CDS) | set(SPELL_MARKS) | set(MOVE_EXTRA_NAMES))
+
+
+def match_move_name(text, names=None):
+    """What Tesseract read in one slot ('Contrariu m', 'inarvindu') -> (known name or None, cleaned text). Gaps and a cut-off start / end of a long name
+    are forgiven; two different names that fit about equally well give None."""
+    import difflib
+    clean = " ".join(re.sub(r"[^A-Za-z' ]", " ", str(text or "")).split())
+    c = clean.lower().replace(" ", "").replace("'", "")
+    if len(c) < 3:
+        return None, clean
+    scored = []
+    for n in (names or known_move_names()):
+        k = n.replace(" ", "").replace("'", "")
+        r = difflib.SequenceMatcher(None, c, k).ratio()
+        if len(c) >= 5 and len(c) < len(k) and c in k:
+            r = max(r, 0.8 + 0.2 * len(c) / len(k))
+        scored.append((r, n))
+    scored.sort(reverse=True)
+    best = scored[0]
+    if best[0] < 0.8:
+        return None, clean
+    if len(scored) > 1 and scored[1][0] > best[0] - 0.04 and scored[1][1] != best[1]:
+        return None, clean
+    return best[1], clean
+
+
+def find_tesseract():
+    """The tesseract program: RLAT_TESSERACT, the PATH, the usual install folders. None when it isn't installed."""
+    cands = [os.environ.get("RLAT_TESSERACT") or ""]
+    w = shutil.which("tesseract")
+    if w:
+        cands.append(w)
+    for env in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        base = os.environ.get(env)
+        if base:
+            cands += [os.path.join(base, "Tesseract-OCR", "tesseract.exe"), os.path.join(base, "Programs", "Tesseract-OCR", "tesseract.exe")]
+    cands += ["/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract", "/usr/bin/tesseract"]
+    for c in cands:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+def ocr_slot_text(exe, slot_rgb, timeout=25):
+    """One hotbar slot's picture -> the text Tesseract reads in it ('' for an empty slot). Raises RuntimeError when Tesseract itself fails."""
+    g = Image.fromarray(np.asarray(slot_rgb)[..., :3].astype(np.uint8)).convert("L")
+    g = g.resize((max(8, g.width * 4), max(8, g.height * 4)), Image.BICUBIC)
+    a = np.asarray(g).astype(np.float64)
+    bg = np.percentile(a, 90)
+    a = 255.0 - np.clip((bg - a) / max(bg - a.min(), 1.0) * 255.0, 0, 255)              # (dark text on the parchment -> black on white)
+    img = Image.fromarray(a.astype(np.uint8))
+    lo, hi = float(np.asarray(img).min()), float(np.asarray(img).max())
+    if hi - lo < 40:
+        return ""                                                                          # (nothing but parchment: an empty slot)
+    pad = Image.new("L", (img.width + 48, img.height + 48), 255)
+    pad.paste(img, (24, 24))
+    best = ""
+    kw = {"capture_output": True, "text": True, "timeout": timeout}
+    if IS_WIN:
+        kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        pad.save(tmp)
+        for psm in ("6", "7", "11"):
+            r = subprocess.run([exe, tmp, "-", "--psm", psm, "-l", "eng", "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' "], **kw)
+            if r.returncode != 0 and not r.stdout.strip():
+                raise RuntimeError((r.stderr or "tesseract failed").strip()[-300:])
+            txt = " ".join(r.stdout.split())
+            if len(txt) > len(best):
+                best = txt
+            if len(best) >= 5 and psm == "6":
+                break
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return best
+
+
+def read_hotbar_names(exe, rgb, bar, n=12):
+    """[(hotbar key, text read, known name or None)] for the slots of a screenshot (bar = detect_hotbar's result). Runs Tesseract once per
+    filled slot, four at a time."""
+    from concurrent.futures import ThreadPoolExecutor
+    s = max(0.5, ui_scale(bar))
+    H, W = rgb.shape[:2]
+    jobs = []
+    for i in range(n):
+        x0 = int(bar["x"] + i * bar["pitch"])
+        y0 = int(bar["y"])
+        crop = rgb[max(0, y0 + int(2 * s)):min(H, y0 + int(bar["h"]) - int(2 * s)), max(0, x0 + int(2 * s)):min(W, x0 + int(bar["w"]) - int(2 * s))]
+        jobs.append(crop)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        texts = list(ex.map(lambda c: ocr_slot_text(exe, c) if c.size else "", jobs))
+    names = known_move_names()
+    out = []
+    for i, tx in enumerate(texts):
+        nm, clean = match_move_name(tx, names)
+        out.append((HOTBAR_KEYS[i], clean, nm))
+    return out
 
 
 def bar_from_clicks(p1, p2, n=12):
@@ -4888,6 +5133,21 @@ def find_rails(mask, min_len):
                 if best is None or a[3] - a[2] > best[0]:
                     best = (a[3] - a[2], a, b)
     return (best[1], best[2]) if best else None
+
+
+def save_failed_grab(rgbs, what):
+    """A look that found nothing (mana bar / hotbar): the grabbed screen is saved next to the config so it can be sent for a look. Returns the text for
+    the message ('' when nothing could be saved)."""
+    try:
+        d = os.path.dirname(os.path.abspath(CONFIG_FILE))
+        names = []
+        for i, a in enumerate(rgbs[:3]):
+            fn = os.path.join(d, f"{what}_grab_{i + 1}.png")
+            Image.fromarray(np.asarray(a)[..., :3].astype(np.uint8)).save(fn)
+            names.append(f"{os.path.basename(fn)} ({a.shape[1]}x{a.shape[0]})")
+        return " The picture the tool saw was saved as " + ", ".join(names) + " next to the config - send it to the developer." if names else ""
+    except Exception:
+        return ""
 
 
 def find_mana_bar(rgb):
@@ -8979,6 +9239,13 @@ def hp_fill_fraction(rgb):
     """rgb = a wide grab of the screen's lower middle (HP_FILL_AREA). How full the HP bar is (0.0 - 1.0): the red part of the bar
     against the bar's empty (dark purple-grey) part, found by colour in the long horizontal strip they make together.
     None when no bar is found (the grass, menus ...)."""
+    r_ = hp_strip(rgb)
+    return None if r_ is None else r_[0]
+
+
+def hp_strip(rgb):
+    """The same look as hp_fill_fraction, with where the bar is: (fill fraction, left x, right x, top y, bottom y) of the strip inside the
+    grab, or None."""
     a = np.asarray(rgb)[..., :3]
     H, W = a.shape[:2]
     if H < 8 or W < 80:
@@ -9028,7 +9295,55 @@ def hp_fill_fraction(rgb):
     if not (edge(range(y0 - 8, y0)) and edge(range(y1 + 1, y1 + 9))):
         return None
     fr = sorted(c[2] for c in best)
-    return fr[len(fr) // 2]
+    return fr[len(fr) // 2], lo, hi, y0, y1
+
+
+def find_game_coins(rgb, strip, s=1.0):
+    """The game's three small round icons (Fist M2, Dash, PB) that sit to the right of the HP bar, found by their dark brown ring.
+    rgb = the grab hp_strip was made on, strip = hp_strip's result. Returns [(x, y, w, h) x3] left to right in the grab's pixels, or None."""
+    a = np.asarray(rgb)[..., :3].astype(np.int16)
+    H, W = a.shape[:2]
+    fr, lo, hi, y0, y1 = strip
+    xa, xb = int(hi + 10 * s), min(W, int(hi + 460 * s))
+    ya, yb = max(0, int(y0 - 95 * s)), min(H, int(y0 + 15 * s))
+    if xb - xa < 60 or yb - ya < 8:
+        return None
+    sub = a[ya:yb, xa:xb]
+    r, g, b = sub[..., 0], sub[..., 1], sub[..., 2]
+    ring = (r <= 150) & (g <= 95) & (b <= 60) & (r - g >= 18) & (g - b >= 12)
+    col = ring.sum(axis=0) >= 2
+    groups, st = [], None
+    for x in range(len(col) + 1):
+        on = x < len(col) and col[x]
+        if on and st is None:
+            st = x
+        elif not on and st is not None:
+            groups.append([st, x - 1])
+            st = None
+    merged = []                                                    # (gaps of a few pixels inside one icon don't split it)
+    for g0 in groups:
+        if merged and g0[0] - merged[-1][1] <= 3 * s:
+            merged[-1][1] = g0[1]
+        else:
+            merged.append(g0)
+    cand = [g0 for g0 in merged if 12 * s <= g0[1] - g0[0] + 1 <= 34 * s]
+    for i in range(len(cand) - 2):
+        c3 = cand[i:i + 3]
+        w3 = [c[1] - c[0] + 1 for c in c3]
+        if max(w3) - min(w3) > 4 * s:
+            continue
+        d1, d2 = c3[1][0] - c3[0][0], c3[2][0] - c3[1][0]
+        if not (w3[0] * 1.2 <= d1 <= w3[0] * 4 and abs(d1 - d2) <= 0.25 * max(d1, d2)):
+            continue
+        out = []
+        for c in c3:
+            rows = np.nonzero(ring[:, c[0]:c[1] + 1].sum(axis=1) >= 1)[0]
+            if not len(rows):
+                break
+            out.append((xa + c[0], ya + int(rows.min()), c[1] - c[0] + 1, int(rows.max() - rows.min() + 1)))
+        if len(out) == 3 and max(o[1] for o in out) - min(o[1] for o in out) <= 3 * s:
+            return out
+    return None
 
 
 ERROR_METER_AREA = (0.0, 0.03, 0.45, 0.18)   # where the Songs' Error Meter appears (top left; fractions of the screen) - looked at as a wide area
@@ -13099,6 +13414,10 @@ class App:
         row.pack(fill="x", padx=8, pady=(3, 1))
         PixBtn(row, "Click the slots", lambda: self.q.put(("area_manual",)), self.f, 130, 26).pack(side="left")
         self.label(row, "(2 clicks)", font=self.fs, fg=DIM).pack(side="left", padx=(6, 0))
+        row = tk.Frame(p, bg=PARCH)
+        row.pack(fill="x", padx=8, pady=(3, 1))
+        PixBtn(row, "Find moves", self.find_moves, self.f, 130, 26).pack(side="left")
+        self.label(row, "(reads the 12 names once, adds the new ones)", font=self.fs, fg=DIM).pack(side="left", padx=(6, 0))
         self.area_lbl = self.label(p, self.fmt_bar(self.cfg["bar"]), font=self.fs, justify="left",
                                    wraplength=PAGE_W - 40)
         self.area_lbl.pack(fill="x", padx=8, pady=(3, 2))
@@ -13397,6 +13716,12 @@ class App:
                     except Exception:
                         pass
                     self._basecd_rb = self.root.after(900, self.rebuild_moves)
+            if apply_spell_cd(m):                          # a Normal Spell: Telorum / Viribus 3 s, Percutiens 5 s, the rest 0
+                try:
+                    self.root.after_cancel(self._basecd_rb)
+                except Exception:
+                    pass
+                self._basecd_rb = self.root.after(900, self.rebuild_moves)
             if apply_base_cd(m):                           # a known move name: its blank cooldown boxes are filled (the rows are redrawn when typing stops)
                 try:
                     self.root.after_cancel(self._basecd_rb)
@@ -13454,6 +13779,7 @@ class App:
 
         def set_cd(v, m=mv):
             v = v.strip().replace(",", ".")
+            m.pop("fresh", None)                           # (somebody typed a cooldown: the 10 s placeholder is gone)
             try:
                 if v:
                     m["cd"] = max(0.0, float(v))
@@ -13705,8 +14031,8 @@ class App:
         free = next((k for k in HOTBAR_KEYS if k not in used), None)
         base = "New snap" if snap else ("New spell" if spell else "New move")
         d = ({"key": free or HOTBAR_KEYS[0], "name": base, "cd": 10.0, "unequip": False} if snap
-             else {"key": free or HOTBAR_KEYS[0], "name": base, "cd": 10.0, "cd2": 0.0, "split": False,
-                   "unequip": False, **({"spell": True} if spell else {})})
+             else {"key": free or HOTBAR_KEYS[0], "name": base, "cd": 0.0 if spell else 10.0, "cd2": 0.0, "split": False,
+                   "unequip": False, **({"spell": True} if spell else {"fresh": True})})        # (fresh: the 10 s is only a placeholder until somebody types a cooldown)
         if free is None:                                          # all 12 slots are taken: this one goes straight into the inventory (white key box)
             taken = {_norm_name(e["name"]) for e in inv_of(self.cfg)}
             n = 1
@@ -13930,11 +14256,13 @@ class App:
         self.root.update()
         time.sleep(0.25)
         found = None
+        seen = []
         try:
             with mss.mss() as s:
                 for mon in s.monitors[1:]:
                     shot = s.grab(mon)
                     rgb = np.asarray(Image.frombytes("RGB", shot.size, shot.rgb))
+                    seen.append(rgb)
                     r = find_mana_bar(rgb)
                     if r:
                         found = (mon, r)
@@ -13943,7 +14271,7 @@ class App:
             self._restore_root()
         if not found:
             self.say("Couldn't find the mana bar (is it on screen?). Use 'Move / resize' to place the "
-                     "picture by hand.", "Mana bar not found")
+                     "picture by hand." + save_failed_grab(seen, "mana"), "Mana bar not found")
             return
         mon, (gl, gr) = found
         shift = lambda r: (r[0] + mon["left"], r[1] + mon["left"], r[2] + mon["top"], r[3] + mon["top"])
@@ -15897,6 +16225,7 @@ class App:
         row = tk.Frame(p, bg=PARCH)
         row.pack(fill="x", padx=8, pady=(6, 4))
         PixBtn(row, "Reset positions", self.dash_reset_pos, self.f, 124, 24).pack(side="left")
+        PixBtn(row, "Find the game's icons", self.place_coins_on_game, self.f, 170, 24).pack(side="left", padx=(6, 0))
         box, p = self.panel(host, "Cooldowns (seconds) and keys")
         box.pack(fill="x", padx=6, pady=(0, 6))
         self.entry_row(p, "Dash cooldown", "dash_cd", float, w=56, h=22)
@@ -16090,6 +16419,47 @@ class App:
         """Where 'DODGES: x' is on the screen now: the 1920x1080 spot moved / scaled with the hotbar."""
         x, y, w, h = DODGE_REGION_1080
         return ref_point(bar_anchor(self.cfg["bar"]), x, y, w, h)
+
+    def place_coins_on_game(self):
+        """Finds the game's own three small icons next to the HP bar (any resolution / UI size) and puts the Fist / Dash / PB coins on them. The
+        other coins that sit by them (the blue mana dash, the Double Jump) move by the same amount."""
+        try:
+            rect = game_window_rect(str(self.cfg["settings"].get("game_title", "Roblox")))
+            if rect is not None:
+                mon = dict(left=rect[0], top=rect[1], width=rect[2], height=rect[3])
+            else:
+                with mss.mss() as sct0:
+                    mon = dict(sct0.monitors[1])
+            us = ui_scale(self.cfg["bar"])
+            gx, gy, gw, gh = hp_fill_box(mon["width"], mon["height"], us)
+            wide = self._grab_rgb({"left": mon["left"] + gx, "top": mon["top"] + gy, "width": gw, "height": gh})
+            strip = hp_strip(wide)
+            found = find_game_coins(wide, strip, us) if strip else None
+        except Exception:
+            found = None
+            strip = None
+        if not found:
+            self.say("Couldn't find the game's three small icons next to the health bar (is the game in front with its health bar showing? "
+                     "'Find hotbar' (F2) first sets the size). Use 'Move / resize' to place the coins by hand.", "Icons not found")
+            return
+        old = {k: dict(self.cfg["dashpos"][k]) for k in ("fist", "dash", "pb", "mana", "jump")}
+        for k, (x, y, w, h) in zip(("fist", "dash", "pb"), found):
+            it = self.cfg["dashpos"][k]
+            it["x"], it["y"], it["w"], it["h"] = round(mon["left"] + gx + x - 1, 1), round(mon["top"] + gy + y - 1, 1), w + 2.0, h + 2.0
+        f = self.cfg["dashpos"]["fist"]
+        dx, dy = f["x"] - old["fist"]["x"], f["y"] - old["fist"]["y"]
+        kk = f["w"] / old["fist"]["w"] if old["fist"]["w"] else 1.0
+        for k in ("mana", "jump"):
+            it = self.cfg["dashpos"][k]
+            it["x"] = round(old["fist"]["x"] + dx + (old[k]["x"] - old["fist"]["x"]) * kk, 1)
+            it["y"] = round(old["fist"]["y"] + dy + (old[k]["y"] - old["fist"]["y"]) * kk, 1)
+            it["w"], it["h"] = round(old[k]["w"] * kk, 1), round(old[k]["h"] * kk, 1)
+        self.cfg["dash_anchor"] = self.anchor_now()              # (placed against the hotbar as it is now: they don't move again)
+        save_cfg(self.cfg)
+        self.dash_fill_entries()
+        if self.mana_edit is not None and self.is_dash_item(self._edit_item):
+            self._edit_render()
+        self.say("The Fist / Dash / PB coins now sit on the game's icons.", "Coins placed")
 
     def dash_reset_pos(self):
         new = default_dashpos(*screen_size(self.root))
@@ -20353,7 +20723,7 @@ class App:
         if now - t0 >= 2.0:
             r = (self.slot_scans - n0) / max(0.1, now - t0) if t0 else 0.0
             self._slot_rate = (now, self.slot_scans, r)
-        return f"{self.fmt_bar(self.cfg['bar'])}\nSlots seen on the screen: {seen}  ({r:.0f} looks/s, last {now - self.slot_t:.1f}s ago)"
+        return f"{self.fmt_bar(self.cfg['bar'])}\nSlots seen on the screen: {seen}  ({r:.0f} looks/s, " + (f"last {now - self.slot_t:.1f}s ago)" if self.slot_t else "no look yet)")
 
     def hotbar_watchdog(self, now):
         """The hotbar watcher normally looks ~15 times a second. If it hasn't finished a look for 2 s (a screen grab that hangs
@@ -20507,6 +20877,118 @@ class App:
             except Exception:
                 pass
 
+    TESS_HELP = ("'Find moves' reads the names with Tesseract (a free program, nothing is running until you click the button). It isn't installed: "
+                 "Windows - install the UB Mannheim build from github.com/UB-Mannheim/tesseract/wiki (default folder); Arch - sudo pacman -S tesseract "
+                 "tesseract-data-eng; Mac - brew install tesseract. Then click Find moves again.")
+
+    def find_moves(self):
+        """ONE look at the hotbar: the tool's windows are hidden, the screen is grabbed, Tesseract reads the 12 names (a few seconds), the moves that
+        aren't in the profile yet are added on their keys. Nothing runs before or after - it only works when this button is clicked."""
+        if self.selecting or getattr(self, "_fm_busy", False):
+            return
+        exe = find_tesseract()
+        if not exe:
+            self.say(self.TESS_HELP, "Tesseract needed")
+            return
+        self._fm_busy = True
+        self._prev_fg = None
+        if IS_WIN:
+            try:
+                if self.game_focused() and str(self.cfg["settings"]["game_title"]).strip():
+                    self._prev_fg = u32.GetForegroundWindow()
+            except Exception:
+                pass
+        self.selecting = True
+        self.ov.hide()
+        self._sig = None
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.25)
+        shots = []
+        try:
+            with mss.mss() as s:
+                for mon in s.monitors[1:]:
+                    shot = s.grab(mon)
+                    shots.append(np.asarray(Image.frombytes("RGB", shot.size, shot.rgb)))
+        except Exception as ex:
+            shots = []
+            dbg_err = f"{type(ex).__name__}: {ex}"
+        self._restore_root()
+        self.give_focus_back()
+        found = None
+        for rgb in shots:
+            bar = detect_hotbar(rgb)
+            if bar:
+                found = (rgb, bar)
+                break
+        if not found:
+            self._fm_busy = False
+            self.say("Couldn't see the hotbar - show the game with its 12 slots (not covered) and click Find moves again.", "Hotbar not seen")
+            return
+        self.say("Reading the hotbar ...", "Reading")
+
+        def work(rgb=found[0], bar=found[1]):
+            try:
+                res = read_hotbar_names(exe, rgb, bar)
+                err = None
+            except Exception as ex:
+                res, err = None, f"{type(ex).__name__}: {ex}"
+            try:
+                self.root.after(0, lambda: self._found_moves(res, err))
+            except Exception:
+                self._fm_busy = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _found_moves(self, res, err):
+        self._fm_busy = False
+        if err or res is None:
+            self.say(f"Tesseract couldn't read the hotbar ({err}). Is its English data installed (tesseract-data-eng / eng.traineddata)?", "Read failed")
+            return
+        lst = self.moves()
+        have = {_norm_name(m.get("name")) for m in lst}
+        used = {m["key"] for m in lst if not m.get("ininv")}
+        added, same, clash, odd = [], [], [], []
+        for key, text, name in res:
+            if not text and not name:
+                continue                                                           # (an empty slot)
+            if name is None and (len(text.replace(" ", "")) < 3 or not text):
+                odd.append(f"{key}: '{text}'")
+                continue
+            disp = " ".join(w[:1].upper() + w[1:] for w in (name or text).split())
+            n = _norm_name(disp)
+            if n in have:
+                same.append(disp)
+                continue
+            if key in used:
+                clash.append(f"{disp} (key {key} is {next((m['name'] for m in lst if m['key'] == key and not m.get('ininv')), '?')})")
+                continue
+            spell = bool(name and name in SPELL_MARKS)
+            d = {"key": key, "name": disp, "cd": 0.0 if spell else 10.0, "cd2": 0.0, "split": False, "unequip": False, **({"spell": True} if spell else {"fresh": True})}
+            apply_spell_cd(d)
+            apply_base_cd(d)
+            apply_name_rules(d)
+            lst.append(d)
+            have.add(n)
+            used.add(key)
+            added.append(disp if name else f"{disp} (not a name I know - check it)")
+        lst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"])))
+        save_cfg(self.cfg)
+        self.rebuild_moves()
+        try:
+            self.auto_marks_sync()
+            self.soul_rebuild_later(False)
+            self.refresh_charged()
+        except Exception:
+            pass
+        bits = [f"Added {len(added)}: " + ", ".join(added) if added else "Nothing new to add"]
+        if same:
+            bits.append(f"already there: {len(same)}")
+        if clash:
+            bits.append("key already used, left alone: " + ", ".join(clash))
+        if odd:
+            bits.append("couldn't read: " + ", ".join(odd))
+        self.say("Find moves - " + "; ".join(bits) + ".", f"{len(added)} moves added")
+
     def pick_area(self, manual=False):
         if self.selecting:
             return
@@ -20537,6 +21019,10 @@ class App:
                     self._restore_root()
                     self.set_bar(bar, "Hotbar found")
                     return
+        if not manual:
+            sv_ = save_failed_grab([s_[2] for s_ in shots], "hotbar").strip()
+            if sv_:
+                self.say(sv_, None)
         mon, shot, _ = shots[0]
         if IS_WIN and len(shots) > 1:                            # the monitor the mouse is on
             cx, cy = cursor_pos()
