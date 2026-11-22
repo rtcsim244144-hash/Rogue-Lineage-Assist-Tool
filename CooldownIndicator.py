@@ -97,7 +97,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -4863,6 +4863,8 @@ def match_move_name(text, names=None):
 def find_tesseract():
     """The tesseract program: RLAT_TESSERACT, the PATH, the usual install folders. None when it isn't installed."""
     cands = [os.environ.get("RLAT_TESSERACT") or ""]
+    for base in (RES_DIR, APP_DIR):                                                  # (the exe carries its own copy: a "tesseract" folder packed inside / next to it)
+        cands += [os.path.join(base, "tesseract", "tesseract.exe"), os.path.join(base, "tesseract", "tesseract")]
     w = shutil.which("tesseract")
     if w:
         cands.append(w)
@@ -4894,6 +4896,9 @@ def ocr_slot_text(exe, slot_rgb, timeout=25):
     kw = {"capture_output": True, "text": True, "timeout": timeout}
     if IS_WIN:
         kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    td = os.path.join(os.path.dirname(os.path.abspath(exe)), "tessdata")
+    if os.path.isdir(td):
+        kw["env"] = dict(os.environ, TESSDATA_PREFIX=td)                             # (a bundled copy brings its own language data)
     fd, tmp = tempfile.mkstemp(suffix=".png")
     os.close(fd)
     try:
@@ -11585,7 +11590,7 @@ class RunBlock:
         needed = self.TAP if self.wIsSecond else self.FIRST
         if self.trick:
             self.update()
-        elif (self.aDown or self.dDown or self.sDown) and self.clock() - self.wPressTime >= needed:
+        elif (self.aDown or self.dDown or self.sDown) and not self.fDown and self.clock() - self.wPressTime >= needed:      # (F held and no run yet: no directional run)
             self.enter_trick()
             if self.trick:
                 self.walkEntered = 0 if self.wIsSecond else 1
@@ -11602,6 +11607,8 @@ class RunBlock:
         self.lastS = now
         if self.trick:
             self.update()
+        elif self.fDown:
+            self.send("s", False)                                  # (F is held and you are not running: a plain S, no directional run)
         elif self.wDown:
             self.enter_trick()
         elif dbl:
@@ -11627,7 +11634,7 @@ class RunBlock:
         self.lastA = now
         if self.trick:
             self.update()
-        elif dbl and not self.wDown:
+        elif dbl and not self.wDown and not self.fDown:            # (F held and no run yet: no directional run)
             self.lastA = -10000.0
             self.start_run()
 
@@ -11645,7 +11652,7 @@ class RunBlock:
         self.lastD = now
         if self.trick:
             self.update()
-        elif dbl and not self.wDown:
+        elif dbl and not self.wDown and not self.fDown:            # (F held and no run yet: no directional run)
             self.lastD = -10000.0
             self.start_run()
 
@@ -16639,7 +16646,7 @@ class App:
         self._mana_seen_now = True
         v = self.read_mana_pct()
         try:
-            if self.gate_open or getattr(self.tracker, "gate", None) is not None or self.tracker.holding_spell(now):
+            if self.drain_exempt(now):
                 self.slow_drain.reset()                      # (the gate shortcut is up / a Gate waits for its name: casting it drains the mana too; a spell in hand can drain it slowly: no drain is looked for)
             else:
                 self.slow_drain.feed(now, v)
@@ -16668,6 +16675,16 @@ class App:
                 self.mana_absent = True
         hide_ = self.mana_hidden(now)
         self.mana_pct = None if (v is None or not S.get("mana_pct_on") or hide_) else (now, v)
+
+    def drain_exempt(self, now):
+        """True while a slow mana drain is NOT a climb: the gate shortcut / a Gate waiting, a spell in hand, or F held down by you (a spell in hand + F = a Mana Shield, which
+        drains the mana slowly for as long as F is held - also after you switch to a weapon; looking for a drain then paused Block Run and let your F go)."""
+        if self.gate_open or getattr(self.tracker, "gate", None) is not None or self.tracker.holding_spell(now):
+            return True
+        try:
+            return bool(getattr(self.inputs, "_phys", {}).get(0x46))
+        except Exception:
+            return False
 
     def _climb_notify(self, now, v):
         """The status line says when a climb / a slow mana drain starts and ends."""
@@ -20878,7 +20895,7 @@ class App:
                 pass
 
     TESS_HELP = ("'Find moves' reads the names with Tesseract (a free program, nothing is running until you click the button). It isn't installed: "
-                 "Windows - install the UB Mannheim build from github.com/UB-Mannheim/tesseract/wiki (default folder); Arch - sudo pacman -S tesseract "
+                 "Windows (the .exe has it built in - a copy that does not: install the UB Mannheim build from github.com/UB-Mannheim/tesseract/wiki, default folder); Arch - sudo pacman -S tesseract "
                  "tesseract-data-eng; Mac - brew install tesseract. Then click Find moves again.")
 
     def find_moves(self):
