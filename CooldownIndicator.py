@@ -97,7 +97,7 @@ CONFIG_FILE = os.path.join(APP_DIR, "cooldown_indicator_config.json")
 # Put your link here once (a folder URL ending in "/") - for GitHub: https://raw.githubusercontent.com/NAME/REPO/main/
 # In that folder you publish: version.txt, CooldownIndicator.py (and Rogue.Lineage.Assist.Tool.exe for the exe users).
 # Leave it empty to switch the update button off. (Users can also type a link in Settings.)
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.7"
 UPDATE_BASE_URL = "https://raw.githubusercontent.com/rtcsim244144-hash/Rogue-Lineage-Assist-Tool/main/"
 
 # ======================= SETTINGS =======================
@@ -111,6 +111,53 @@ VK_LBUTTON, VK_RBUTTON = 0x01, 0x02
 # on a Turkish (and other non-US) layout the key at that place is not "-" / "=" (a Turkish keyboard has "?" there), so its virtual key differs.
 SCAN_HOTBAR = {0x0C: "-", 0x0D: "="}
 SCAN_HOTBAR_US = dict(SCAN_HOTBAR)
+# Roblox reads EVERY key by its PLACE on a US QWERTY keyboard (Roblox docs: "KeyCode keyboard values refer to the physical position of buttons on a standard
+# QWERTY keyboard"): on AZERTY the key that types W is the US-Z place, on QWERTZ Y / Z swap, on a Finnish board the "-" key is the US "/" place, and so on.
+# So the tool reads and sends the letter keys by place too (KEYS_BY_PLACE): the letter keys' scan codes on every layout are the US ones.
+KEYS_BY_PLACE = True
+US_SCAN_VK = {}
+for _row, _first in (("QWERTYUIOP", 0x10), ("ASDFGHJKL", 0x1E), ("ZXCVBNM", 0x2C)):
+    for _i, _ch in enumerate(_row):
+        US_SCAN_VK[_first + _i] = ord(_ch)
+for _i in range(10):
+    US_SCAN_VK[0x02 + _i] = 0x31 + _i if _i < 9 else 0x30      # (the digit row's places)
+for _sc, _vk in ((0x0C, 0xBD), (0x0D, 0xBB), (0x1A, 0xDB), (0x1B, 0xDD), (0x27, 0xBA), (0x28, 0xDE), (0x29, 0xC0),
+                 (0x2B, 0xDC), (0x33, 0xBC), (0x34, 0xBE), (0x35, 0xBF)):
+    US_SCAN_VK[_sc] = _vk                                    # (the punctuation places: - = [ ] ; ' ` \ , . /  as on a US keyboard, whatever these keys type on this layout)
+US_VK_SCAN = {vk: sc for sc, vk in US_SCAN_VK.items()}
+for _i in range(9):
+    US_VK_SCAN[0x31 + _i] = 0x02 + _i                       # (digits: the top row's places)
+US_VK_SCAN.update({0x30: 0x0B, 0x0D: 0x1C, 0x20: 0x39, 0xA0: 0x2A})     # 0, Enter, Space, left Shift
+
+
+def scan_for_vk(vk, map_virtual_key=None):
+    """The scan code to send with a virtual key: the US place of that key (what Roblox reads), else whatever this layout says."""
+    if KEYS_BY_PLACE and int(vk) in US_VK_SCAN:
+        return US_VK_SCAN[int(vk)]
+    return map_virtual_key(int(vk), 0) if map_virtual_key else 0
+
+
+def place_info(info):
+    """A copy of a keyboard hook event whose virtual key is the US-QWERTY key of its PLACE (letters only), so every feature that reads W / S / F / G / Q ...
+    sees the keys Roblox sees. A US keyboard is unchanged. Events with no scan code (injected by virtual key) and extended keys are left alone."""
+    if KEYS_BY_PLACE and not (info.flags & 1):
+        vk = US_SCAN_VK.get(int(info.scanCode))
+        if vk is not None and vk != info.vkCode:
+            c = KBDLLHOOKSTRUCT.from_buffer_copy(info)
+            c.vkCode = vk
+            return c
+    return info
+
+
+def is_slash_key(info):
+    """The key that opens the Roblox chat: the "/" PLACE (US: "/", German: the "-" key, Finnish: the "-" key), the numpad "/", or a "/" sent by virtual key
+    only. Not the key whose virtual key is "/" on this layout (German: the "#" key is VK_OEM_2 but only types #)."""
+    if not KEYS_BY_PLACE:
+        return info.vkCode in (0xBF, 0x6F) or info.scanCode == 0x35
+    return info.scanCode == 0x35 or info.vkCode == 0x6F or (info.vkCode == 0xBF and not info.scanCode)
+
+
+HOTBAR_BY_PLACE = True      # slots "-" / "=" = the two keys right of 0 on every layout (what Roblox does). False = follow what the keys type (old behaviour)
 
 
 def is_ahk_extra(extra):
@@ -126,6 +173,8 @@ def hotbar_layout_for(vk_of_scan):
     The game's slots "-" and "=" follow what the keys TYPE, so the keys are found by that: the place whose virtual key is VK_OEM_MINUS (0xBD) is the "-"
     slot and the place with VK_OEM_PLUS (0xBB) the "=" slot (US: the two right of 0; Finnish / Swedish / Norwegian / Danish: "+" right of 0 and "-" right of ".";
     Turkish: "-" at the second place, and so on). A layout that has no such key keeps the usual place (0x0C / 0x0D) for what is missing."""
+    if HOTBAR_BY_PLACE:                                      # Roblox reads the hotbar by PLACE: on a Finnish keyboard the real "-" key (US "/" place) only opens the chat
+        return {0x0C: "-", 0x0D: "="}
     found = {}
     try:
         for sc in range(0x02, 0x36):                         # (the main block of the keyboard; the numpad has other scan codes and virtual keys)
@@ -194,6 +243,7 @@ DEFAULT_SETTINGS = {
     "mana_dash_cd": 5.2,     # every blue coin
     "dj_cd": 4.1,            # Whisperer's Double Jump cooldown
     "dj_window": 0.5,        # two Space presses this close together = a double jump
+    "ens_dj_cd": 2.1,        # Enshroud gives a Double Jump while the Shrouded buff lasts: its cooldown
     "soul_dur": 25.0,        # Soul Berserk (Wraith Knight): how long the buff lasts
     "soul_cd": 35.0,         # ...and its cooldown, which starts when the buff ends
     "awk_dur": 25.5,         # Dzin's Awakened: how long it lasts
@@ -206,6 +256,7 @@ DEFAULT_SETTINGS = {
     "hyper_dur": 90.0, "hyper_cd": 30.0,        # Hyper Body
     "vind_dur": 5.0, "vind_cd": 10.0,            # Tempest Soul (Vind Soul)
     "flock_dur": 2.0, "flock_cd": 25.0,          # Flock (Flocked)
+    "ens_dur": 15.0, "ens_cd": 45.0,             # Enshroud (the Shrouded buff, then the cooldown)
     "psurge_dur": 2.5, "psurge_cd": 15.0,        # Power Surge
     "stand_dur": 30.0, "stand_cd": 6000.0,       # Bloodline (Last Stand, then a 5 s Red Veil debuff; the cooldown starts after it)
     "pto_dur": 60.0, "pto_cd": 6000.0,           # Galvanize (Potions Timeout: starts 1.8 s after the click)
@@ -227,6 +278,8 @@ DEFAULT_SETTINGS = {
     "whatsnew_cache": {},     # the last "What's New?" text read from GitHub: {"v": version, "lines": [...]} (used when GitHub can not be reached)
     "weaponcd_done": False,  # the one-time fix of weapons that kept the 10 s placeholder as their main cooldown was done
     "chargecd_done": False,   # the one-time fill of the Charged Blow / Dark Charged Blow / Azure cooldown boxes (hardcoded numbers) was done
+    "g_hold_no_cd": True,        # a normal move used while you hold G does not go on cooldown
+    "green_names_done": False,   # the one-time green name boxes of MOVE_UNEQUIP moves was done
     "spellcd_done": False,   # the one-time fix of the Normal Spells' cooldowns (hardcoded: 0, Telorum / Viribus 3, Percutiens 5) was done
     "basecd_done": False,    # the one-time fill of the known moves' base cooldowns was done
     "seen_update": "",       # the newest version whose "Update Available" window was shown
@@ -235,6 +288,9 @@ DEFAULT_SETTINGS = {
     "cast_run_lock": 1.0,    # seconds after a Cast Run in which clicks on the same spell are dismissed (0 = no lock)
     "ahk_chat_suspend": True,   # while the Roblox chat is typed in, your own AutoHotkey scripts are paused (File > Suspend Hotkeys)
     "grab_layered": False,   # hidden: true = the screen grab also copies layered windows (CAPTUREBLT): can make the mouse cursor / screen blink for a frame
+    "update_auto_restart": True,   # after an update is installed the program starts the new version by itself
+    "r_right_click": True,      # the R key triggers the right-click features (Viribus, Gate, snap Ignis ...) as its own key (not when R is bound to another key in Keybinds)
+    "gate_need_prompt": True,   # Gate: the boxes / shortcuts / keybinds only work while the game's "Gate - Type the name of a gate" prompt is on the screen
     "gate_mode": "popup",    # Gate (Extras): "popup" = the boxes come up on a right click with a Gate spell, "off", "shortcut" = type d / f / df / c / t / s and a number (the Gate keybinds work in every mode)
     "gate_cd": 6.5,          # Snap Gate: the cooldown (seconds) that starts when Enter is pressed
     "vir_key": "m2",         # Viribus (a Normal Spell with the blue name box): this key / mouse button casts it (left click), waits, then holds F ("m2" = right click)
@@ -255,8 +311,8 @@ DEFAULT_SETTINGS = {
     "always_show": False,    # never hide the cooldown boxes / coins just because the game's HP bar isn't recognised (menus / loading included)
     "inv_equip": True,       # clicking a known item (Fire Protection, ...) in the inventory = equipping it
     "potion_cd": 6.0,             # every potion: this long a cooldown for ALL potions, from the moment a drink is finished
-    "potion_keys": {"Feather Feet": {"id": 0x15, "label": "Y"}, "Fire Protection": {"id": 0x16, "label": "U"},
-                    "Health Potion": {"id": 0x23, "label": "H"}},            # a key per potion: potion name -> {"id", "label"} (opens the inventory, drinks it, closes the inventory again)
+    "potion_keys": {},            # a key per potion (nothing is bound by default): potion name -> {"id", "label"} (opens the inventory, drinks it, closes the inventory again)
+    "potion_keys_v2": False,      # (set once: the old default keys Y / U / H are taken out of every saved config; a key you bind yourself stays)
     "kb_accept_injected": True,   # keybinds also take keys that another program sends (mouse software of a 12-button mouse: Razer Synapse, Logitech G Hub...)
     "kb_inj_v2": False,           # (set once: the option above became ON by default - an older saved "off" is switched on one time)
     "inv_keys": {},               # a key per inventory item (nothing is bound by default): item name -> {"id", "label"} (opens the inventory, equips the item, closes it)
@@ -450,6 +506,7 @@ BMOVES = {"agility": ("Agility", "agi_dur", "agi_cd", "Agility Duration"),
           "tempest": ("Tempest Soul", "vind_dur", "vind_cd", "Vind Soul Duration"),
           "flock": ("Flock", "flock_dur", "flock_cd", "Flocked Duration"),
           "powersurge": ("Power Surge", "psurge_dur", "psurge_cd", "Power Surge Duration"),
+          "enshroud": ("Enshroud", "ens_dur", "ens_cd", "Shrouded Duration"),
           "bloodline": ("Bloodline", "stand_dur", "stand_cd", "Last Stand Duration"),
           "galvanize": ("Galvanize", "pto_dur", "pto_cd", "Potions Timeout Duration"),
           "silverguard": ("Silverguard", None, None, ""),          # these two last until they are turned off (no duration / cooldown)
@@ -566,6 +623,7 @@ SPELL_MARKS = {
     "percutiens": ((60, 70), (70, 80)),
     "hoppa": ((30, 60), (50, 60)),
     "inferi": ((1, 30), None),
+    "fulmineus": ((30, 40), None),                 # (new spell: 30-40 % to cast; no snap range known yet)
 }
 SPELL_ALIAS = {}                               # (exact names only: a partly typed name must not match something else)
 
@@ -688,6 +746,8 @@ BASE_CDS = {
     'spin kick': (10.5, 0, False),
     'subzero strike': (15.5, 0, False),
     'swallow reversal': (15, 15, False),
+    'sanguinity': (18.5, 0, False),
+    'telekinetic weapon': (10.5, 15, True),           # (the M2 box is green: M1 and M2 don't share)
     'sweet soothing': (10, 0, False),
     'sword': (0, 3, False),
     'symphony of horses': (10, 0, False),
@@ -715,6 +775,9 @@ def snap_fixed_cd(name, gate_cd=None):
     if any(w and w in n for w in GATE_SNAPS):
         return float(gate_cd) if gate_cd and gate_cd > 0 else GATE_CD
     return None
+
+
+MOVE_UNEQUIP = ("enshroud", "demon flip", "spin kick", "leg breaker", "rising dragon", "lightning elbow", "lightning drop", "monastic stance")                    # moves whose name box starts green (unequips after use); turned on once, you can switch it off again
 
 
 def base_cd_for(name):
@@ -756,6 +819,9 @@ def apply_base_cd(m):
     def vals():
         return (round(float(m.get("cd") or 0.0), 4), round(float(m.get("cd2") or 0.0), 4), bool(m.get("split")))
     changed = False
+    if _norm_name(m.get("name")) in MOVE_UNEQUIP and not m.get("unequip") and not m.get("unequip_set"):
+        m["unequip"] = m["unequip_set"] = True                  # (the green name box of a move that is put away after use)
+        changed = True
     rec = m.pop("basecd", None)
     if rec and vals() == tuple(rec["now"]):
         m["cd"], m["cd2"], m["split"] = rec["prev"][0], rec["prev"][1], bool(rec["prev"][2])
@@ -782,7 +848,7 @@ def apply_base_cd(m):
 
 # NORMAL spells (left click) have no cooldown of their own except these (a snap spell with the same name has another one: they are never touched here).
 # Snarvindur stays as it is (its box is 0: the snap spells' "Snarvindur seconds" setting does the work).
-NORMAL_SPELL_CDS = {"telorum": 3.0, "viribus": 3.0, "percutiens": 5.0}
+NORMAL_SPELL_CDS = {"telorum": 3.0, "viribus": 3.0, "percutiens": 5.0, "fulmineus": 3.0}
 
 
 def normal_spell_cd(name):
@@ -1496,10 +1562,10 @@ AWK_COINS = 10             # Dzin: the dodge coins
 AWK_GONE = 1.2             # seconds the 'Dodges:' text must be missing before Awakened counts as over
 MANA_COINS = 5              # the blue coins (Dragon Sage / Faceless mana dashes)
 DASH_CD_DEFAULT = {"dash_cd": 1.5, "pb_cd": 3.0, "fist_cd": 2.8, "mana_dash_cd": 5.2, "mana_dash_timeout": 0.2,
-                   "dj_cd": 4.1, "dj_window": 0.5, "soul_dur": 25.0, "soul_cd": 35.0, "awk_dur": 25.5, "awk_cd": 60.0, "fisch_cd": 60.0,
+                   "dj_cd": 4.1, "dj_window": 0.5, "ens_dj_cd": 2.1, "soul_dur": 25.0, "soul_cd": 35.0, "awk_dur": 25.5, "awk_cd": 60.0, "fisch_cd": 60.0,
                    "agi_dur": 10.0, "agi_cd": 30.0, "bane_dur": 10.0, "bane_dur_mana": 20.0, "bane_cd": 25.0,
                    "levi_dur": 35.0, "levi_cd": 40.0, "hyper_dur": 90.0, "hyper_cd": 30.0,
-                   "song_switch_cd": 3.0, "song_fail_cd": 10.0, "shard_cd": 15.0, "flood_dur": 30.0, "flood_cd": 6000.0, "vind_dur": 5.0, "vind_cd": 10.0, "flock_dur": 2.0, "flock_cd": 25.0, "psurge_dur": 2.5, "psurge_cd": 15.0,
+                   "song_switch_cd": 3.0, "song_fail_cd": 10.0, "shard_cd": 15.0, "flood_dur": 30.0, "flood_cd": 6000.0, "vind_dur": 5.0, "vind_cd": 10.0, "flock_dur": 2.0, "flock_cd": 25.0, "ens_dur": 15.0, "ens_cd": 45.0, "psurge_dur": 2.5, "psurge_cd": 15.0,
                    "stand_dur": 30.0, "stand_cd": 6000.0, "pto_dur": 60.0, "pto_cd": 6000.0}
 # where the in-game coins are on a 1920x1080 screen (x, y, w, h): they are scaled to your screen on the first start
 DASH_POS_1080 = {"dash": (1101, 928, 18, 18), "pb": (1129, 928, 18, 18), "fist": (1072, 928, 18, 18), "mana": (1171, 954, 105, 21),
@@ -1559,7 +1625,10 @@ def coin_art(kind, ready, size):
     return _coin_cache[key]
 
 
-BUFF_PNG = {"fire": "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",
+BUFF_PNG = {"telekinesis": "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",
+"awakened": "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",
+"enshroud": "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",
+"fire": "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",
             "feather": "iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAXoklEQVR42u2d249kx33fP7+qOn36OpfdWYmWKHJJOZRoBVYcR+KKkmKuEUCCbfgCSHyIHD0kgJI4DwHiJ+dlyT+A8Ev8kIvz4DgGQgkBcyFgBTFmbTP0ShYdxbJImAqpIbmMyJ1rT09fT1X98lDn9PTMzqx2uTN74U4Rxe6ZOdt9un71u31/3181nIyTcTJOxsk4GSfjZJyMk3Ey7rUhd+JNPfvss/bLXz4jXCx/8QR8/eur+uSTT4b91y4vL7sn9v/yien/fsy4iMh5f7INTjTgzhiqKiKia29dOjffnr9/Z6cXAdrtjunudC8vfeTcpeqadP2y23yz/YtiyEA1hCgQaJ/6MHmjDYRD3skqzgr4ApaeF5HbpgXuztoPFy3giTzlFha+0JKYbnJ+Aba73wS+CBetqgYR0fX1RrOWmec6C3Oo94gYNHqkswjMAf6QPablR+8C6/PA9qxg72EBVHopW6G76be3dzzAAuIQ2bpaY7xOCtnsbmx1fAgKRjR6OtIkbxUQw2FKrjgneN/D3fpFnx3mTjA71YSOqKoIWBFx5QZxIuIEbHUNkK4TJ1L+PV1XTXEkoR08waHV60v53szcxz2kAXvUXihQWH/zW7prKnZlJSJaXZOE92Kx0bcHvSYYA6oHa4AqiAFjgVNFeQ96z/kAVRWufL+1ZrYEIBuoKwbixdgMEURstaKIsdnqKy90sqY638qCqtf+aq0NQfaHFcWkIJohovFAAagq2AChEM8rC6urLzgRJ7rqdWnpNCy9M7xV4anczmjn3XeX23bUeDWzru1DUEREo6e1eF+j3p5zGtMaiHGMdrZ9f/OdoRhX7mxQVICWiAhAjEqzmfPf//ML/PX3V6g3asSoh90DWc3pV/7hL/Tr9UxjVFTwpxfn3dra1lfPPHTuOV1ednL+eAVxWzXAmExQWXDONhRNUYwo1lr2a4C11jlrO2Ls1FooEELgIA0YDoZAPFQAMSoxZuKcbTtniVHxPoCzGCPZPeQDKArv6ymKiaLRs+sIdc+OLbxXMXt/X+3+/T7AWIMx5nDTLooxBu+9Fl4qQXkK71RV7+ooSPVZq6pOdbmc6lSftYe6YTFSPYoxMnWU7E5VLSMm9sy0k2dnRASMGIyRw2f5d5CwdxKmNu5u1QCRJ8N1CysGNCoaPYgtHwWMKzevgBhcltFsNZg1QVeZlaC02nW8j/R3hihKDIeZoEjUnMWFOZc3axCVogiOziJmfTu/KwWg+qwVeTKsv/mt31yY75zb6G5HgFPzc2ar27t0+oHHnik1IQIsLZ1mXK9jbEb0BSKAGPxkyHiwXWa2kVq9xhuvXebF5ZfI6zX0ELsuAt5H7n/wDD/10w8RQtKGA6JQtcZIjDrc2u5+LR+5EVhA44IzJhZ6KYF6T4S7TAPOSGmv/56ZW/jiXOkgzdwCurXdBp6prkljibxp0m6PRYrJJGMy2Ga800WMSyaFnI0rq3zvf/9fWq38UMdqjNDfGfGJTz7EJ//Oxxn0R1QWbX8EVHOOwoei/cGf+f3rylHuJhNkjHRDt+t7/UGCEoxzxkj3ELsBRtKjCBhfxv0OMQZBkMoENXMazWsLQDVpwaA/YjgYHyoA7wIhBHnjjT9dfOB136PTEXo9LaHscKtwIXc8TriEEkobLoJTxenysmMFx/pLosvL2u0O3HyrMZOSpMxVtXSmSLLVpXNVpXLGe7PeA0zR7CwXXcWYUL6TihERFd9siJfz5/37CoyLGkADGuOu0dU4LpOa2cRmU8O6ggMTSxNkqOU1TMzBWGKMNFs5WeYoJgFf2xvbe+/3aMCgPwKEWq2GL2KpFUqWOannuas0wGaO7tb2ooreVkj+WARQb84jtTnypiYFyOrU6v7htZX/9SXnnFE1MYRAVsvq48F2JsZRZb0uy3jjtctsXFnDOUdMi8eVd9a57/45sportSAt+OLiKcQIaNrtRRGIWnD5rcv4IgBoljkRkctz8/OXoqoBjTWX4b0fDUIs3jcFGVV1IuI1bHwds/Al4oZPCKSBYoQON0qQUqe2eHNzqzQpydw023W+/nt/xF999wc0mnUUpRgH7vvIHH/zZ+9nMgnJZaiSOcdnHv8MLstQjWhUanmNP//2d7j81tvUajVCiH6+03JbW9t/8OV/9C+/cqch78eTCWtIliaGJGLjGA2HurPRDWLcvkzWuMqOCwYRS96o0Ww1aDRryWFmSpZlFBOPLxSRElDTwGAwxjk/9Q9FEaYmKMsyrFVcltFoNnLVZbeysuLOnj3rU8349teEzdHi+czg6TIzwRgju3j97tyFHGay3tLpzma3qoqI7HOwgkiCqdNjeq6qGmOa6XlUVKPIeb+ysuJFznsR8XdCQd4dLZ4vBaqoX9VDrr0qatkfxFShZLX4KSJKQpmNgKrnzjnJnJv+nDmHcxZnDc4ZfBEy5yxR4x1Z/XNHi+fPuWKw7UGz/XCBquK9Zz+YFoNSlU1iVIwRrBXqjRp5PUMVnA3U8hpZVgNSdqso1loN3vcF0UoAIkLwER8jxkdU8D4EJ8jO+0YAVcx85crFlh01Xq3ZetuHoEFGIg3DeDBo5G0HKf5HxLG5ucGlF/+MPG+gmhYxeOXl7/6I6BUk7f7hYMIXf+VxvvDLjzMaTjAmOed6u01n6UMQPaqo2EzUF/1JLB4ZDi/viDhR9TphHm0V2IkS5iawBnlzjvUshb/nzz/t3zcacBien7LPgzXAWr9HAONRQfDJsRojjIaTqQaoJshYY9IAl9UgmvTSNgNjNLMf2mq3zw65S4c7Xjz/MB+w60yNEdTsPt/vAyqnrFEpQ51StgoagfVMVUczqfQBEbZWvkfvNAGYIymrz+L5YuQapmt3DcuZFn0WuzdTIU0XUYTSyHtUy2x6+qhVUT1FQ7IvKkKPouheRnr7ahzL7rZrwIF4/gH1DBEhq1lcZqZZq4gyHIzxRUxVrBJK8EWBakCjR7FoLKjVMsGcchi/e+uuuwhebiF7w99RJuhqPD9ZAVerTykhqglU29ke8+r/uUKj1UxZq4J1ll/4tc/jnE0RDIIvCj766Meozy2RNT1AENOy6PASfv2Z5Gg0zFALB8cJHeuzz1p58smw9talc6cXFn5zbX0rImpqLqPwfjSQ+LUHHnh8+F7BvJvUgP14fmk2NO7TAmEy9qy9s0Ors5tk5Y2Mj//UQ+SNrLT3AtFTnz+DrbdwGiCi2NPA5usip75xy430mbLG4ePDtOe/NDcpsNZWYB7N3P8zYHj7oIg9eL6ZQsoHmSCXGVxmiDE5WecMw+GYqHEqAI0e1yyweUyvqQIUEEKuqg5WHJz1t5peLiJjelWNQ62zTkIIPVWvt8QElZGNJZH2U+bDmw4aex1miedXGWtMq10mSWYaCVVQQuV8p/+WslCuWtJ+pszlCBdZWTnL2ZWL5fJzK/oTnC4vsxpxCC7dE1ZSsdoNBprqHC+lGseNFnTcTTqhTS2u6H7eq7gcSTVWDBFo4bKMQX+IsXZPkeWgSCnvtCwsgglAcJABkpe7/dh3/L5GEA+w/sMXu6iiMZShsRCD1wcf+vzmsWpA5Vy0/9b9NO87h+/GFL4GcKaOJ2MGnxHjuPzaD9na6JIITxElY3tjlZ/59KMldFziNpmdxv1V1SrPcxltdS/VF8xlisJgTMBm4ovxW7r9ypc2tvtiNEYQ0Uix+MDO80dlhg7qT5CozquPNm+cI6uTtzoCirMOG0K28f++/etxEkfWlkX9+Y5Zf6d7aemRc5evxzFfjwYkzn5e/7vg/iOuvfefma2qnisaI2Jy/uSbL/DtP/0O7U4LUAb9EX/rU4/yD772S/R7Q4ytnLUyGk1mS4yhM9dxV3709lONxZ/85uxNvPODi7/8wZ/8+H/p+IBzFnGO3tY26+uNI+T3X92f4KyDGJBaA+qLdPI5u2tuY4P++n9IJA9JUHiitXwF+AMulq93JE5Y4xi8x2/7Pf8u0b33mKC8kdOea9NqNZMZso4sy+jvDBgMJjNQhVxdNFfF1RoLqupYWUmvffas7779Uk5v02/3+qUTtOJD7Gnm9Vj7E1ScxkDeCtLJ5y3BT6M9jYHNzW2vOu1D8KedcVHi+DiiIIFysa9a9L3NJxqVGGJp49PzCtfZdbpyTWkDgfV1KQUQvPeatFHLR0TA6vGUCav+BERwlAFD2jMzWXoKJtws6z2tjcgxhaHCfgYDMzvYJCrzHtihujHVWSjm2stmBF+ak6J6p7WVP1MyJyCZs4bMObyfHCOJVq9+bgyomQpAdP/nkRtGPG5AAInpEDUi7PZPFGM/g+dHxKVcwGUW65JwnBOsTeXGKhQ9VL4i+Kjt1Vde6GSFOoD5n1jyG8Nehg89BB9CtEIQRHdiLI5cCRK0Vd4rAsaiURkPh0hpbhQBDeVnsTO4lS1/PioBXEzB8Prbb3N6aYetje4UuRyPC37/3z3PZFQgRkpqoPKRh+f59M89TPBaXjfmwY9+iPqpB8nnhoiYw8IQh82ot4p/Pab3O6FlUVEfaup0EJ9npB92OnFFU/yEgqW4oHzgsf7RQRFPADD/gbMYN89CfTOZTtfkr//ye/ynf/u7NNvNFNnFSN6o8xu/9TVqjXya6+BOcfrDa+XLPXH0GqAaS7ZywulHwxHjUYEpBVAUEZjDZRYIGCO4sKsBSPl4CGUcEYwxDWctYixF8FjnEJFMzjzaSwX54+5bSBpgxBBRpNSA4WCIsabMY2LpEso+BhGEeMMaYN67Dyh5DMbsndYcCj3v9QGHTQghaOG9Ft4raBEKrxW5LcbvZPuIALfMB1Q9B7Nz7+e58ZKDucFE5ap50H2nXWF2p7mG3Z9d/N3Xi/s5+wplet/bg/vffPI1i+2vVBi//FiZHHT/6PE5YWstUnJtRMBYSW24B5bIJkzGQ4qSGjgZjSmKycGfy8w4MFL3YqfTtu3cgrH44J2dX4Tu9sLxgGx7smifaE1r4+vlrImxKTo3sYyeHbgjdMIXS0Tq5Ze/z/zcHN1uDwwYSZlf6kiRKeIZJmM+9olP8vCjHyUUY4wxxBhotjoQJzOakGoFg/V3UcrIQgmdTst2t7ae8ePBJSfOqBHfVmMwXC49WzgqyOHNN19sNNX8m8y5+sQXKc6MIRbjwbmsXgPUXsscqyo76+9Sa2QlbQY6nRG97a09AcyRaMA7V1YZ9Pts9/rTem7w+81QYjCc+eB93Hf/x4F+aeUkOfHgr6rVjgc9qkxSFe3ULWE0/J9LD332D4+bs99smsyN3a/PLcwRCo9IgsOTbZ+kHXVNj5/un5iVHCbo1A2Tne7xmKAsy6YmKPVhHXxzRVGgOiKWGnBNKrkxu61IZaYZVOZ1ebnqlPfXOq7m5jTBawiy2d3a7vjgd486sG2b1xpyfSbIIMam3Eg1RUHWHk9BpmIqVAKYfX4AZXD6mCpdUfcfX6KqFRmxUiCPgjEkzv7yMsfdp4viBHGoqAhSaWhVx4hRpzH+/sinfO6V9F+6f+VGAuXr1wBnpxWt6UKjeB8JRcXrqfIAAVKHC8Ym55Q1BBpu1lwZAovz3akJ8t47OvPo+sYta5LTGEtiQaroafTU8hpiW2A9Bk31DOfo9/qIEWKIhBiJMWd+ruPqzRox6Hu6/+sWwPqVHYqdyE5/MOV0alQWl1roVBMMjbZBKChGXUIxRBCt1TLxcXA5q40vJTClPIeGwNZWt3TChhg1LtUyI868DsDq6jGnXKfJmwGbWYz3U4znjdcus9N/DWcllU+x9LtbfOrnHiPPbam5gjH4re3e8/kkK0KIghJu9P7ddSIR/PDld2jUWgxGw5KnkzCev/3ZB3BOKiQQ7wusDBisv0VReFQIpxcW3NbW5p984Oxnb4ifL0ds87mK1bGUmHYmg1gkBodt89++8e/59h//Oe25FgA7230+c/4x/v4//cfATpmyZwJ+INL+1Zu5/xtzwjVLFsxUANYJvoiopp+lDE2harIrGWkiOFc7oKh+UGX3iURFuVX9WtGXpAJfVvQ8eV6jPV/VM0pMOnPEsEP0/eTbbIaGQlTfWITXe+kYnZ7e6P27G8+E90PM+1O/qigfSw6olCR9jSLiVZcRecjfttNZKtRJFViX/X0MJQtvpp7Bbj3DGogGIwK2gqZbocxNplj0jWyem6fWWSPW7WqARoNzjsylU01CjJnN3B3Bz59ZGC0FUsDqvtxErrOjq3p++qbOG7rZRVEfQh8xWgnAx0jwAe99On3Eig/eOyO3l5+fzB8NWKtCCIXVdoxRpER5k+aGQ9Yy/U01EhEkdYGKYXVBddXtvuYSwPB6DwJ8rwJQa40EH/o7a6NHOg9nO73eQDqdpto1CM0Jk1oLauuwBrYu9FMafMt7sqrGQfy7v4Q7/Xt49aAODFGDdFcvtxKGIxKj0mzlTIbDPSetGGOYDIeMNn7IoD/GmLI+KaY1/4H7XzXitDx9weO8w69/FXhu+t7HqQF/8db61m//i9++8/n5YjJwHaTsLUASFDzd9ea6NSC5kph6+DPXTsuoEIryGDqT3TJ6+tk5n6kiFy5gdo+R0QPmbT6jVFXLpLXAF4ovNKY6w035gFh4rV4PpUjvobfOCY8GdZWySPz00+gdfCLy9JSCCpSSshFkl0apU3R398AnqiKTqmpQvSbQEG60Mu+4V4az6eMaWzI3khyazXwKh6fzhhoURcHO9g4xuS0G/SFEldapBVevjbG2XGOxkJ0qlzEC3pUmKD8RwL5UvnflHTpzI3q9rSlQWEw8/+O//jHFxE9Jw74o+Buf+Bg/+/nPIRSISIjasM6OLvXWt54pRoXRVBgHa5l3mzhry81vI84axqNLMxpxogFAwugbhnG/t8vqGBW88r3Xp6QCYww72zs89vOf45Gf/lRZzxCFDjB4XaT1jffcQ33PmyBrE9enrE+LEcREGs18hrFniCHgi4IY+8RikK51OYR+edTBWXd2ZWU3tNxDPbl4w1CKuQHYVncb5JhpluOO/P4B1WWny8tuBZzqsotRbYxh6mgrbo8eEG7u9i0Y7Cyd8iKc3bfc6cgDmR59UD4/eics2LzZaLgQ1VX0k8FwuDgYje64kOcgfv/w3e92TbtBYzROpFIjGEl9yaPhJP1sDIP+iHQcUVnPKGsbWHfQeUfH36T38ssva0mLfH0wGn1jNBlHEGOtIQYdzdVcwR38/QMxqsvqWXzjjR+dK37wNsPRSCA1BIYY+dijDxLK07nECOPhmGbdMBlsomFcdt8qseg+vLZyqTzvKPHxj6I/Qd5PZl512Ymc92tvXPrD0w88+IWiu4HBYFs5f/Wtl/nd33mOzlyDEJIZqjdq/PPf+kp5xHEsFyRRKYOfPfo+UqvldDrtKcGs6k+Y1Ir5paVz28feJamq8tRTT11VbX766af9nfz9AzGoa4xrDEcjaXeattGslX4A8rpjOBiTfAN7ar3pXKPdHpVJ4XV9oxumJNYj6k9wt7tR+ShP/XrppVel6huY5fdXbIy9ZxDp9HSWvUccJ3pMCa5dhUHOwNlH0p/wfghDp2vw6U//kyIxxEWr0FJLsm3F4tg/D45YjZhr9FioqhxVf8LdLgC58BsXWs3WQAA6p0653saGH/XH2SgbMx4VJWFACEGnZxClA6CgVncH9jPHEIcR/DVQHT2q/oS71QkLoP/qwoX2+vr2q8aYtkZVRCWRBWzDOusSlyeFmo88+iBf/JXHGZY9alpGQlnNzban+VOLc259o/tVWv657Efqip84HM9P/Qmf6N9M/fqu1oD+YCAgC9baRpRdmx18pCj8tAlwNJxMNaCy+8yQza7q6Deys3jmcz3uhS/xOQJVKGI6oS/GGNMBfcK+I3BuzAdEDU5VRb+ztxfhoHmv+wA0te0ETSUrObBrc9ossts0cshI56GpRBFRXV7W46bH3NUCqI9GUth8sVlvEGM4pN0oUUk67RatUwvU8zH2kDOl7vrvD7jVoefGqVMDs9H91Z3BIDMSNR5oEizD0ZDt3g699S2Gw8mhHVzWmlv+/QEn4+TLPG9uXLhw4bq1+KmnnvjxZ9w8wS39/oCTcTJOxsk4GSfjZJyMk3EyTsa9N/4/EVinh3S9D/0AAAAASUVORK5CYII="}      # the potion effect icons (Fire Resistance / Feather Feet), 96x96
 BUFF_OF = {"fire protection": ("fire", "fire_dur"), "feather feet": ("feather", "feather_dur")}   # potion -> (icon, setting with its length)
 _buff_cache = {}
@@ -1659,6 +1728,9 @@ def buff_art(kind, frac, size, text=""):
 
 
 BMOVE_PNG = {
+    "telekinesis": "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",
+    "awakened": "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",
+    "enshroud": "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",
     "soulberserk": "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",
     "tempest": "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",
     "powersurge": "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",
@@ -2625,7 +2697,7 @@ def cl_scroll_max(n, ph, s):
 
 def load_cfg():
     cfg = {"version": 5, "bar": dict(DEFAULT_BAR), "active": DEFAULT_PROFILE,
-           "profiles": seed_profiles(), "snaps": {}, "settings": dict(DEFAULT_SETTINGS),
+           "profiles": seed_profiles(), "snaps": {}, "tele": {}, "settings": dict(DEFAULT_SETTINGS),
            "mana": dict(DEFAULT_MANA, zone=list(DEFAULT_MANA["zone"])), "marks": {}, "decor": [], "dashpos": default_dashpos(), "pctpos": default_pctpos(), "kdapos": default_kdapos(), "popts": {}, "inv": {}, "brew": clean_brew(None), "checklists": default_checklists(), "sell": clean_sell(None), "dayfarm": clean_dayfarm(None), "keybinds": clean_keybinds(None), "gates": clean_gates(None), "pinned": [], "mascot": None, "_dash_fresh": True, "charged": {DEFAULT_PROFILE: clean_charged(SEED_CHARGED)}}
     data = {}
     try:
@@ -2640,6 +2712,9 @@ def load_cfg():
             snaps = data.get("snaps")
             if isinstance(snaps, dict):
                 cfg["snaps"] = {str(k): clean_moves(v) for k, v in snaps.items() if str(k) in cfg["profiles"]}
+            tele_ = data.get("tele")
+            if isinstance(tele_, dict):                                   # the moves that only exist during Telekinesis (fist moves)
+                cfg["tele"] = {str(k): clean_moves(v, m2=True) for k, v in tele_.items() if str(k) in cfg["profiles"]}
             if valid_mana(data.get("mana")):
                 cfg["mana"] = {"x": float(data["mana"]["x"]), "y": float(data["mana"]["y"]),
                                "w": float(data["mana"]["w"]), "h": float(data["mana"]["h"]),
@@ -2690,6 +2765,13 @@ def load_cfg():
         pass
     if not cfg["settings"].get("kb_inj_v2"):
         cfg["settings"]["kb_accept_injected"], cfg["settings"]["kb_inj_v2"] = True, True       # (one time: ON by default; the user can still turn it off)
+    if not cfg["settings"].get("potion_keys_v2"):
+        cfg["settings"]["potion_keys_v2"] = True                         # (one time: the old default potion keys are gone for everybody - they can still bind their own)
+        pk_ = cfg["settings"].get("potion_keys")
+        if isinstance(pk_, dict):
+            old_ = {"Feather Feet": 0x15, "Fire Protection": 0x16, "Health Potion": 0x23}
+            cfg["settings"]["potion_keys"] = {k: v for k, v in pk_.items()
+                                              if not (k in old_ and isinstance(v, dict) and v.get("id") == old_[k])}
     if not str(cfg["settings"].get("update_base") or "").strip():
         cfg["settings"]["update_base"] = UPDATE_BASE_URL      # (an old config saved it empty: use the built-in link)
     if cfg["active"] not in cfg["profiles"]:
@@ -2723,6 +2805,12 @@ def load_cfg():
     if not cfg["settings"].get("spellcd_done"):
         cfg["settings"]["spellcd_done"] = True
         sweep_spell_cds(cfg)
+    if not cfg["settings"].get("green_names_done"):
+        cfg["settings"]["green_names_done"] = True         # (once: the moves with a green name box by default - MOVE_UNEQUIP - get it; you can switch it off again)
+        for _moves in cfg.get("profiles", {}).values():
+            for _m in _moves:
+                if "cd2" in _m and not _m.get("spell") and _norm_name(_m.get("name")) in MOVE_UNEQUIP and not _m.get("unequip_set"):
+                    _m["unequip"] = _m["unequip_set"] = True
     if not cfg["settings"].get("chargecd_done"):
         cfg["settings"]["chargecd_done"] = True
         sweep_charged_cds(cfg)
@@ -2747,7 +2835,7 @@ def save_cfg(cfg):
 # Updates: version.txt in the update folder says what the newest version is.
 #   version=1.1.0                 (required)
 #   notes=what changed            (optional, one line)
-#   script_sha256=...  exe_sha256=...   (optional but recommended: the file is rejected if it doesn't match)
+#   script_sha256=...  exe_sha256=...   (REQUIRED: the file is rejected if it is missing or doesn't match; make_update_files.py writes them)
 #   script_url=...  exe_url=...   (optional full https links; default = <folder>/CooldownIndicator.py / .exe)
 # Nothing is installed without a click. The old script is kept as CooldownIndicator.py.bak.
 # ----------------------------------------------------------------------------
@@ -2935,7 +3023,9 @@ def check_for_update(base, current=APP_VERSION, fetch=None):
 
 def _check_sha(data, info, key):
     want = (info.get(key) or "").strip().lower()
-    if want and hashlib.sha256(data).hexdigest() != want:
+    if not re.fullmatch(r"[0-9a-f]{64}", want):              # (a missing / blank / broken checksum is a refusal, never a skipped check)
+        raise UpdateError("The update has no valid checksum (" + key + ") - NOT installed.")
+    if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), want):
         raise UpdateError("The downloaded file doesn't match its checksum - NOT installed.")
 
 
@@ -3095,6 +3185,10 @@ class Tracker:
         self.history = []            # the last moves USED, newest last: dicts (key, name, kind, started, time)
         self.disarmed = False        # the Weapon is gone from the hotbar (the game removes the moves that need it)
         self.absent = frozenset()    # while disarmed: hotbar keys that are not on the bar any more
+        self.tele_t0 = 0.0
+        self.tm_norm, self.tm_tele = {}, {}      # the cooldowns of a key's hotbar move / of its Telekinesis move while the other one is showing
+        self.tw_stash = {}           # Telekinetic Weapon's cooldowns of Telekinesis while Telekinesis is off: key -> {timer name: (ready, total)} (they keep ticking, they just don't show)
+        self.tele, self.tele_pend = False, -1e9     # Telekinesis (Telekinetic Weapon: the weapon floats around you; the bar looks disarmed, but it isn't) / when the move was last used
         self.seen = set()            # hotbar keys that have been seen on the bar at least once (this session)
         self._flip = 0               # debounce: consecutive scans that disagree with the current state
         self.soul = None             # Wraith Knight: Soul Berserk (key, buff start, buff end, cooldown end, buff length, cooldown length)
@@ -3122,7 +3216,15 @@ class Tracker:
                 return e
         return None
 
+    def tele_list(self):
+        """The moves of the Telekinesis State (fist hybrid / emulated fist moves): only there while Telekinesis is on."""
+        return self.cfg.get("tele", {}).get(self.cfg["active"], [])
+
     def move_for(self, key):
+        if self.tele and not (isinstance(key, str) and key.startswith("inv:")):
+            for tm_ in self.tele_list():
+                if tm_["key"] == key:
+                    return tm_
         if isinstance(key, str) and key.startswith("inv:"):     # an Inventory move: a Moves-style dict made from its entry
             e = self.inv_entry(key[4:])
             if e is None or e.get("potion"):
@@ -3319,6 +3421,9 @@ class Tracker:
                 self._flip = 0
                 return None
             want = bool(weapons & self.seen) and any(w in self.seen and w not in present for w in weapons)
+            if want and not self.disarmed and time.time() < getattr(self, "tele_ret_until", 0.0):
+                self._flip = 0
+                return None
             if want == self.disarmed:
                 self._flip = 0
                 if want:                          # still disarmed: keep the removed-slot list current
@@ -3329,21 +3434,90 @@ class Tracker:
                 return None
             self._flip = 0
             self.disarmed = want
+            a_tk = self._live_armed(time.time()) if want else None
+            mv_tk = self.move_for(a_tk[0]) if a_tk else None
+            tele = want and (time.time() - self.tele_pend < 20.0           # the weapon left the bar after Telekinetic Weapon was used (or it is in hand right now): Telekinesis, not a disarm
+                             or bool(mv_tk and _norm_name(mv_tk.get("name")) == "telekinetic weapon"))
+            if self.tele and not tele:
+                self._tele_stash()                                       # (the weapon came back by itself: the attack cooldowns go on silently)
+                self._tm_swap(False)                                     # (the Telekinesis moves go away, the hotbar moves' timers come back)
+            self.tele = tele
+            if tele:
+                self.tele_t0 = time.time()
+                self._tm_swap(True)
+                self._tele_restore(time.time())
             if self.cfg["popts"].get(self.cfg["active"], {}).get("whisper_dj"):
                 self._agility_reset(time.time())      # Whisperer: losing / getting back the weapon resets Agility's cooldown
             if want:
-                self.last_charge = None      # disarmed: the Charge is gone too
+                self.last_charge = None      # disarmed / Telekinesis: the Charge is gone too
                 self.azure_on = False
             if not want:
                 self.absent = frozenset()
+                self.tele_pend = -1e9
                 return "Weapon is back - armed again."
             self._drop({k for k in HOTBAR_KEYS if k not in present})
+            if tele:
+                return "TELEKINESIS - your weapon floats around you: the moves that need it are gone, their cooldowns were reset (like a disarm)."
             return "DISARMED - moves that need the weapon are gone: their cooldowns were reset."
 
-    def _drop(self, keys):
-        """Keys that left the bar: their move / M2 timers are cleared. (lock held)"""
+    def _tw_keys(self):
+        return [m["key"] for m in self.cfg["profiles"].get(self.cfg["active"], []) if _norm_name(m.get("name")) == "telekinetic weapon" and not m.get("spell") and not m.get("ininv")]
+
+    def _tm_swap(self, entering):
+        """The Telekinesis moves have their own cooldowns: they live in the same timers as the hotbar moves of that key, so they are swapped in / out
+        (and keep running while they are out). Lock held."""
+        now = time.time()
+        for k in {m_["key"] for m_ in self.tele_list()}:
+            out_, in_ = (self.tm_norm, self.tm_tele) if entering else (self.tm_tele, self.tm_norm)
+            st = {}
+            for rn, tn in (("ready_at", "total"), ("m2_ready", "m2_total")):
+                r, t = getattr(self, rn), getattr(self, tn)
+                if k in r:
+                    st[rn] = (r.pop(k), t.pop(k, 0.0))
+            if st:
+                out_[k] = st
+            back = in_.pop(k, None) or {}
+            for rn, (rd, tot) in back.items():
+                if rd > now:
+                    getattr(self, rn)[k] = rd
+                    getattr(self, "total" if rn == "ready_at" else "m2_total")[k] = tot
+
+    def _tele_stash(self):
+        """Telekinesis is over: the cooldowns of Telekinetic Weapon's attacks (M1 / M2) stop showing but keep running. Lock held."""
+        for k in self._tw_keys():
+            st = {}
+            for rn, tn in (("ready_at", "total"), ("m2_ready", "m2_total")):
+                r, t = getattr(self, rn), getattr(self, tn)
+                if k in r:
+                    st[rn] = (r.pop(k), t.pop(k, 0.0))
+            if st:
+                self.tw_stash[k] = st
+
+    def _tele_restore(self, now):
+        """Telekinesis is on (again): the attack cooldowns that are still running show up again. Lock held."""
+        for k, st in list(self.tw_stash.items()):
+            for rn, (rd, tot) in st.items():
+                if rd > now:
+                    getattr(self, rn)[k] = rd
+                    getattr(self, "total" if rn == "ready_at" else "m2_total")[k] = tot
+        self.tw_stash.clear()
+
+    def tele_return(self, now):
+        """R with Telekinetic Weapon in hand while Telekinesis is on: the game takes the weapon back. True when that is what the R press is (it is no right click / M2).
+        Telekinesis itself ends only when the weapon is seen on the hotbar again."""
+        with self.lock:
+            if not self.tele:
+                return False
+            a = self._live_armed(now)
+            mv = self.move_for(a[0]) if a else None
+            if not mv or _norm_name(mv.get("name")) != "telekinetic weapon":
+                return False
+            return True                                          # (nothing changes here: Telekinesis only ends when the weapon is really back on the hotbar - update_hotbar)
+
+    def _drop(self, keys, reset=True):
+        """Keys that left the bar: their move / M2 timers are cleared (not in Telekinesis). (lock held)"""
         self.absent = frozenset(keys)
-        for k in keys:
+        for k in keys if reset else ():
             for d in (self.ready_at, self.total, self.m2_ready, self.m2_total):
                 d.pop(k, None)
         if self.armed and self.armed[0] in keys:
@@ -3712,7 +3886,7 @@ class Tracker:
             if cleared:
                 back = " - the axe's M2 cooldown is gone"
         if kind == "bane" and self.disarmed:                  # Bane gives the weapon back: the macro knows at once (no waiting for the screen)
-            self.disarmed, self.absent, self._flip = False, frozenset(), 0
+            self.disarmed, self.absent, self._flip, self.tele = False, frozenset(), 0, False
             if self.cfg["popts"].get(self.cfg["active"], {}).get("whisper_dj"):
                 self._agility_reset(now)
             back = " - weapon is back, armed again"
@@ -3721,6 +3895,12 @@ class Tracker:
         if kind == "galvanize":
             return f"{BM_TITLE[kind]} ({key}): starts in {GALVANIZE_DELAY:g}s, lasts {dur:g}s ({cd:g}s cooldown after it)"
         return f"{BMOVES[kind][0]} ({key}): {dur:g}s, then {cd:g}s cooldown{back}"
+
+    def enshroud_on(self, now):
+        """Enshroud's Shrouded buff is on right now (it gives a Double Jump)."""
+        with self.lock:
+            st = self.bm.get("enshroud")
+            return bool(st) and st["t0"] <= now < st["t1"]
 
     def power_surge_on(self, now):
         """The Power Surge buff is on right now (lock held)."""
@@ -3761,6 +3941,11 @@ class Tracker:
                 if deb and v["t1"] <= now < v["t1"] + deb:
                     left = v["t1"] + deb - now
                     live.append((v["t1"], v["debk"], max(0.0, min(1.0, left / deb)), left))
+            if self.tele and self.disarmed:                      # Telekinesis: the weapon floats around you until R brings it back (never runs out)
+                live.append((self.tele_t0, "telekinesis", 1.0, None))
+            a_ = getattr(self, "awk", None)
+            if a_ and a_["t0"] <= now < a_["t1"] and a_.get("dur"):      # Dzin: Awakened lasting (same place as the other buffs)
+                live.append((a_["t0"], "awakened", max(0.0, min(1.0, (a_["t1"] - now) / a_["dur"])), a_["t1"] - now))
             s_ = getattr(self, "soul", None)
             if s_ and s_[1] <= now < s_[2]:                      # Wraith Knight: Soul Berserk lasting (same place as the other buffs)
                 live.append((s_[1], "soulberserk", max(0.0, min(1.0, (s_[2] - now) / s_[4])) if s_[4] > 0 else 1.0, s_[2] - now))
@@ -4269,6 +4454,11 @@ class Tracker:
         mv = self.move_for(key)
         if not mv:
             return None                      # this key only has a snap spell: a left click does nothing
+        if _norm_name(mv.get("name")) == "telekinetic weapon" and not mv.get("spell") and not self.disarmed and self.seen \
+                and any(self.is_weapon(m_) and not m_.get("ininv") and m_["key"] in self.seen for m_ in self.cfg["profiles"].get(self.cfg["active"], [])):
+            self.tele_pend = now             # (a weapon is on the bar: when it leaves it now, that is Telekinesis)
+            self.armed = None                # ...and the move itself: no cooldown, it unequips after use (like a green name box) - the weapon + Telekinetic Weapon are both on the bar
+            return f"Telekinetic Weapon ({key}): used - unequipped, no cooldown (weapon on the bar)"
         if getattr(self, "soul_mode", False) and not mv.get("spell") and (is_elegant_slash(mv.get("name")) or is_needles_eye(mv.get("name"))):
             r = self._soul_mode_click(key, mv, now, S)
             if r is not None:
@@ -4339,7 +4529,8 @@ class Tracker:
     def _shared(mv):
         """M1 and M2 share one cooldown (the default) - only meaningful when the move has BOTH cooldowns
         (a weapon has no M1 cooldown, so there is nothing to share)."""
-        return float(mv.get("cd") or 0.0) > 0 and float(mv.get("cd2") or 0.0) > 0 and not mv.get("split") and not is_decompose(mv.get("name"))
+        return float(mv.get("cd") or 0.0) > 0 and float(mv.get("cd2") or 0.0) > 0 and not mv.get("split") and not is_decompose(mv.get("name")) \
+            and _norm_name(mv.get("name")) != "telekinetic weapon"      # (Telekinetic Weapon's M1 and M2 never share)
 
     def song_keys(self):
         """The Tracker keys of every Song in the profile (hotbar Moves and Inventory)."""
@@ -4441,6 +4632,8 @@ class Tracker:
         mv = self.move_for(key)
         if mv and is_shard_name(mv.get("name")) and not mv.get("spell"):
             return self._shard_click(key, now, S)
+        if mv and _norm_name(mv.get("name")) == "telekinetic weapon" and not mv.get("spell") and not self.tele:
+            return None                      # Telekinetic Weapon's M2 (a right click / R) does nothing outside Telekinesis: no cooldown
         cd = float(mv.get("cd2") or 0.0) if mv and not mv.get("spell") else 0.0
         if mv and is_decompose(mv.get("name")) and not mv.get("spell"):
             if not self.decomp_on:
@@ -4790,6 +4983,49 @@ def detect_hotbar(rgb, n=12):
     return _detect_hotbar_partly(rgb, mask, y_lo, n)
 
 
+def detect_slots_by_tabs(rgb, templates=None):
+    """The slots of a hotbar with ANY number of slots, wherever the game put them (a re-centred bar while disarmed / in Telekinesis, a bar with gaps): the
+    parchment squares are found, and every one is named by the digit on the cream tab above it. Returns [(key, x0, x1, y0, y1)] (the slot interiors,
+    screen pixels, left to right) or []."""
+    H = rgb.shape[0]
+    y_lo = int(H * 0.55)
+    a = rgb[y_lo:].astype(np.int16)
+    r, g, b = a[..., 0], a[..., 1], a[..., 2]
+    d = r - b
+    mask = (r >= 185) & (g >= 170) & (b >= 150) & (d >= 4) & (d <= 52)
+    rows = mask.sum(axis=1)
+    if rows.size == 0 or rows.max() < 20:
+        return []
+    tpl = templates or DEFAULT_GLYPHS
+    for y0, y1 in sorted(_runs(rows >= 0.5 * rows.max(), 15), key=lambda t: t[0] - t[1]):
+        h = y1 - y0 + 1
+        runs = _runs(mask[y0:y1 + 1].sum(axis=0) >= 0.5 * h, 20)
+        if not runs:
+            continue
+        ws = sorted(e - s + 1 for s, e in runs)
+        w = ws[len(ws) // 2]
+        runs = [(s, e) for s, e in runs if abs((e - s + 1) - w) <= max(3, 0.12 * w)]        # (only the square slots: not a long bar of text / UI)
+        if not runs:
+            continue
+        scale = max(0.5, w / 54.0)
+        top = max(0, y_lo + y0 - int(26 * scale))
+        strip = rgb[top:y_lo + y0 + int(2 * scale)]
+        tabs = scan_tabs(strip, scale)
+        if not tabs:
+            continue
+        keys, _unk = identify_tabs(tabs, tpl)
+        out = []
+        for (cx, _g), key in zip(tabs, keys):
+            if not key:
+                continue
+            near = min(runs, key=lambda sr: abs((sr[0] + sr[1]) / 2.0 - cx))
+            if abs((near[0] + near[1]) / 2.0 - cx) <= 0.35 * w:
+                out.append((key, int(near[0]), int(near[1]), int(y_lo + y0), int(y_lo + y1)))
+        if out:
+            return out
+    return []
+
+
 def _detect_hotbar_partly(rgb, mask, y_lo, n=12):
     """The hotbar with some slots COVERED (the tool's own window on top of the game, a chat box ...): 6 or more evenly spaced slots are enough when
     the game centres its hotbar - the first one seen is then slot k, found from where the middle of the screen would put slot 1. Returns the bar
@@ -4828,7 +5064,7 @@ def _detect_hotbar_partly(rgb, mask, y_lo, n=12):
 
 
 # ---------- 'Find moves': reads the move names on the hotbar with Tesseract (only when the button is clicked) ----------
-MOVE_EXTRA_NAMES = ("rapier", "needle's eye", "the soul", "agility", "bladeflip", "bane", "scrupus", "health potion", "sprint", "soul rip")
+MOVE_EXTRA_NAMES = ("rapier", "needle's eye", "the soul", "agility", "bladeflip", "bane", "scrupus", "health potion", "sprint", "soul rip", "telekinetic weapon", "enshroud", "sanguinity")
 
 
 def known_move_names():
@@ -4939,6 +5175,24 @@ def read_hotbar_names(exe, rgb, bar, n=12):
     for i, tx in enumerate(texts):
         nm, clean = match_move_name(tx, names)
         out.append((HOTBAR_KEYS[i], clean, nm))
+    return out
+
+
+def read_slot_names(exe, rgb, slots):
+    """[(hotbar key, text read, known name or None)] for the slots found by detect_slots_by_tabs (any number of them, anywhere)."""
+    from concurrent.futures import ThreadPoolExecutor
+    H, W = rgb.shape[:2]
+    jobs = []
+    for key, x0, x1, y0, y1 in slots:
+        s = max(0.5, (x1 - x0 + 1) / 54.0)
+        jobs.append(rgb[max(0, y0 + int(2 * s)):min(H, y1 - int(2 * s)), max(0, x0 + int(2 * s)):min(W, x1 - int(2 * s))])
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        texts = list(ex.map(lambda cr: ocr_slot_text(exe, cr) if cr.size else "", jobs))
+    names = known_move_names()
+    out = []
+    for (key, *_), tx in zip(slots, texts):
+        nm, clean = match_move_name(tx, names)
+        out.append((key, clean, nm))
     return out
 
 
@@ -6150,7 +6404,7 @@ if IS_WIN:
             _send_input(_INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(0, sc, 8 | (2 if up else 0), 0, TRAIN_TAG))))
             return
         vk = SEND_VK[name]
-        inp = _INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(vk, u32.MapVirtualKeyW(vk, 0), 2 if up else 0, 0, TRAIN_TAG)))
+        inp = _INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(vk, scan_for_vk(vk, u32.MapVirtualKeyW), 2 if up else 0, 0, TRAIN_TAG)))
         _send_input(inp)
 
     def send_click(up=False):
@@ -6165,10 +6419,16 @@ if IS_WIN:
         inp = _INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(0, 0, 0, 16 if up else 8, 0, TRAIN_TAG)))
         _send_input(inp)
 
-    def send_raw_key(vk, ext=0, up=False, tag=TRAIN_TAG):
-        """A key by its virtual key."""
+    def send_rclick_key(up=False):
+        """The right click the R key stands for: NOT tagged as the tool's own, so the tool counts it like a real right click (Gate, cooldowns ...)."""
+        _send_input(_INPUT(0, _INPUTUNION(mi=_MOUSEINPUT(0, 0, 0, 16 if up else 8, 0, 0x52434C4B))))
+
+    def send_raw_key(vk, ext=0, up=False, tag=TRAIN_TAG, typing=False):
+        """A key by its virtual key, sent from the US place of that key (what Roblox reads for game keys). typing=True: typing text into the chat box, where
+        the layout's own scan code is right (the box reads characters)."""
         fl = (2 if up else 0) | (1 if ext else 0)
-        _send_input(_INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(int(vk), u32.MapVirtualKeyW(int(vk), 0), fl, 0, tag))))
+        sc = u32.MapVirtualKeyW(int(vk), 0) if typing else scan_for_vk(vk, u32.MapVirtualKeyW)
+        _send_input(_INPUT(1, _INPUTUNION(ki=_KEYBDINPUT(int(vk), sc, fl, 0, tag))))
 
     def close_foreground_window():
         """What Alt+F4 does: asks the window in front to close."""
@@ -6224,10 +6484,13 @@ else:
     def send_rclick(up=False):
         pass
 
+    def send_rclick_key(up=False):
+        pass
+
     def send_scan_key(scan, up=False):
         pass
 
-    def send_raw_key(vk, ext=0, up=False, tag=None):
+    def send_raw_key(vk, ext=0, up=False, tag=None, typing=False):
         pass
 
     def send_raw_scan(scan, ext=False, up=False, tag=None):
@@ -6301,6 +6564,8 @@ def discord_send_image(url, payload, png, name="screenshot.png", timeout=20):
 def game_window_rect(title="Roblox"):
     """(left, top, width, height) of the game window's client area on the screen, or None when the Roblox game isn't the
     window in front."""
+    global GAME_TITLE
+    GAME_TITLE = title or GAME_TITLE            # (game_monitor() looks for the same window)
     if not IS_WIN:
         return None
     try:
@@ -6318,10 +6583,40 @@ def game_window_rect(title="Roblox"):
         return None
 
 
+GAME_TITLE = "Roblox"          # (kept in step with the game window title setting)
+
+
+def game_monitor(sct=None):
+    """The screen (mss monitor dict) the GAME is on: the one holding the middle of the game window, else the one the mouse is on, else the first one.
+    With two screens the first one mss lists is not always the one the game runs on (e.g. a 2560x1440 main and a 1920x1080 second screen)."""
+    def pick(s):
+        mons = list(s.monitors[1:]) or [s.monitors[0]]
+        pts = []
+        try:
+            r = game_window_rect(GAME_TITLE)
+            if r is not None:
+                pts.append((r[0] + r[2] // 2, r[1] + r[3] // 2))
+        except Exception:
+            pass
+        try:
+            pts.append(tuple(cursor_pos()))
+        except Exception:
+            pass
+        for (x, y) in pts:
+            for m in mons:
+                if m["left"] <= x < m["left"] + m["width"] and m["top"] <= y < m["top"] + m["height"]:
+                    return dict(m)
+        return dict(mons[0])
+    if sct is not None:
+        return pick(sct)
+    with mss.mss() as s:
+        return pick(s)
+
+
 def screenshot_png(rect=None):
     """PNG bytes of the screen rect (left, top, w, h), or of the whole main screen."""
     with mss.mss() as sct:
-        box = ({"left": rect[0], "top": rect[1], "width": rect[2], "height": rect[3]} if rect else sct.monitors[1])
+        box = ({"left": rect[0], "top": rect[1], "width": rect[2], "height": rect[3]} if rect else game_monitor(sct))
         shot = sct.grab(box)
         img = Image.frombytes("RGB", shot.size, shot.rgb)
     out = io.BytesIO()
@@ -6353,6 +6648,66 @@ GATE_BASE_OLD = ("Sigil", "Skycastle", "Snail")                                 
 GATE_AREAS = (("Forest", 5), ("Desert", 5), ("Deepforest", 5), ("Shore", 4), ("Tundra", 7), ("Canyon", 9))     # the boxes on the right, in this order
 GATE_PAGE_ORDER = ("Desert", "Forest", "Shore", "Tundra", "Deepforest", "Canyon")                          # the order of the "Unpinned Gates Location" list
 GATE_RANDOM = ("Sigil", "Skycastle", "Snail", "Counts", "Deepforest", "Forest", "Tundra", "Shore", "Desert", "Canyon")     # the random gate picks one of these
+
+# ---- the game's gate prompt ("Gate / Type the name of a gate" at the top of the screen): the Gate shortcuts and keybinds only work while it is on the screen ----
+GATE_PROMPT_PNG = "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"
+_GP = {"tpl": None}
+
+
+def _gp_gray(a):
+    a = np.asarray(a)[..., :3].astype(np.float64)
+    return a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+
+
+def _gp_box(g, k):
+    p = k // 2
+    g2 = np.pad(g, p, mode="edge")
+    I = np.zeros((g2.shape[0] + 1, g2.shape[1] + 1))
+    I[1:, 1:] = g2.cumsum(0).cumsum(1)
+    return ((I[k:, k:] - I[:-k, k:] - I[k:, :-k] + I[:-k, :-k]) / float(k * k))[:g.shape[0], :g.shape[1]]
+
+
+def _gp_text(rgb, k=11):
+    """The light text pixels (brighter than their surroundings): the prompt's letters, whatever is behind them."""
+    g = _gp_gray(rgb)
+    return (g - _gp_box(g, k)) > 28, g > 140
+
+
+def _gp_mask(rgb, k=11):
+    a, b = _gp_text(rgb, k)
+    return a & b
+
+
+def gate_prompt_score(rgb, us=1.0):
+    """0..1: how well the game's gate prompt (title + subtitle, as in GATE_PROMPT_PNG) is in this picture of the top-middle of the game screen."""
+    if _GP["tpl"] is None:
+        _GP["tpl"] = Image.open(io.BytesIO(base64.b64decode(GATE_PROMPT_PNG))).convert("RGB")
+    t = _GP["tpl"]
+    if abs(us - 1.0) > 0.02:
+        t = t.resize((max(8, int(t.size[0] * us)), max(8, int(t.size[1] * us))), Image.BILINEAR)
+    k = max(5, int(11 * us) | 1)
+    T = _gp_mask(np.asarray(t), k).astype(np.float64)
+    F = _gp_mask(rgb, k).astype(np.float64)
+    H, W = F.shape
+    h, w = T.shape
+    if H < h or W < w or T.sum() < 20:
+        return 0.0
+    n = float(h * w)
+    Tz = T - T.mean()
+    sT = float(np.sqrt((Tz ** 2).sum()))
+    sz = (H + h, W + w)
+
+    def corr(A, B):
+        return np.fft.irfft2(np.fft.rfft2(A, sz) * np.fft.rfft2(B[::-1, ::-1], sz), sz)[h - 1:H, w - 1:W]
+    one = np.ones((h, w))
+    sF, sF2, sFT = corr(F, one), corr(F * F, one), corr(F, Tz)
+    den = np.sqrt(np.maximum(sF2 - sF * sF / n, 0.0)) * sT
+    ok = den > 1e-6
+    if not ok.any():
+        return 0.0
+    return float((sFT[ok] / den[ok]).max())
+
+
 GATE_ICON_PNG = "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"
 
 
@@ -8584,6 +8939,9 @@ def house_bar_art(w, hp):
     return _house_cache[key]
 
 
+HOUSE_LOW_HP = 30                       # (a housemate under this HP % has a red name)
+
+
 def house_panel(members, s=1.0, numbers=False):
     """The housemates' panel as one RGBA picture (the game's HP bar, the % in the middle, the buff icons on the right).
     members = [(name, hp or None, [(kind, is_move, fraction, seconds or None)])]."""
@@ -8602,7 +8960,7 @@ def house_panel(members, s=1.0, numbers=False):
     for i, (name, hp, buffs) in enumerate(members):
         y0 = i * PITCH
         by = y0 + NAME_H
-        d.text((int(round(5 * s)), y0), str(name).upper(), font=f_name, fill=(255, 255, 255, 255), stroke_width=(1 if s >= 0.7 else 0), stroke_fill=(20, 12, 14, 255))   # (capitals like the game's own name over your bar)
+        d.text((int(round(5 * s)), y0), str(name).upper(), font=f_name, fill=((255, 50, 50, 255) if (hp is not None and hp < HOUSE_LOW_HP) else (255, 255, 255, 255)), stroke_width=(1 if s >= 0.7 else 0), stroke_fill=(20, 12, 14, 255))   # (red name under 30% HP; capitals like the game's own name over your bar)
         bar, (bx0, bx1, by0, by1) = house_bar_art(BW, hp)
         img.alpha_composite(bar, (0, by))
         txt = "?" if hp is None else f"{hp}%"
@@ -9957,14 +10315,14 @@ class InputWatcher(threading.Thread):
         self._hb = time.monotonic()                                       # (the hooks are alive: see _hook_watch)
         try:
             if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN, WM_KEYUP, WM_SYSKEYUP):
-                info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                info = place_info(ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents)      # (a copy: the letters as the keys' US places)
                 is_down = w_param in (WM_KEYDOWN, WM_SYSKEYDOWN)
                 physical = info.dwExtraInfo != TRAIN_TAG                           # (not the tool's own key press)
                 if not physical and info.vkCode in self.INJ_WATCH:
                     self._inj[info.vkCode] = is_down                               # (what the tool itself holds down for the game right now, whatever sent it)
                 real = physical and not (info.flags & 0x10)                        # (typed on the keyboard: not injected by another program, e.g. your own AutoHotkey script)
                 held_real = real or (physical and not is_ahk_extra(info.dwExtraInfo))    # (the keys the run features count as held: also what a remapper / driver injects, never what AutoHotkey sends)
-                kreal = real or (physical and bool(self.app.cfg["settings"].get("kb_accept_injected")))     # (the keybinds can also take the keys a mouse driver sends)
+                kreal = real or (physical and not is_ahk_extra(info.dwExtraInfo) and bool(self.app.cfg["settings"].get("kb_accept_injected")))     # (the keybinds can also take the keys a mouse driver sends - never what an AutoHotkey script sends: that goes straight to the game)
                 if kreal and not real and is_down and self.kb_capture is not None:
                     cb, self.kb_capture = self.kb_capture, None
                     cb(None if info.vkCode == 0x1B else kb_key_id(info.scanCode, info.flags),
@@ -10004,9 +10362,9 @@ class InputWatcher(threading.Thread):
                             return 1                                     # (their key repeats: swallowed, the game already got the G release)
                     if real and info.vkCode == 0x47 and self.gf_g_event(is_down):
                         return 1                                         # (G while the tool holds it for the user: swallowed, the tool lets it go)
-                    if real and is_down and getattr(self.app, "gate_open", False) is True and (info.vkCode in (0x1B, 0x0D, 0xBF, 0x6F) or info.scanCode == 0x35):
+                    if real and is_down and getattr(self.app, "gate_open", False) is True and (info.vkCode in (0x1B, 0x0D) or is_slash_key(info)):
                         self.gate_hide()                                # (Esc / Enter / "/" : the gate shortcut boxes go away)
-                    if real and is_down and (info.vkCode in (0xBF, 0x6F) or info.scanCode == 0x35) and getattr(self.app, "chat_open", False) is not True:
+                    if real and is_down and is_slash_key(info) and getattr(self.app, "chat_open", False) is not True:
                         self.app.chat_open = True                       # a "/" YOU type = the Roblox chat opens: no keybind / AutoHotkey works until Enter / Esc / a click
                                                                         # (a "/" an AutoHotkey script sends doesn't count: that is how a typing macro works)
                     elif is_down and info.vkCode == 0x1B:
@@ -10118,9 +10476,72 @@ class InputWatcher(threading.Thread):
         except Exception:
             pass
 
+    def _gp_need(self):
+        try:
+            return bool(self.app.cfg["settings"].get("gate_need_prompt", True))
+        except Exception:
+            return True
+
+    def gate_prompt_on(self):
+        """True while the game's gate prompt is on the screen (a picture check every 0.15 s in the background; the keyboard hook only reads
+        the answer). True always when the check is switched off or cannot work (then the Gate works like before)."""
+        if not self._gp_need() or not IS_WIN:
+            return True
+        t = getattr(self, "_gp_thread", None)
+        if t is None or not t.is_alive():
+            self._gp_state = (False, 0.0, True)                          # (visible, when, working)
+            self._gp_thread = threading.Thread(target=self._gp_loop, daemon=True)
+            self._gp_thread.start()
+        vis, when, ok = getattr(self, "_gp_state", (False, 0.0, True))
+        if not ok:
+            return True
+        if time.time() - when > 1.0:
+            vis = self.gate_prompt_check()                               # (the watcher is not running: look now)
+        return vis
+
+    def gate_prompt_check(self):
+        """One look at the screen: is the gate prompt on it? Updates the cached answer."""
+        vis, ok = False, True
+        try:
+            r = game_window_rect(GAME_TITLE)
+            if r is None:
+                vis = False
+            else:
+                L, T, W, H = r
+                hs = max(0.5, min(3.0, H / 1080.0))
+                x0, x1 = L + int(W * 0.5 - 420 * hs), L + int(W * 0.5 + 420 * hs)
+                y0, y1 = T + int(60 * hs), T + int(520 * hs)
+                x0, y0 = max(L, x0), max(T, y0)
+                x1, y1 = min(L + W, x1), min(T + H, y1)
+                with mss.mss() as sct:
+                    shot = sct.grab({"left": x0, "top": y0, "width": x1 - x0, "height": y1 - y0})
+                rgb = np.asarray(Image.frombytes("RGB", shot.size, shot.rgb))
+                scales = {round(hs, 2)}
+                try:
+                    scales.add(round(ui_scale(self.app.cfg["bar"]), 2))
+                except Exception:
+                    pass
+                vis = max(gate_prompt_score(rgb, us) for us in scales) >= 0.55
+        except Exception:
+            ok = False
+        self._gp_state = (vis, time.time(), ok)
+        return vis
+
+    def _gp_loop(self):
+        while True:
+            try:
+                if self.game_active() and self._gp_need():
+                    self.gate_prompt_check()
+                else:
+                    self._gp_state = (False, time.time(), True)
+            except Exception:
+                pass
+            time.sleep(0.15)
+
     def gate_armed_now(self):
         try:
-            return self.game_active() and self.app.tracker.on and self.app.tracker.gate_why(time.time()) == "ok"
+            return (self.game_active() and self.app.tracker.on and self.app.tracker.gate_why(time.time()) == "ok"
+                    and self.gate_prompt_on())
         except Exception:
             return False
 
@@ -10143,7 +10564,7 @@ class InputWatcher(threading.Thread):
             return True                                                    # (key repeat of a key that was taken)
         is_open = getattr(app, "gate_open", False) is True
         both = getattr(app, "cfg", {"settings": {}})["settings"].get("gate_mode") == "both"      # (BOTH: the boxes are for clicks only; the keyboard types the letters + a number)
-        if is_open and not self.game_active():
+        if is_open and (not self.game_active() or not self.gate_prompt_on()):
             self.gate_hide()
             is_open = False
         if is_open:
@@ -10210,7 +10631,7 @@ class InputWatcher(threading.Thread):
         elif tok == " ":
             send_raw_key(0x20, 0, up)
         else:
-            send_raw_key(ord(tok.upper()), 0, up)
+            send_raw_key(ord(tok.upper()), 0, up, typing=True)             # (text for the chat box: the layout's own key)
 
     def _gate_seq(self, name):
         try:
@@ -10258,6 +10679,8 @@ class InputWatcher(threading.Thread):
                 send_raw_key(0x58, 0, True, TRAIN_TAG)                         # (the X release goes to the game too)
                 self.events.put(("up", "x", time.time(), None))
                 return True
+            if h is not None and h[0] == "rm2":
+                return bool(h[1])                                              # (R let go: only taken when its press was taken - Viribus took it)
             if h is not None and h[0] == "map":
                 send_slot(h[1], h[2], True)
                 if h[3]:
@@ -10292,6 +10715,34 @@ class InputWatcher(threading.Thread):
             app.potion_press(pm[kid])
             return True
         km = getattr(app, "kb_map", None)
+        if vk == 0x52 and kid < 0x200 and not (self._pk & set(CTRL_VKS)) and not (km and kid in km) and not (pm and kid in pm):
+            try:
+                on = bool(app.cfg["settings"].get("r_right_click", True))
+            except Exception:
+                on = True
+            if on:                                                         # R is its OWN key (the game itself treats it like a right click): it goes to the game as R,
+                h = held.get(kid)                                          # and the tool's right-click features (Viribus, Gate, snap Ignis, the cooldowns) react to it
+                if h is not None and h[0] == "rm2":
+                    return bool(h[1])                                      # (key repeat)
+                if kid not in held and self.game_active():
+                    pt = (0, 0)
+                    try:
+                        _p = wintypes.POINT()
+                        u32.GetCursorPos(ctypes.byref(_p))
+                        pt = (_p.x, _p.y)
+                    except Exception:
+                        pass
+                    taken = False
+                    if app.tracker.tele_return(time.time()):
+                        pass                                               # (Telekinesis: R is the weapon coming back - NOT a right click / M2; the game gets the R, the status ends when the weapon is on the bar)
+                    elif app.cfg["settings"].get("vir_key", "m2") == "m2" and self.vir_fire(pt):
+                        taken = True                                       # (Viribus: the tool sends the left click + F instead, R itself is not sent)
+                    else:
+                        self.events.put(("click", "right", time.time(), pt))
+                        self.gate_rclick(pt)                               # (Gate armed: the shortcut boxes come up)
+                        self.gf_cast(pt)                                   # (snap Ignis with a green / white box: R goes through as it is, then G + F)
+                    held[kid] = ("rm2", taken)
+                    return taken
         if not km:
             return False
         if kid in held:
@@ -11224,7 +11675,13 @@ class InputWatcher(threading.Thread):
     def _poll_fallback(self):
         """Only used if the hooks can't be installed: poll every 2 ms, also catching taps shorter than that."""
         self.mode = "poll"
-        watch = [(vk, n) for vk, n in list(VK_NAME.items()) + list(LETTER_VK.items()) + [(0xC0, "inv")]] + [(VK_LBUTTON, "left"), (VK_RBUTTON, "right")]
+        def _lay(vk):                                           # (the virtual key THIS layout has at the US place of that key)
+            try:
+                sc = US_VK_SCAN.get(int(vk)) if KEYS_BY_PLACE else None
+                return (u32.MapVirtualKeyW(sc, 1) or vk) if sc else vk
+            except Exception:
+                return vk
+        watch = [(_lay(vk), n) for vk, n in list(VK_NAME.items()) + list(LETTER_VK.items()) + [(0xC0, "inv")] if not (HOTBAR_BY_PLACE and vk in (0xBD, 0xBB))] + [(VK_LBUTTON, "left"), (VK_RBUTTON, "right")]
         for sc, n in SCAN_HOTBAR.items():                       # (the keys at the "-" / "=" places of THIS keyboard layout)
             try:
                 vk = u32.MapVirtualKeyW(sc, 1)
@@ -11270,7 +11727,16 @@ class InputWatcher(threading.Thread):
     def slot_at(self, pt):
         """The hotbar key of the slot under the click (None = not on the hotbar)."""
         x, y = pt if pt else cursor_pos()
-        for key, (rx, ry, rw, rh) in zip(HOTBAR_KEYS, slot_rects(self.app.cfg["bar"])):
+        bar = self.app.cfg["bar"]
+        live = dict(getattr(self.app, "slot_cx", None) or {})
+        if live:                                                  # the slots where the tabs ARE right now (a re-centred bar: disarmed / Telekinesis / a bar with gaps)
+            hw = bar["w"] / 2.0
+            if bar["y"] <= y < bar["y"] + bar["h"]:
+                for key, cx in live.items():
+                    if cx - hw <= x < cx + hw:
+                        return key
+            return None
+        for key, (rx, ry, rw, rh) in zip(HOTBAR_KEYS, slot_rects(bar)):
             if rx <= x < rx + rw and ry <= y < ry + rh:
                 return key
         return None
@@ -11347,6 +11813,12 @@ class InputWatcher(threading.Thread):
                 mv_ = T.move_for(ak) if ak else None
                 if mv_ and mv_.get("soul"):         # Soul Berserk needs a rune: look at the counter BEFORE the game updates it
                     runes = self.app.read_runes()
+            if 0x47 in self._pk and self.app.cfg["settings"].get("g_hold_no_cd", True):
+                ak_ = T.armed_key(t)                        # G held while a normal move is used: it doesn't go on cooldown (spells / snap spells still do)
+                mg_ = T.move_for(ak_) if ak_ else None
+                if (mg_ and not mg_.get("spell") and "cd2" in mg_ and not mg_.get("pick")
+                        and not (name == "right" and T.snap_for(ak_))):
+                    return
             msg = T.click(t, name, runes)           # name is 'left' or 'right'
             if msg:
                 self.app.q.put(("msg", msg))
@@ -13545,6 +14017,8 @@ class App:
         """Right-click on a spell's key box: white = this spell isn't on the hotbar, it is in the inventory. It then shows in the
         Inventory subsection of Extras (numbers copied from here) and under 'Inventory' in the Mana Overlay tab (its cast marks)."""
         lst, kind = self.list_of(mv)
+        if kind == "tele":
+            return "break"                                              # (Telekinesis moves are never in the inventory)
         if not mv.get("ininv") and not can_be_in_inventory(mv):
             self.say("Give it a name first (Soul Rip / Awakened / the buff moves live in the Inventory subsection by themselves).", "Can't do that")
             return "break"
@@ -13591,8 +14065,37 @@ class App:
             except Exception:
                 pass
 
+    def tele_moves(self):
+        return self.cfg.setdefault("tele", {}).setdefault(self.cfg["active"], [])
+
+    def add_tele_move(self):
+        lst = self.tele_moves()
+        used = {m["key"] for m in lst}
+        free = next((k for k in HOTBAR_KEYS if k not in used), None)
+        if free is None:
+            self.say("All 12 slots already have a Telekinesis move.", "No free slot")
+            return
+        lst.append({"key": free, "name": "New move", "cd": 10.0, "cd2": 0.0, "split": False, "unequip": False, "fresh": True})
+        lst.sort(key=lambda m: HOTBAR_KEYS.index(m["key"]))
+        save_cfg(self.cfg)
+        self.rebuild_moves()
+        self.say(f"Added a Telekinesis move on key {free}. It only shows while Telekinesis is on. Click its Key button to change the key.", "Move added")
+
+    def build_tele_block(self, parent):
+        """Under the Telekinetic Weapon row: the moves that only exist while its Telekinesis State is on."""
+        self.label(parent, "Telekinesis State: moves under here are not on your normal hotbar, they only show up while Telekinesis is on "
+                           "(your weapon floats around you and you are holding your fists).",
+                   font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(4, 0))
+        for tm_ in list(self.tele_moves()):
+            self.build_move_row(parent, tm_)
+        PixBtn(parent, "Add moves to Telekinesis State", self.add_tele_move, self.f, 230, 24).pack(anchor="w", padx=8, pady=(4, 0))
+        self.label(parent, "If you're using fist hybrid or emulated fist moves",
+                   font=self.fs, fg=DIM, justify="left", wraplength=PAGE_W - 40).pack(fill="x", padx=8, pady=(1, 4))
+
     def list_of(self, mv):
         """Which list (normal moves or snap spells) a row dict belongs to, plus its kind."""
+        if any(m is mv for m in self.tele_moves()):
+            return self.tele_moves(), "tele"
         if any(m is mv for m in self.snaps()):
             return self.snaps(), "snap"
         return self.moves(), "move"
@@ -13909,6 +14412,8 @@ class App:
             self.build_awk_row(parent)                     # Awakened: its duration / cooldown row sits under it
         if mv.get("bmove"):
             self.build_bmove_row(parent, mv["bmove"])      # Agility / Bane / Leviathan Plunge / Hyper Body
+        if not mv.get("spell") and not mv.get("ininv") and _norm_name(mv.get("name")) == "telekinetic weapon" and not any(m is mv for m in self.tele_moves()):
+            self.build_tele_block(parent)                  # Telekinetic Weapon: the moves of its Telekinesis State sit under it
 
     def soul_rebuild_later(self, inv):
         """The name just became / stopped being 'Soul Rip': redraw the rows (a moment after the typing stops)."""
@@ -14071,7 +14576,8 @@ class App:
             lst[:] = [m for m in lst if m is not mv]
             if mv.get("ininv"):
                 sync_inv_links(self.cfg)
-            self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
+            if kind != "tele":
+                self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
             save_cfg(self.cfg)
             self.rebuild_moves()
 
@@ -16178,6 +16684,7 @@ class App:
                                      getter=lambda: self.popt("whisper_dj"), setter=lambda v: self.set_popt("whisper_dj", v))
         self.entry_row(p, "Double jump cooldown (seconds)", "dj_cd", float, w=56, h=22)
         self.entry_row(p, "Two Space presses within (seconds)", "dj_window", float, w=56, h=22)
+        self.entry_row(p, "Enshroud double jump cooldown (seconds)", "ens_dj_cd", float, w=56, h=22)
         box, p = self.panel(host, "Cadence")
         box.pack(fill="x", padx=6, pady=(0, 6))
         self.label(p, "Add a song to Moves or Inventory to turn this on: " + ", ".join(SONGS) + ".", **small).pack(fill="x", padx=8, pady=(0, 3))
@@ -16249,9 +16756,8 @@ class App:
         c = foreground_center()
         if c is not None:
             centres.append(c)
-        with mss.mss() as s:
-            mon = s.monitors[1]
-            c2 = (mon["left"] + mon["width"] // 2, mon["top"] + mon["height"] // 2)
+        mon = game_monitor()
+        c2 = (mon["left"] + mon["width"] // 2, mon["top"] + mon["height"] // 2)
         if not centres or abs(centres[0][0] - c2[0]) + abs(centres[0][1] - c2[1]) > 30:
             centres.append(c2)                                    # (the middle of the screen too)
         self._cross_dist = min(max(abs(x - cx), abs(y - cy)) for cx, cy in centres)
@@ -16304,7 +16810,7 @@ class App:
         self.set_popt("mana_dash", v)
 
     def dj_on(self):
-        return self.popt("whisper_dj")
+        return self.popt("whisper_dj") or self.tracker.enshroud_on(time.time())        # (Whisperer, or Enshroud's Shrouded buff is on: it gives a Double Jump too)
 
     def soul_on(self):
         """Wraith Knight's Soul Rip: on while a move called 'Soul Rip' is in the profile's Moves or in its Inventory."""
@@ -16435,8 +16941,7 @@ class App:
             if rect is not None:
                 mon = dict(left=rect[0], top=rect[1], width=rect[2], height=rect[3])
             else:
-                with mss.mss() as sct0:
-                    mon = dict(sct0.monitors[1])
+                mon = game_monitor()
             us = ui_scale(self.cfg["bar"])
             gx, gy, gw, gh = hp_fill_box(mon["width"], mon["height"], us)
             wide = self._grab_rgb({"left": mon["left"] + gx, "top": mon["top"] + gy, "width": gw, "height": gh})
@@ -16506,7 +17011,8 @@ class App:
                 self.dashcd.press_pb(t, cd_value(S, "pb_cd"))
         if name == "space" and self.dj_on():               # Whisperer: Space twice in a row = the double jump
             with self.dash_lock:
-                self.dashcd.press_jump(t, cd_value(S, "dj_cd"), cd_value(S, "dj_window"))
+                ens_ = self.tracker.enshroud_on(t)
+                self.dashcd.press_jump(t, cd_value(S, "ens_dj_cd" if ens_ else "dj_cd"), cd_value(S, "dj_window"))
 
     # --- the little Scroom that shows while the macro is hidden ---
     def mascot_wanted(self):
@@ -16899,8 +17405,7 @@ class App:
 
     def inv_panel_rect(self):
         """Where the inventory panel sits on the screen (scales with the screen size)."""
-        with mss.mss() as sct:
-            mon = sct.monitors[1]
+        mon = game_monitor()
         f = INV_FRAC
         return (mon["left"] + int(mon["width"] * f[0]), mon["top"] + int(mon["height"] * f[1]),
                 mon["left"] + int(mon["width"] * f[2]), mon["top"] + int(mon["height"] * f[3]))
@@ -16955,8 +17460,7 @@ class App:
                 if rect is not None:
                     m_ = dict(left=rect[0], top=rect[1], width=rect[2], height=rect[3])
                 else:
-                    with mss.mss() as sct0:
-                        m_ = dict(sct0.monitors[1])
+                    m_ = game_monitor()
                 c_ = self._hp_mon_c = (now, m_)
             mon = c_[1]
             us = ui_scale(self.cfg["bar"])
@@ -17031,8 +17535,7 @@ class App:
         if now - p["t"] < 0.25:
             return                                                   # (a moment for the game to settle)
         xm, ym = int((x0 + x1) / 2), int((y0 + y1) / 2)
-        with mss.mss() as sct:
-            mon = sct.monitors[1]
+        mon = game_monitor()
         left, top = max(mon["left"], xm - 90), max(mon["top"], ym - 90)
         arr = self._grab_rgb({"left": left, "top": top, "width": 180, "height": 180})
         box = inv_card_find(arr, xm - left, ym - top)
@@ -17170,8 +17673,7 @@ class App:
             return True
         sig, failed = None, False
         try:
-            with mss.mss() as sct:
-                mon = sct.monitors[1]
+            mon = game_monitor()
             half = 90
             left, top = max(mon["left"], int(x) - half), max(mon["top"], int(y) - half)
             time.sleep(0.05)                                            # (the game lifts the clicked card: let it)
@@ -17358,8 +17860,7 @@ class App:
 
     def potion_neutral(self):
         """A spot above the inventory panel (the cursor waits there; a click there drinks the potion in hand)."""
-        with mss.mss() as sct:
-            mon = sct.monitors[1]
+        mon = game_monitor()
         return (mon["left"] + mon["width"] // 2, mon["top"] + int(mon["height"] * 0.2))
 
     def potion_scan(self, name, timeout=1.5):
@@ -18194,7 +18695,7 @@ class App:
         self.gate_menu.set_pinned(self.gates_data()["pinned"])
         self.gate_menu.reset()
         self.gate_open, self._gate_sig = True, None
-        self._gate_seen, self._gate_t0 = False, time.time()
+        self._gate_seen, self._gate_t0, self._gp_seen = False, time.time(), False
         self._gate_draw()
 
     def _gate_draw(self):
@@ -18219,6 +18720,17 @@ class App:
                 self.gate_close("the game isn't in front")
                 return
             # the boxes go when the game's gate prompt does: the wait for the name (GATE_WAIT s after the cast) is over / Enter was pressed
+            if not self.inputs.gate_prompt_on():
+                if getattr(self, "_gp_seen", False) or now - getattr(self, "_gate_t0", now) > 1.5:
+                    self._gp_seen = False
+                    self.gate_close("the gate prompt isn't on the screen")
+                else:
+                    try:
+                        self.gate_ov.hide()                  # (the cast was just made: the prompt may not be drawn yet)
+                    except Exception:
+                        pass
+                return
+            self._gp_seen = True
             if self.tracker.gate_waiting(now):
                 self._gate_seen = True
             elif getattr(self, "_gate_seen", False) or now - getattr(self, "_gate_t0", now) > self.GATE_FALLBACK:
@@ -20112,6 +20624,11 @@ class App:
             self.say(err)
             return
         self._upd_installed = True
+        if self.cfg["settings"].get("update_auto_restart", True):
+            self.upd_set(f"Updated to {version}. Restarting by itself... (your settings are kept)", show=("restart",))
+            self.say(f"Updated to {version}. Restarting...", "Updated!")
+            self.root.after(1500, self.restart_app)               # (a moment to read it; "Restart now" stays as a backup if it doesn't come back)
+            return
         self.upd_set(f"Updated to {version}. Press Restart now to use it (your settings are kept).", show=("restart",))
         self.say(f"Updated to {version}. Restart to use it.", "Updated!")
 
@@ -20362,7 +20879,8 @@ class App:
             other = next((m for m in lst if m is not mv and m["key"] == name and not m.get("ininv")), None)
             if other:                                        # the key is taken: SWAP the two moves
                 old = mv["key"]
-                self.tracker.swap_keys(old, name, snap=(kind == "snap"))
+                if kind != "tele":
+                    self.tracker.swap_keys(old, name, snap=(kind == "snap"))
                 mv["key"], other["key"] = name, old
                 lst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"])))
                 save_cfg(self.cfg)
@@ -20370,7 +20888,8 @@ class App:
                 self.say(f"'{mv['name']}' is now on key {name} and '{other['name']}' moved to key {old}.",
                          f"Swapped {name} / {old}")
             else:
-                self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
+                if kind != "tele":
+                    self.tracker.clear_key(mv["key"], snap=(kind == "snap"))
                 mv["key"] = name
                 lst.sort(key=lambda m: (bool(m.get("ininv")), HOTBAR_KEYS.index(m["key"])))
                 save_cfg(self.cfg)
@@ -20580,7 +21099,7 @@ class App:
         elif running:
             cap = f"Running: {running}"
         elif self.tracker.disarmed:
-            cap = "Disarmed"
+            cap = "Telekinesis" if getattr(self.tracker, "tele", False) else "Disarmed"
         else:
             cap = f"Armed: {armed}" if armed else "Tracking"
         if cap != self._last_cap:
@@ -20870,6 +21389,10 @@ class App:
             for k, cx in live:
                 i = HOTBAR_KEYS.index(k)
                 rects[i] = (cx - rects[i][2] / 2.0, rects[i][1], rects[i][2], rects[i][3])
+            here = {k for k, _ in live}
+            for i, k in enumerate(HOTBAR_KEYS):
+                if k not in here:
+                    items[i] = None                             # (a slot that isn't on the bar any more shows no cooldown box - not at its old place either; its timer keeps running)
         sig = (tuple(items), tuple(sorted(bar.items())), S["box_grow"], S["opacity"], live)
         if sig != self._sig:
             self._sig = sig
@@ -20934,19 +21457,25 @@ class App:
         self.give_focus_back()
         found = None
         for rgb in shots:
-            bar = detect_hotbar(rgb)
-            if bar:
-                found = (rgb, bar)
+            slots = detect_slots_by_tabs(rgb)                      # (any number of slots, anywhere: each is named by the number on its tab)
+            if slots:
+                found = (rgb, slots)
                 break
         if not found:
+            for rgb in shots:
+                bar = detect_hotbar(rgb)
+                if bar:
+                    found = (rgb, bar)
+                    break
+        if not found:
             self._fm_busy = False
-            self.say("Couldn't see the hotbar - show the game with its 12 slots (not covered) and click Find moves again.", "Hotbar not seen")
+            self.say("Couldn't see the hotbar - show the game with its hotbar (the numbers above the slots) in view and click Find moves again.", "Hotbar not seen")
             return
         self.say("Reading the hotbar ...", "Reading")
 
         def work(rgb=found[0], bar=found[1]):
             try:
-                res = read_hotbar_names(exe, rgb, bar)
+                res = read_slot_names(exe, rgb, bar) if isinstance(bar, list) else read_hotbar_names(exe, rgb, bar)
                 err = None
             except Exception as ex:
                 res, err = None, f"{type(ex).__name__}: {ex}"
@@ -20961,13 +21490,16 @@ class App:
         if err or res is None:
             self.say(f"Tesseract couldn't read the hotbar ({err}). Is its English data installed (tesseract-data-eng / eng.traineddata)?", "Read failed")
             return
-        lst = self.moves()
+        tele = bool(getattr(self.tracker, "tele", False))                          # (in Telekinesis the bar shows the fist moves: they go to the Telekinesis State list)
+        lst = self.tele_moves() if tele else self.moves()
         have = {_norm_name(m.get("name")) for m in lst}
         used = {m["key"] for m in lst if not m.get("ininv")}
         added, same, clash, odd = [], [], [], []
         for key, text, name in res:
             if not text and not name:
                 continue                                                           # (an empty slot)
+            if tele and name == "telekinetic weapon":
+                continue                                                           # (the move itself stays a hotbar move)
             if name is None and (len(text.replace(" ", "")) < 3 or not text):
                 odd.append(f"{key}: '{text}'")
                 continue
@@ -20979,7 +21511,7 @@ class App:
             if key in used:
                 clash.append(f"{disp} (key {key} is {next((m['name'] for m in lst if m['key'] == key and not m.get('ininv')), '?')})")
                 continue
-            spell = bool(name and name in SPELL_MARKS)
+            spell = bool(name and name in SPELL_MARKS) and not tele
             d = {"key": key, "name": disp, "cd": 0.0 if spell else 10.0, "cd2": 0.0, "split": False, "unequip": False, **({"spell": True} if spell else {"fresh": True})}
             apply_spell_cd(d)
             apply_base_cd(d)
